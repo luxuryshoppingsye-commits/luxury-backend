@@ -50,19 +50,17 @@ services:
       - key: REALTIME_ALLOWED_ORIGINS
         value: https://luxuryshoppings.com,https://www.luxuryshoppings.com
       - key: API_BASE_URL
-        value: https://luxury-backend-xy9d.onrender.com
+        value: https://api.luxuryshoppings.com
       - key: APP_PUBLIC_URL
-        value: https://luxury-backend-xy9d.onrender.com
+        value: https://api.luxuryshoppings.com
       - key: FRONTEND_PUBLIC_URL
         value: https://luxuryshoppings.com
       - key: WS_BASE_URL
-        value: wss://luxury-backend-xy9d.onrender.com
+        value: wss://api.luxuryshoppings.com
       - key: ENABLE_MESSAGE_WORKER
         value: "true"
       - key: MESSAGE_WORKER_POLL_SECONDS
         value: "5"
-      - key: PUBLIC_RESPONSE_CACHE_TTL_SECONDS
-        value: "300"
       - key: FIREBASE_PROJECT_ID
         value: luxury-345be
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON

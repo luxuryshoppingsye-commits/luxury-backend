@@ -13,6 +13,8 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
 OFFICIAL_RENDER_API_ORIGIN = "https://luxury-backend-xy9d.onrender.com"
 OFFICIAL_RENDER_WS_ORIGIN = "wss://luxury-backend-xy9d.onrender.com"
+OFFICIAL_PUBLIC_API_ORIGIN = "https://api.luxuryshoppings.com"
+OFFICIAL_PUBLIC_WS_ORIGIN = "wss://api.luxuryshoppings.com"
 OFFICIAL_FRONTEND_ORIGINS = {
     "https://luxuryshoppings.com",
     "https://www.luxuryshoppings.com",
@@ -389,21 +391,21 @@ class Settings(BaseSettings):
             if frontend_origin and frontend_origin not in OFFICIAL_FRONTEND_ORIGINS:
                 raise ValueError("FRONTEND_PUBLIC_URL must use the official production website origin")
             production_http_urls = {
-                "API_BASE_URL": (self.api_base_url, render_public_url),
-                "APP_PUBLIC_URL": (self.app_public_url, render_public_url),
+                "API_BASE_URL": (self.api_base_url, OFFICIAL_PUBLIC_API_ORIGIN),
+                "APP_PUBLIC_URL": (self.app_public_url, OFFICIAL_PUBLIC_API_ORIGIN),
             }
             for name, (value, expected) in production_http_urls.items():
                 normalized = value.rstrip("/")
                 if normalized != expected:
-                    raise ValueError(f"{name} must use the official Render backend in production")
+                    raise ValueError(f"{name} must use the official public API domain in production")
                 if _contains_forbidden_public_marker(normalized):
                     raise ValueError(
                         f"{name} cannot point to local, legacy, Supabase, or alternate backends in production"
                     )
             ws_normalized = self.ws_base_url.rstrip("/")
-            expected_ws_origin = f"wss://{render_parts.netloc}{render_parts.path}".rstrip("/")
+            expected_ws_origin = OFFICIAL_PUBLIC_WS_ORIGIN
             if ws_normalized != expected_ws_origin:
-                raise ValueError("WS_BASE_URL must match RENDER_PUBLIC_URL in production")
+                raise ValueError("WS_BASE_URL must use the official public API domain in production")
             if _contains_forbidden_public_marker(ws_normalized):
                 raise ValueError("WS_BASE_URL cannot point to local, legacy, Supabase, or alternate backends in production")
         return self

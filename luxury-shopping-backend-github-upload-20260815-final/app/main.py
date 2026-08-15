@@ -7,10 +7,8 @@ import mimetypes
 import os
 import re
 import shutil
-import time
 import uuid
 import zipfile
-from dataclasses import dataclass
 from io import BytesIO
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -321,114 +319,7 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/api/uploads",
 )
 
-# Only JSON catalogue/content responses are eligible for the short in-process
-# cache. User/session/order endpoints are deliberately excluded above and are
-# always no-store. The cache is cleared after successful writes so admin and
-# merchant changes become visible without waiting for the TTL.
-PUBLIC_RESPONSE_CACHE_PREFIXES = tuple(
-    prefix
-    for prefix in PUBLIC_CACHEABLE_PREFIXES
-    if prefix not in {"/uploads", "/api/uploads"}
-)
-try:
-    PUBLIC_RESPONSE_CACHE_TTL_SECONDS = max(
-        15,
-        min(int(os.getenv("PUBLIC_RESPONSE_CACHE_TTL_SECONDS", "300")), 600),
-    )
-except ValueError:
-    PUBLIC_RESPONSE_CACHE_TTL_SECONDS = 300
-PUBLIC_RESPONSE_CACHE_MAX_BYTES = 512 * 1024
 AUTH_COOKIE_NAMES = frozenset({"at", "rt"})
-
-
-@dataclass(frozen=True)
-class _PublicResponseCacheEntry:
-    expires_at: float
-    body: bytes
-    status_code: int
-    media_type: str | None
-    headers: tuple[tuple[str, str], ...]
-
-
-_PUBLIC_RESPONSE_CACHE: dict[str, _PublicResponseCacheEntry] = {}
-_PUBLIC_RESPONSE_CACHE_LOCK = asyncio.Lock()
-
-
-def _public_response_cache_key(request: Request) -> str | None:
-    if settings.app_env not in {"production", "staging"}:
-        return None
-    if request.method != "GET":
-        return None
-    if _has_auth_context(request):
-        return None
-    path = request.url.path
-    if not _matches_prefix(path, PUBLIC_RESPONSE_CACHE_PREFIXES):
-        return None
-    # Keep Origin and Accept-Encoding in the key because CORS and GZip may emit
-    # request-specific response headers/body representations.
-    return (
-        f"{path}?{request.url.query}"
-        f"|origin={request.headers.get('origin', '')}"
-        f"|encoding={request.headers.get('accept-encoding', '')}"
-    )
-
-
-async def _get_public_response_cache(key: str) -> _PublicResponseCacheEntry | None:
-    now = time.monotonic()
-    async with _PUBLIC_RESPONSE_CACHE_LOCK:
-        entry = _PUBLIC_RESPONSE_CACHE.get(key)
-        if entry is None:
-            return None
-        if entry.expires_at <= now:
-            _PUBLIC_RESPONSE_CACHE.pop(key, None)
-            return None
-        return entry
-
-
-async def _clear_public_response_cache() -> None:
-    async with _PUBLIC_RESPONSE_CACHE_LOCK:
-        _PUBLIC_RESPONSE_CACHE.clear()
-
-
-async def _materialize_public_response(response: Response) -> tuple[Response, bytes | None]:
-    """Materialize a JSON response so it can be safely reused on cache hits."""
-    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-    if (
-        response.status_code != 200
-        or content_type not in {"application/json", "application/problem+json"}
-        or response.headers.get("set-cookie")
-    ):
-        return response, None
-
-    existing_body = getattr(response, "body", None)
-    if existing_body is not None:
-        body = bytes(existing_body)
-    elif hasattr(response, "body_iterator"):
-        body = b"".join([chunk async for chunk in response.body_iterator])
-    else:
-        return response, None
-    headers = dict(response.headers)
-    # Response recalculates Content-Length from the materialized bytes. Keep
-    # CORS headers, but never cache request-specific or compression headers.
-    for name in (
-        "content-length",
-        "date",
-        "server",
-        "set-cookie",
-        "x-request-id",
-        "cache-control",
-        "pragma",
-        "expires",
-    ):
-        headers.pop(name, None)
-    materialized = Response(
-        content=body,
-        status_code=response.status_code,
-        headers=headers,
-        media_type=getattr(response, "media_type", None),
-        background=getattr(response, "background", None),
-    )
-    return materialized, body
 
 
 def _matches_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -452,34 +343,18 @@ def _has_auth_context(request: Request) -> bool:
 def _apply_cache_headers(request: Request, response) -> None:
     path = request.url.path
     has_auth_context = _has_auth_context(request)
-    is_public_get = (
+    is_static_file = (
         request.method in {"GET", "HEAD"}
         and not has_auth_context
-        and _matches_prefix(path, PUBLIC_CACHEABLE_PREFIXES)
+        and _matches_prefix(path, ("/uploads", "/api/uploads"))
     )
-    is_private = (
-        request.method not in {"GET", "HEAD", "OPTIONS"}
-        or has_auth_context
-        or _matches_prefix(path, PRIVATE_NO_STORE_PREFIXES)
-    )
-    if is_public_get and not is_private:
-        response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
-        # Cloudflare can use this edge-only TTL while browsers keep the shorter
-        # browser max-age. Do not combine s-maxage with stale-while-revalidate:
-        # shared caches treat s-maxage as proxy-revalidate.
-        response.headers["Cloudflare-CDN-Cache-Control"] = (
-            "public, max-age=600, stale-while-revalidate=86400"
-        )
-        # Also emit the standard CDN directive for providers/CDN layers that
-        # do not read Cloudflare's vendor-specific header.
-        response.headers["CDN-Cache-Control"] = (
-            "public, max-age=600, stale-while-revalidate=86400"
-        )
-        response.headers["Vary"] = "Accept-Encoding, Origin"
+    if is_static_file:
+        response.headers["Cache-Control"] = "public, max-age=86400, immutable"
         if "Pragma" in response.headers:
             del response.headers["Pragma"]
         if "Expires" in response.headers:
             del response.headers["Expires"]
+        response.headers["Vary"] = "Accept-Encoding"
         return
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -643,32 +518,6 @@ async def request_security(request: Request, call_next):
     if policy.authentication_required and authenticated_subject_from_request(request) is None:
         return guarded_json(401, "authentication_required")
 
-    # Public catalogue responses are already bounded by the in-process cache
-    # and are also marked cacheable for Cloudflare/browser caches.  Returning a
-    # fresh cache hit before the PostgreSQL-backed rate limiter avoids two
-    # database round trips for every repeated catalogue request while keeping
-    # all uncached requests on the normal limiter path.
-    cache_key = _public_response_cache_key(request)
-    if cache_key:
-        cached = await _get_public_response_cache(cache_key)
-        if cached is not None:
-            response = Response(
-                content=cached.body,
-                status_code=cached.status_code,
-                headers=dict(cached.headers),
-                media_type=cached.media_type,
-            )
-            _apply_security_headers(request, response)
-            logger.info(
-                "request_complete request_id=%s method=%s path=%s status=%s policy=%s cache=hit-fast",
-                request_id,
-                request.method,
-                request.url.path,
-                response.status_code,
-                policy.policy_name,
-            )
-            return response
-
     try:
         rate_limit = await DistributedRateLimitService().check(request, policy)
     except HTTPException as exc:
@@ -689,64 +538,10 @@ async def request_security(request: Request, call_next):
         _apply_security_headers(request, response)
         return response
 
-    if cache_key:
-        cached = await _get_public_response_cache(cache_key)
-        if cached is not None:
-            response = Response(
-                content=cached.body,
-                status_code=cached.status_code,
-                headers=dict(cached.headers),
-                media_type=cached.media_type,
-            )
-            for key, value in rate_limit.headers.items():
-                response.headers.setdefault(key, value)
-            _apply_security_headers(request, response)
-            logger.info(
-                "request_complete request_id=%s method=%s path=%s status=%s policy=%s cache=hit",
-                request_id,
-                request.method,
-                request.url.path,
-                response.status_code,
-                policy.policy_name,
-            )
-            return response
-
     response = await call_next(request)
     for key, value in rate_limit.headers.items():
         response.headers.setdefault(key, value)
     _apply_security_headers(request, response)
-
-    if cache_key:
-        response, body = await _materialize_public_response(response)
-        _apply_security_headers(request, response)
-        if body is not None and len(body) <= PUBLIC_RESPONSE_CACHE_MAX_BYTES:
-            cached_headers = tuple(
-                (key, value)
-                for key, value in response.headers.items()
-                if key.lower()
-                not in {
-                    "content-length",
-                    "date",
-                    "server",
-                    "set-cookie",
-                    "x-request-id",
-                    "cache-control",
-                    "pragma",
-                    "expires",
-                }
-                and not key.lower().startswith("x-ratelimit-")
-            )
-            async with _PUBLIC_RESPONSE_CACHE_LOCK:
-                _PUBLIC_RESPONSE_CACHE[cache_key] = _PublicResponseCacheEntry(
-                    expires_at=time.monotonic() + PUBLIC_RESPONSE_CACHE_TTL_SECONDS,
-                    body=body,
-                    status_code=response.status_code,
-                    media_type=getattr(response, "media_type", None),
-                    headers=cached_headers,
-                )
-    elif request.method not in {"GET", "HEAD", "OPTIONS"} and response.status_code < 400:
-        # Any successful write can change a public product/content response.
-        await _clear_public_response_cache()
 
     logger.info(
         "request_complete request_id=%s method=%s path=%s status=%s policy=%s cache=%s",
@@ -755,7 +550,7 @@ async def request_security(request: Request, call_next):
         request.url.path,
         getattr(response, "status_code", 0),
         policy.policy_name,
-        "stored" if cache_key else "bypass",
+        "bypass",
     )
     return response
 

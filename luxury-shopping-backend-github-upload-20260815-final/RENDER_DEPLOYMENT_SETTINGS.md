@@ -29,9 +29,9 @@
 | `DATABASE_MIGRATION_URL` | رابط قاعدة البيانات نفسه إذا كان مطلوبًا في إعدادك |
 | `JWT_SECRET` | نفس قيمة الخدمة القديمة إذا أردت إبقاء الجلسات الحالية، أو قيمة عشوائية قوية جديدة |
 | `RENDER_PUBLIC_URL` | `https://luxury-backend-xy9d.onrender.com` |
-| `API_BASE_URL` | `https://luxury-backend-xy9d.onrender.com` |
-| `APP_PUBLIC_URL` | `https://luxury-backend-xy9d.onrender.com` |
-| `WS_BASE_URL` | `wss://luxury-backend-xy9d.onrender.com` |
+| `API_BASE_URL` | `https://api.luxuryshoppings.com` |
+| `APP_PUBLIC_URL` | `https://api.luxuryshoppings.com` |
+| `WS_BASE_URL` | `wss://api.luxuryshoppings.com` |
 | `FRONTEND_PUBLIC_URL` | `https://luxuryshoppings.com` |
 | `CORS_ORIGINS` | `https://luxuryshoppings.com,https://www.luxuryshoppings.com` |
 | `REALTIME_ALLOWED_ORIGINS` | `https://luxuryshoppings.com,https://www.luxuryshoppings.com` |
@@ -70,9 +70,9 @@
 
 افتح هذه المسارات:
 
-1. `https://luxury-backend-xy9d.onrender.com/health/ready`
-2. `https://luxury-backend-xy9d.onrender.com/health/live`
-3. `https://luxury-backend-xy9d.onrender.com/health/storage`
+1. `https://api.luxuryshoppings.com/health/ready`
+2. `https://api.luxuryshoppings.com/health/live`
+3. `https://api.luxuryshoppings.com/health/storage`
 
 يجب أن يظهر في فحص التخزين `provider=cloudflare_r2` و`reachable=true`.
 

@@ -24,13 +24,14 @@ def _request(path: str, method: str = "GET", headers: dict[str, str] | None = No
     )
 
 
-def test_public_catalog_without_auth_has_bounded_public_cache_headers():
+def test_public_catalog_without_auth_is_not_cached():
     response = Response()
 
     _apply_cache_headers(_request("/api/catalog/products"), response)
 
-    assert response.headers["cache-control"] == "public, max-age=300, stale-while-revalidate=600"
-    assert response.headers["vary"] == "Accept-Encoding, Origin"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["expires"] == "0"
 
 
 def test_public_catalog_with_auth_is_not_persistently_cacheable():
@@ -47,7 +48,7 @@ def test_public_catalog_with_auth_is_not_persistently_cacheable():
     assert "Authorization" in response.headers["vary"]
 
 
-def test_public_catalog_with_non_auth_cookie_remains_cacheable():
+def test_public_catalog_with_non_auth_cookie_is_not_cached():
     response = Response()
 
     _apply_cache_headers(
@@ -58,7 +59,26 @@ def test_public_catalog_with_non_auth_cookie_remains_cacheable():
         response,
     )
 
-    assert response.headers["cache-control"] == "public, max-age=300, stale-while-revalidate=600"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_health_is_not_cached():
+    response = Response()
+
+    _apply_cache_headers(_request("/health/ready"), response)
+
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["expires"] == "0"
+
+
+def test_public_uploads_keep_static_file_cache_headers():
+    response = Response()
+
+    _apply_cache_headers(_request("/uploads/products/example.webp"), response)
+
+    assert response.headers["cache-control"] == "public, max-age=86400, immutable"
 
 
 def test_public_catalog_with_refresh_cookie_is_not_persistently_cacheable():

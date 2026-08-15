@@ -13,7 +13,7 @@ def _read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_web_and_flutter_use_the_single_render_backend_contract() -> None:
+def test_web_and_flutter_use_the_single_public_api_contract() -> None:
     required = [
         ROOT / "luxury-shopping-handover-20260609/src/lib/api/client.ts",
         ROOT / "luxury-shopping-handover-20260609/src/lib/backendOrigins.ts",
@@ -25,11 +25,11 @@ def test_web_and_flutter_use_the_single_render_backend_contract() -> None:
     web_origins = _read("luxury-shopping-handover-20260609/src/lib/backendOrigins.ts")
     flutter_config = _read("lib/core/config/app_config.dart")
 
-    assert "https://luxury-backend-xy9d.onrender.com" in web_origins
-    assert "wss://luxury-backend-xy9d.onrender.com" in web_origins
+    assert "https://api.luxuryshoppings.com" in web_origins
+    assert "wss://api.luxuryshoppings.com" in web_origins
     assert "DATABASE_URL" not in web_client
-    assert "_productionApiBaseUrl = 'https://luxury-backend-xy9d.onrender.com'" in flutter_config
-    assert "_productionWsBaseUrl = 'wss://luxury-backend-xy9d.onrender.com'" in flutter_config
+    assert "_productionApiBaseUrl = 'https://api.luxuryshoppings.com'" in flutter_config
+    assert "_productionWsBaseUrl = 'wss://api.luxuryshoppings.com'" in flutter_config
 
 
 def test_cart_order_and_notification_records_are_scoped_to_authenticated_uuid() -> None:
