@@ -7,9 +7,9 @@
 - Service type: Web Service
 - Runtime: Python
 - Root directory: فارغ إذا كان هذا المستودع يحتوي الـ Backend وحده
-- Build command: `pip install -r requirements.txt`
+- Build command: `python -m pip install -r requirements.txt`
 - Pre-deploy command: `python -m alembic upgrade head`
-- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Start command: `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Health check path: `/health/ready`
 - Branch: `main`
 - Persistent Disk: لا تضف Disk للصور

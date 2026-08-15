@@ -25,11 +25,11 @@ def test_web_and_flutter_use_the_single_render_backend_contract() -> None:
     web_origins = _read("luxury-shopping-handover-20260609/src/lib/backendOrigins.ts")
     flutter_config = _read("lib/core/config/app_config.dart")
 
-    assert "https://luxury-backend-34ht.onrender.com" in web_origins
-    assert "wss://luxury-backend-34ht.onrender.com" in web_origins
+    assert "https://luxury-backend-xy9d.onrender.com" in web_origins
+    assert "wss://luxury-backend-xy9d.onrender.com" in web_origins
     assert "DATABASE_URL" not in web_client
-    assert "_productionApiBaseUrl = 'https://luxury-backend-34ht.onrender.com'" in flutter_config
-    assert "_productionWsBaseUrl = 'wss://luxury-backend-34ht.onrender.com'" in flutter_config
+    assert "_productionApiBaseUrl = 'https://luxury-backend-xy9d.onrender.com'" in flutter_config
+    assert "_productionWsBaseUrl = 'wss://luxury-backend-xy9d.onrender.com'" in flutter_config
 
 
 def test_cart_order_and_notification_records_are_scoped_to_authenticated_uuid() -> None:

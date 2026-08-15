@@ -456,6 +456,11 @@ def _apply_cache_headers(request: Request, response) -> None:
         response.headers["Cloudflare-CDN-Cache-Control"] = (
             "public, max-age=600, stale-while-revalidate=86400"
         )
+        # Also emit the standard CDN directive for providers/CDN layers that
+        # do not read Cloudflare's vendor-specific header.
+        response.headers["CDN-Cache-Control"] = (
+            "public, max-age=600, stale-while-revalidate=86400"
+        )
         response.headers["Vary"] = "Accept-Encoding, Origin"
         if "Pragma" in response.headers:
             del response.headers["Pragma"]

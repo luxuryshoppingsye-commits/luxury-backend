@@ -410,18 +410,25 @@ class R2MigrationService:
     ) -> None:
         client = self.storage._r2_client()
         bucket = str(self.settings.r2_bucket)
+        cache_control = "public, max-age=31536000, immutable"
         head = None
         try:
             head = client.head_object(Bucket=bucket, Key=storage_key)
         except Exception:
             head = None
         metadata = {str(k).lower(): str(v) for k, v in (head or {}).get("Metadata", {}).items()}
-        if not head or int(head.get("ContentLength") or -1) != len(data) or metadata.get("sha256") != checksum:
+        if (
+            not head
+            or int(head.get("ContentLength") or -1) != len(data)
+            or metadata.get("sha256") != checksum
+            or str(head.get("CacheControl") or "") != cache_control
+        ):
             client.put_object(
                 Bucket=bucket,
                 Key=storage_key,
                 Body=data,
                 ContentType=content_type,
+                CacheControl=cache_control,
                 Metadata={"sha256": checksum, "policy": policy_key, "migrated-from": "render"},
             )
         verified = client.get_object(Bucket=bucket, Key=storage_key)

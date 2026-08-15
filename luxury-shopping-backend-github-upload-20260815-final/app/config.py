@@ -11,8 +11,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
-OFFICIAL_RENDER_API_ORIGIN = "https://luxury-backend-34ht.onrender.com"
-OFFICIAL_RENDER_WS_ORIGIN = "wss://luxury-backend-34ht.onrender.com"
+OFFICIAL_RENDER_API_ORIGIN = "https://luxury-backend-xy9d.onrender.com"
+OFFICIAL_RENDER_WS_ORIGIN = "wss://luxury-backend-xy9d.onrender.com"
 OFFICIAL_FRONTEND_ORIGINS = {
     "https://luxuryshoppings.com",
     "https://www.luxuryshoppings.com",
@@ -161,7 +161,11 @@ class Settings(BaseSettings):
     ai_max_concurrent_requests_per_user: int = Field(2, alias="AI_MAX_CONCURRENT_REQUESTS_PER_USER", ge=1)
     ai_request_timeout_seconds: int = Field(20, alias="AI_REQUEST_TIMEOUT_SECONDS", ge=1, le=120)
     ai_stream_max_duration_seconds: int = Field(30, alias="AI_STREAM_MAX_DURATION_SECONDS", ge=1, le=300)
-    firebase_project_id: str = Field("", alias="FIREBASE_PROJECT_ID")
+    # The project id is public Firebase configuration and is also embedded in
+    # the mobile clients. Keeping the production default here makes OAuth and
+    # push diagnostics work even when an older Render service has not yet
+    # synchronized the non-secret variable from render.yaml.
+    firebase_project_id: str = Field("luxury-345be", alias="FIREBASE_PROJECT_ID")
     google_application_credentials: str = Field("", alias="GOOGLE_APPLICATION_CREDENTIALS")
     google_application_credentials_json: str = Field("", alias="GOOGLE_APPLICATION_CREDENTIALS_JSON")
     firebase_service_account_json: str = Field("", alias="FIREBASE_SERVICE_ACCOUNT_JSON")
