@@ -1,0 +1,2 @@
+"""Luxury Shopping backend package."""
+

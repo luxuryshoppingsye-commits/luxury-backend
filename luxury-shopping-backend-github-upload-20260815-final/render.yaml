@@ -1,0 +1,115 @@
+services:
+  - type: web
+    name: luxury-shopping-backend
+    runtime: python
+    plan: starter
+    region: virginia
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    preDeployCommand: python -m alembic upgrade head
+    # Migrations run once in preDeployCommand. Running them again on every
+    # process start needlessly delays cold starts and restarts.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health/ready
+    autoDeployTrigger: commit
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: ALLOW_TEST_FIXTURES
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.11.10"
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_MIGRATION_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: RENDER_PUBLIC_URL
+        value: https://luxury-backend-xy9d.onrender.com
+      - key: UPLOAD_DIR
+        value: /tmp/luxury-backend-upload-quarantine
+      - key: STORAGE_PROVIDER
+        value: r2
+      - key: R2_ENDPOINT_URL
+        sync: false
+      - key: R2_BUCKET
+        value: luxury-images-prod
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_REGION
+        value: auto
+      - key: R2_PUBLIC_BASE_URL
+        value: https://images.luxuryshoppings.com
+      - key: MAX_UPLOAD_BYTES
+        value: "10485760"
+      - key: CORS_ORIGINS
+        value: https://luxuryshoppings.com,https://www.luxuryshoppings.com
+      - key: REALTIME_ALLOWED_ORIGINS
+        value: https://luxuryshoppings.com,https://www.luxuryshoppings.com
+      - key: API_BASE_URL
+        value: https://luxury-backend-xy9d.onrender.com
+      - key: APP_PUBLIC_URL
+        value: https://luxury-backend-xy9d.onrender.com
+      - key: FRONTEND_PUBLIC_URL
+        value: https://luxuryshoppings.com
+      - key: WS_BASE_URL
+        value: wss://luxury-backend-xy9d.onrender.com
+      - key: ENABLE_MESSAGE_WORKER
+        value: "true"
+      - key: MESSAGE_WORKER_POLL_SECONDS
+        value: "5"
+      - key: PUBLIC_RESPONSE_CACHE_TTL_SECONDS
+        value: "300"
+      - key: FIREBASE_PROJECT_ID
+        value: luxury-345be
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM_EMAIL
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: auto
+      - key: RESEND_API_URL
+        value: https://api.resend.com/emails
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: AI_PROVIDER_NAME
+        value: gemini
+      - key: AI_DEFAULT_MODEL
+        value: gemini-2.0-flash
+      - key: AI_MODEL_ALLOWLIST
+        value: gemini-2.0-flash
+      - key: IMAGE_AI_ENHANCEMENT_ENABLED
+        value: "true"
+      - key: IMAGE_AI_MODEL
+        value: gemini-2.5-flash-image
+      - key: IMAGE_AI_TIMEOUT_SECONDS
+        value: "30"
+      - key: IMAGE_AI_MAX_INPUT_BYTES
+        value: "5242880"
+      - key: IMAGE_MAX_DIMENSION
+        value: "2400"
+      - key: IMAGE_MIN_DIMENSION
+        value: "900"
+      - key: GEMINI_API_KEY
+        sync: false
