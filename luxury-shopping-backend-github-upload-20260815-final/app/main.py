@@ -338,6 +338,7 @@ try:
 except ValueError:
     PUBLIC_RESPONSE_CACHE_TTL_SECONDS = 300
 PUBLIC_RESPONSE_CACHE_MAX_BYTES = 512 * 1024
+AUTH_COOKIE_NAMES = frozenset({"at", "rt"})
 
 
 @dataclass(frozen=True)
@@ -358,7 +359,7 @@ def _public_response_cache_key(request: Request) -> str | None:
         return None
     if request.method != "GET":
         return None
-    if request.headers.get("authorization") or request.cookies:
+    if _has_auth_context(request):
         return None
     path = request.url.path
     if not _matches_prefix(path, PUBLIC_RESPONSE_CACHE_PREFIXES):
@@ -435,9 +436,22 @@ def _matches_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
     return any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in prefixes)
 
 
+def _has_auth_context(request: Request) -> bool:
+    """Return true only for credentials that can change the response identity.
+
+    Browsers send harmless preference/analytics cookies with ``credentials:
+    include``. Treating every cookie as authentication disabled the public
+    catalogue cache for otherwise anonymous visitors. The API's actual web
+    session cookies are ``at`` and ``rt``; all other cookies are ignored here.
+    """
+    if request.headers.get("authorization"):
+        return True
+    return any(name in request.cookies for name in AUTH_COOKIE_NAMES)
+
+
 def _apply_cache_headers(request: Request, response) -> None:
     path = request.url.path
-    has_auth_context = bool(request.headers.get("authorization") or request.cookies)
+    has_auth_context = _has_auth_context(request)
     is_public_get = (
         request.method in {"GET", "HEAD"}
         and not has_auth_context

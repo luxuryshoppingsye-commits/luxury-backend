@@ -47,6 +47,35 @@ def test_public_catalog_with_auth_is_not_persistently_cacheable():
     assert "Authorization" in response.headers["vary"]
 
 
+def test_public_catalog_with_non_auth_cookie_remains_cacheable():
+    response = Response()
+
+    _apply_cache_headers(
+        _request(
+            "/api/catalog/products",
+            headers={"Cookie": "locale=ar; theme=light"},
+        ),
+        response,
+    )
+
+    assert response.headers["cache-control"] == "public, max-age=300, stale-while-revalidate=600"
+
+
+def test_public_catalog_with_refresh_cookie_is_not_persistently_cacheable():
+    response = Response()
+
+    _apply_cache_headers(
+        _request(
+            "/api/catalog/products",
+            headers={"Cookie": "rt=private-refresh-token"},
+        ),
+        response,
+    )
+
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
 def test_private_customer_and_admin_paths_are_no_store():
     for path in ["/me", "/orders", "/payments/review", "/admin/products", "/resources/orders/query"]:
         response = Response()
