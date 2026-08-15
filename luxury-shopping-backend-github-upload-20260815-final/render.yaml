@@ -86,7 +86,7 @@ services:
       - key: SMTP_FROM_EMAIL
         sync: false
       - key: EMAIL_PROVIDER
-        value: auto
+        value: smtp
       - key: RESEND_API_URL
         value: https://api.resend.com/emails
       - key: RESEND_API_KEY

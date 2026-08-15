@@ -125,7 +125,7 @@ class Settings(BaseSettings):
     smtp_username: str = Field("", alias="SMTP_USERNAME")
     smtp_password: str = Field("", alias="SMTP_PASSWORD")
     smtp_from_email: str = Field("", alias="SMTP_FROM_EMAIL")
-    email_provider: str = Field("auto", alias="EMAIL_PROVIDER")
+    email_provider: str = Field("smtp", alias="EMAIL_PROVIDER")
     resend_api_url: str = Field("https://api.resend.com/emails", alias="RESEND_API_URL")
     resend_api_key: str = Field("", alias="RESEND_API_KEY")
     resend_from_email: str = Field("", alias="RESEND_FROM_EMAIL")
