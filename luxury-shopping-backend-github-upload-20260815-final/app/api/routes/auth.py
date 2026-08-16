@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 import secrets
 import asyncio
+import logging
 from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Any
@@ -66,6 +67,7 @@ from ...services.outbox_service import deliver_email_now, email_delivery_configu
 
 
 router = APIRouter(tags=["auth"])
+logger = logging.getLogger(__name__)
 PartnerApplication = MODEL_BY_TABLE["partner_applications"]
 AccountDeletionRequest = MODEL_BY_TABLE["account_deletion_requests"]
 EMAIL_OUTBOX = MODEL_BY_TABLE["email_outbox"]
@@ -1490,6 +1492,11 @@ async def password_reset_request(
             if delivery_status != "provider_accepted":
                 reset_state.invalidated_at = datetime.now(timezone.utc)
                 await session.commit()
+                logger.warning(
+                    "password_reset_email_delivery_failed provider=%s error_code=%s",
+                    delivery.get("provider") or "none",
+                    delivery.get("error_code") or "unknown",
+                )
                 raise HTTPException(status_code=503, detail="password_reset_email_delivery_failed")
         await record_security_event(
             session,

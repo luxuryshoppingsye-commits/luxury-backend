@@ -317,6 +317,9 @@ async def deliver_email_now(session: AsyncSession, row: Any) -> dict[str, Any]:
                 extra,
             )
             _mark_terminal(row, "provider_accepted", provider_id=f"{_email_provider_mode(settings)}:accepted")
+        except smtplib.SMTPAuthenticationError as error:
+            code = getattr(error, "smtp_code", None)
+            _mark_terminal(row, "failed_permanent", code=f"smtp_auth_{code or 'failed'}")
         except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
             code = getattr(error, "smtp_code", None)
             if isinstance(code, int) and 400 <= code < 500:
@@ -453,6 +456,10 @@ async def process_email_outbox(session: AsyncSession, limit: int | None = None) 
             )
             _mark_terminal(row, "provider_accepted", provider_id=f"{_email_provider_mode(settings)}:accepted")
             counts["provider_accepted"] += 1
+        except smtplib.SMTPAuthenticationError as error:
+            code = getattr(error, "smtp_code", None)
+            _mark_terminal(row, "failed_permanent", code=f"smtp_auth_{code or 'failed'}")
+            counts["failed_permanent"] += 1
         except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
             code = getattr(error, "smtp_code", None)
             if isinstance(code, int) and 400 <= code < 500:
