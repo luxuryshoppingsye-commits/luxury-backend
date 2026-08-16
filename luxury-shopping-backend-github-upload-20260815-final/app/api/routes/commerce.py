@@ -55,6 +55,7 @@ from ...services.financial_calculator import (
 )
 from ...services.merchant_order_scope import merchant_order_detail, merchant_order_list
 from ...services.public_read_cache import cache_key, public_read_cache
+from ...services.product_identifier import decode_compact_uuid
 from ...services.commerce_rules import (
     eligible_line,
     parse_strict_quantity,
@@ -1218,7 +1219,9 @@ async def _product_detail_uncached(identifier: str, session: AsyncSession) -> di
     try:
         lookup_clauses.append(Product.id == uuid.UUID(identifier))
     except ValueError:
-        pass
+        compact_uuid = decode_compact_uuid(identifier)
+        if compact_uuid is not None:
+            lookup_clauses.append(Product.id == compact_uuid)
     lookup_clauses.append(Product.short_code == identifier)
     lookup_clauses.append(Product.sku == identifier)
     product = (

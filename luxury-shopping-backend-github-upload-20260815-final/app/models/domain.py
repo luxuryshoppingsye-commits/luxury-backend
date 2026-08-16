@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -16,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -217,7 +219,7 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
     name: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     name_en: Mapped[str | None] = mapped_column(String(500), index=True)
     sku: Mapped[str | None] = mapped_column(String(160), unique=True, index=True)
-    short_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    short_code: Mapped[str | None] = mapped_column(String(6), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text)
     rich_description: Mapped[str | None] = mapped_column(Text)
     price: Mapped[Decimal] = mapped_column(MONEY, nullable=False, server_default="0")
@@ -252,6 +254,21 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
         CheckConstraint("stock_quantity >= 0", name="ck_products_stock_nonnegative"),
         Index("ix_products_catalog", "is_active", "approval_status", "category_id"),
     )
+
+
+_PRODUCT_SHORT_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+
+
+def _new_product_short_code() -> str:
+    return "".join(secrets.choice(_PRODUCT_SHORT_CODE_ALPHABET) for _ in range(6))
+
+
+@event.listens_for(Product, "init", propagate=True)
+def _assign_product_short_code(target: Product, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Assign a compact public identifier to every newly-created product."""
+
+    if not getattr(target, "short_code", None):
+        target.short_code = _new_product_short_code()
 
 
 class ProductVariant(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):

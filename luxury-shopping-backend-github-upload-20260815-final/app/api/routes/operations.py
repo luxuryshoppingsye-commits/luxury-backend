@@ -73,6 +73,7 @@ from ...services.payment_refund_security import (
     update_refund_workflow_status,
 )
 from ...services.public_read_cache import cache_key, public_read_cache
+from ...services.product_identifier import decode_compact_uuid
 from ...services.realtime import (
     REALTIME_PROTOCOL,
     RealtimeEventService,
@@ -1584,7 +1585,9 @@ async def api_catalog_product(identifier: str, session: AsyncSession = Depends(g
     try:
         clauses.append(model.id == uuid.UUID(identifier))
     except ValueError:
-        pass
+        compact_uuid = decode_compact_uuid(identifier)
+        if compact_uuid is not None:
+            clauses.append(model.id == compact_uuid)
     if "short_code" in model.__table__.c:
         clauses.append(model.short_code == identifier)
     if "slug" in model.__table__.c:

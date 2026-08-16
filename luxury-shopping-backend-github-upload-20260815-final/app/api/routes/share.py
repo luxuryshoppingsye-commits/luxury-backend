@@ -22,6 +22,7 @@ from ...services.catalog_policy import (
     validate_public_product_or_404,
 )
 from ...services.public_read_cache import cache_key, public_read_cache
+from ...services.product_identifier import decode_compact_uuid
 from ...storage.files import FileStorage
 
 
@@ -70,7 +71,9 @@ async def _share_product_payload(identifier: str, session: AsyncSession) -> dict
     try:
         lookup_clauses.append(Product.id == uuid.UUID(identifier))
     except ValueError:
-        pass
+        compact_uuid = decode_compact_uuid(identifier)
+        if compact_uuid is not None:
+            lookup_clauses.append(Product.id == compact_uuid)
     lookup_clauses.extend((Product.short_code == identifier, Product.sku == identifier))
     product = (
         await session.execute(
