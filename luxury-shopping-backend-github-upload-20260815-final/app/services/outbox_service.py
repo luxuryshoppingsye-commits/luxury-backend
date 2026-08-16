@@ -288,6 +288,59 @@ def _send_email_sync(
         client.send_message(email)
 
 
+async def deliver_email_now(session: AsyncSession, row: Any) -> dict[str, Any]:
+    """Deliver a critical email before returning success to its caller.
+
+    Password-reset messages must not be reported as sent merely because they
+    were inserted into the outbox. The normal worker still handles retries for
+    the rest of the system; this focused path proves provider acceptance for a
+    security email while preserving the outbox audit row.
+    """
+    settings = get_settings()
+    now = _now()
+    row.status = "processing"
+    extra = _extra(row)
+    attempts = int(extra.get("attempts") or 0) + 1
+    _set_extra(row, {"attempts": attempts, "started_at": _iso(now)})
+    recipient = _recipient_email(row)
+    if not _email_valid(recipient):
+        _mark_terminal(row, "failed_permanent", code="invalid_email")
+    elif not email_delivery_configured(settings):
+        _mark_terminal(row, "blocked_configuration", code="delivery_configuration_missing")
+    else:
+        try:
+            await asyncio.to_thread(
+                _send_email_sync,
+                recipient,
+                row.title or "Luxury Shopping",
+                row.message or "",
+                extra,
+            )
+            _mark_terminal(row, "provider_accepted", provider_id=f"{_email_provider_mode(settings)}:accepted")
+        except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
+            code = getattr(error, "smtp_code", None)
+            if isinstance(code, int) and 400 <= code < 500:
+                _mark_retry(row, attempts, f"smtp_{code}", error)
+            else:
+                _mark_terminal(row, "failed_permanent", code=f"smtp_{code or 'permanent'}")
+        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, smtplib.SMTPHeloError, OSError, TimeoutError) as error:
+            _mark_retry(row, attempts, error.__class__.__name__, error)
+        except httpx.HTTPStatusError as error:
+            status_code = error.response.status_code
+            if status_code in PERMANENT_HTTP_STATUSES:
+                _mark_terminal(row, "failed_permanent", code=f"email_provider_http_{status_code}")
+            else:
+                _mark_retry(row, attempts, f"email_provider_http_{status_code}", error)
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            _mark_retry(row, attempts, error.__class__.__name__, error)
+    await session.flush()
+    return {
+        "status": row.status,
+        "provider": _email_provider_mode(settings) if row.status == "provider_accepted" else None,
+        "error_code": _extra(row).get("last_error_code"),
+    }
+
+
 async def _claim_rows(session: AsyncSession, table: str, limit: int) -> list[Any]:
     model = MODEL_BY_TABLE[table]
     rows = list(

@@ -54,6 +54,7 @@ from ...services.financial_calculator import (
     unit_price,
 )
 from ...services.merchant_order_scope import merchant_order_detail, merchant_order_list
+from ...services.public_read_cache import cache_key, public_read_cache
 from ...services.commerce_rules import (
     eligible_line,
     parse_strict_quantity,
@@ -880,6 +881,39 @@ async def _catalog_products_page(
     include_total: bool = True,
     **filters: Any,
 ) -> dict[str, Any]:
+    key = cache_key(
+        "catalog-products",
+        page=page,
+        page_size=page_size,
+        offset=offset,
+        sort=sort,
+        include_total=include_total,
+        filters=filters,
+    )
+    return await public_read_cache.get_or_set(
+        key,
+        lambda: _catalog_products_page_uncached(
+            session,
+            page=page,
+            page_size=page_size,
+            offset=offset,
+            sort=sort,
+            include_total=include_total,
+            **filters,
+        ),
+    )
+
+
+async def _catalog_products_page_uncached(
+    session: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    offset: int | None,
+    sort: str,
+    include_total: bool = True,
+    **filters: Any,
+) -> dict[str, Any]:
     safe_page_size = min(max(int(page_size or 20), 1), 5000)
     safe_page = max(int(page or 1), 1)
     safe_offset = max(int(offset), 0) if offset is not None else (safe_page - 1) * safe_page_size
@@ -918,6 +952,11 @@ async def _catalog_products_page(
 
 @router.get("/categories")
 async def categories(limit: int = Query(100, ge=1, le=5000), session: AsyncSession = Depends(get_session)):
+    key = cache_key("catalog-categories", limit=limit)
+    return await public_read_cache.get_or_set(key, lambda: _categories_uncached(limit=limit, session=session))
+
+
+async def _categories_uncached(limit: int, session: AsyncSession) -> list[dict[str, Any]]:
     statement = (
         select(Category, func.count(Product.id).label("product_count"))
         .outerjoin(
@@ -952,6 +991,11 @@ async def catalog_admin_categories(staff: User = Depends(require_staff), session
 
 @router.get("/brands")
 async def brands(limit: int = Query(100, ge=1, le=5000), session: AsyncSession = Depends(get_session)):
+    key = cache_key("catalog-brands", limit=limit)
+    return await public_read_cache.get_or_set(key, lambda: _brands_uncached(limit=limit, session=session))
+
+
+async def _brands_uncached(limit: int, session: AsyncSession) -> list[dict[str, Any]]:
     result = await session.execute(
         select(Brand)
         .where(Brand.deleted_at.is_(None), Brand.is_active.is_(True))
@@ -971,6 +1015,11 @@ async def catalog_brands(limit: int = Query(500, ge=1, le=5000), session: AsyncS
 
 @router.get("/api/catalog/currencies")
 async def catalog_currencies(limit: int = Query(100, ge=1, le=5000), session: AsyncSession = Depends(get_session)):
+    key = cache_key("catalog-currencies", limit=limit)
+    return await public_read_cache.get_or_set(key, lambda: _catalog_currencies_uncached(limit=limit, session=session))
+
+
+async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["currencies"]
     statement = select(model)
     if "deleted_at" in model.__table__.c:
@@ -1158,6 +1207,13 @@ async def product_detail(product_id: str, session: AsyncSession = Depends(get_se
     identifier = unquote(product_id).strip()
     if not identifier:
         raise HTTPException(status_code=404, detail="product_not_found")
+    return await public_read_cache.get_or_set(
+        cache_key("catalog-product-detail", identifier=identifier),
+        lambda: _product_detail_uncached(identifier, session),
+    )
+
+
+async def _product_detail_uncached(identifier: str, session: AsyncSession) -> dict[str, Any]:
     lookup_clauses = []
     try:
         lookup_clauses.append(Product.id == uuid.UUID(identifier))

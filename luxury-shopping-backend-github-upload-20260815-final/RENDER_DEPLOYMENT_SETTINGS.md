@@ -60,9 +60,9 @@
 - `FIREBASE_SERVICE_ACCOUNT_JSON` أو `GOOGLE_APPLICATION_CREDENTIALS_JSON`
 - `GEMINI_API_KEY`
 - `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`
-- `EMAIL_PROVIDER=smtp`
-- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`
-- `RESEND_API_KEY`, `RESEND_FROM_EMAIL` لا تُستخدم مع `EMAIL_PROVIDER=smtp`؛ أضفها فقط إذا قررت التحويل إلى Resend لاحقًا
+- `EMAIL_PROVIDER=resend`
+- `RESEND_API_KEY`, `RESEND_FROM_EMAIL` من نطاق موثّق في Resend
+- بديل SMTP عند الحاجة: `EMAIL_PROVIDER=smtp` مع `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`
 
 القيم العامة الخاصة بالذكاء الاصطناعي والإشعارات موجودة في `render.yaml`. المتغيرات السرية لا تُحفظ في GitHub.
 

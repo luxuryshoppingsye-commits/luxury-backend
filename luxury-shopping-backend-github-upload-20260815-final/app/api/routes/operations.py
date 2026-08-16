@@ -72,6 +72,7 @@ from ...services.payment_refund_security import (
     signed_receipt_file_response,
     update_refund_workflow_status,
 )
+from ...services.public_read_cache import cache_key, public_read_cache
 from ...services.realtime import (
     REALTIME_PROTOCOL,
     RealtimeEventService,
@@ -692,26 +693,61 @@ async def sync_bootstrap(user: User = Depends(current_user), session: AsyncSessi
 
 @router.get("/content/site")
 async def public_site_content(session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-site"),
+        lambda: _public_site_content_uncached(session),
+    )
+
+
+async def _public_site_content_uncached(session: AsyncSession) -> dict[str, Any]:
     return {"data": [serialize_record(row) for row in await _public_rows(session, "site_content")]}
 
 
 @router.get("/content/menus")
 async def public_site_menus(admin: bool = False, session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-menus", admin=admin),
+        lambda: _public_site_menus_uncached(session),
+    )
+
+
+async def _public_site_menus_uncached(session: AsyncSession) -> dict[str, Any]:
     return {"data": [serialize_record(row) for row in await _public_rows(session, "site_menus")]}
 
 
 @router.get("/content/social-links")
 async def public_social_links(admin: bool = False, session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-social-links", admin=admin),
+        lambda: _public_social_links_uncached(session),
+    )
+
+
+async def _public_social_links_uncached(session: AsyncSession) -> dict[str, Any]:
     return {"data": [serialize_record(row) for row in await _public_rows(session, "social_links")]}
 
 
 @router.get("/content/theme")
 async def public_theme_settings(session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-theme"),
+        lambda: _public_theme_settings_uncached(session),
+    )
+
+
+async def _public_theme_settings_uncached(session: AsyncSession) -> dict[str, Any]:
     return {"data": [serialize_record(row) for row in await _public_rows(session, "theme_settings", limit=200)]}
 
 
 @router.get("/content/settings/public/{setting_key}")
 async def public_setting(setting_key: str, session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-setting", setting_key=setting_key),
+        lambda: _public_setting_uncached(setting_key, session),
+    )
+
+
+async def _public_setting_uncached(setting_key: str, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["site_settings"]
     columns = model.__table__.c
     clauses = []
@@ -731,6 +767,13 @@ async def public_setting(setting_key: str, session: AsyncSession = Depends(get_s
 
 @router.get("/content/sections")
 async def public_page_sections(page: str = "home", session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-sections", page=page),
+        lambda: _public_page_sections_uncached(page, session),
+    )
+
+
+async def _public_page_sections_uncached(page: str, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["page_sections"]
     columns = model.__table__.c
     clauses = []
@@ -743,6 +786,13 @@ async def public_page_sections(page: str = "home", session: AsyncSession = Depen
 
 @router.get("/content/pages/{slug}")
 async def public_static_page(slug: str, session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("content-page", slug=slug),
+        lambda: _public_static_page_uncached(slug, session),
+    )
+
+
+async def _public_static_page_uncached(slug: str, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["static_pages"]
     columns = model.__table__.c
     result = await session.execute(select(model).where(columns.slug == slug).limit(1))
@@ -758,6 +808,13 @@ async def public_suppliers(
     active: bool | None = Query(None),
     session: AsyncSession = Depends(get_session),
 ):
+    return await public_read_cache.get_or_set(
+        cache_key("public-suppliers", type=type, active=active),
+        lambda: _public_suppliers_uncached(type, active, session),
+    )
+
+
+async def _public_suppliers_uncached(type: str | None, active: bool | None, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["suppliers"]
     columns = model.__table__.c
     clauses = []

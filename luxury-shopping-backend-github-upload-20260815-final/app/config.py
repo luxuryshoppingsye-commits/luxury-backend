@@ -127,7 +127,10 @@ class Settings(BaseSettings):
     smtp_username: str = Field("", alias="SMTP_USERNAME")
     smtp_password: str = Field("", alias="SMTP_PASSWORD")
     smtp_from_email: str = Field("", alias="SMTP_FROM_EMAIL")
-    email_provider: str = Field("smtp", alias="EMAIL_PROVIDER")
+    # Prefer the provider that is actually configured. Production uses Resend
+    # when RESEND_API_KEY and RESEND_FROM_EMAIL are present, while retaining
+    # SMTP as a deliberate fallback for installations that configure it.
+    email_provider: str = Field("auto", alias="EMAIL_PROVIDER")
     resend_api_url: str = Field("https://api.resend.com/emails", alias="RESEND_API_URL")
     resend_api_key: str = Field("", alias="RESEND_API_KEY")
     resend_from_email: str = Field("", alias="RESEND_FROM_EMAIL")
@@ -183,6 +186,12 @@ class Settings(BaseSettings):
         5.0,
         alias="MESSAGE_WORKER_POLL_SECONDS",
         ge=1.0,
+        le=60.0,
+    )
+    public_read_cache_ttl_seconds: float = Field(
+        5.0,
+        alias="PUBLIC_READ_CACHE_TTL_SECONDS",
+        ge=0.0,
         le=60.0,
     )
     message_bulk_recipient_limit: int = Field(100, alias="MESSAGE_BULK_RECIPIENT_LIMIT", ge=1, le=5000)

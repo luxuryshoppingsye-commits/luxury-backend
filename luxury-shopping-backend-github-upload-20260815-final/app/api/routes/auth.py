@@ -62,7 +62,7 @@ from ...services.staff_permissions import (
     normalize_permissions,
 )
 from ...services.firebase_auth_service import firebase_admin_configuration_status, verify_firebase_id_token
-from ...services.outbox_service import email_delivery_configured
+from ...services.outbox_service import deliver_email_now, email_delivery_configured
 
 
 router = APIRouter(tags=["auth"])
@@ -1433,7 +1433,11 @@ async def password_reset_request(
     user = (await session.execute(
         select(User).where(func.lower(User.email) == email, User.deleted_at.is_(None))
     )).scalar_one_or_none()
+    delivery_status = "not_required"
     if user is not None:
+        settings = get_settings()
+        if not settings.fixtures_enabled and not email_delivery_configured(settings):
+            raise HTTPException(status_code=503, detail="password_reset_email_unconfigured")
         now = datetime.now(timezone.utc)
         old_tokens = (
             await session.execute(
@@ -1460,10 +1464,11 @@ async def password_reset_request(
         )
         session.add(reset_row)
         await session.flush()
-        session.add(PasswordResetTokenState(reset_token_id=reset_row.id))
+        reset_state = PasswordResetTokenState(reset_token_id=reset_row.id)
+        session.add(reset_state)
         reset_link = _append_query_param(redirect_target, "token", raw_token)
         delivery_status = _email_delivery_status()
-        session.add(EMAIL_OUTBOX(
+        email_row = EMAIL_OUTBOX(
             user_id=user.id,
             title="استعادة كلمة المرور",
             email=user.email,
@@ -1473,9 +1478,19 @@ async def password_reset_request(
                 "reset_url": reset_link,
                 "redirect_to": redirect_target,
                 "client_type": body.client_type,
+                "category": "security",
                 "expires_in_minutes": 30,
             },
-        ))
+        )
+        session.add(email_row)
+        await session.flush()
+        if not settings.fixtures_enabled:
+            delivery = await deliver_email_now(session, email_row)
+            delivery_status = delivery["status"]
+            if delivery_status != "provider_accepted":
+                reset_state.invalidated_at = datetime.now(timezone.utc)
+                await session.commit()
+                raise HTTPException(status_code=503, detail="password_reset_email_delivery_failed")
         await record_security_event(
             session,
             user_id=user.id,
@@ -1485,7 +1500,7 @@ async def password_reset_request(
             request=request,
         )
     await session.commit()
-    return {"ok": True}
+    return {"ok": True, "delivery_status": delivery_status}
 
 
 @router.post("/auth/password-reset-confirm")

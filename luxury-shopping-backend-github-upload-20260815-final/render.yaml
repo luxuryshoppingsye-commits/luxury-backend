@@ -61,6 +61,8 @@ services:
         value: "true"
       - key: MESSAGE_WORKER_POLL_SECONDS
         value: "5"
+      - key: PUBLIC_READ_CACHE_TTL_SECONDS
+        value: "5"
       - key: FIREBASE_PROJECT_ID
         value: luxury-345be
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
@@ -74,15 +76,15 @@ services:
       - key: VAPID_SUBJECT
         sync: false
       - key: SMTP_HOST
-        sync: false
+        value: smtp.gmail.com
       - key: SMTP_PORT
-        sync: false
+        value: "587"
       - key: SMTP_USERNAME
-        sync: false
+        value: luxuryshoppingsye@gmail.com
       - key: SMTP_PASSWORD
         sync: false
       - key: SMTP_FROM_EMAIL
-        sync: false
+        value: luxuryshoppingsye@gmail.com
       - key: EMAIL_PROVIDER
         value: smtp
       - key: RESEND_API_URL

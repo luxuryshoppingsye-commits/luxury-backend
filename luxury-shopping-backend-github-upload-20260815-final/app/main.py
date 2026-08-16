@@ -34,6 +34,7 @@ from .services.api_protection import (
     sanitize_request_id,
     set_current_request_id,
 )
+from .services.public_read_cache import public_read_cache
 from .storage import FileStorage
 
 
@@ -178,7 +179,11 @@ async def lifespan(_: FastAPI):
     message_worker = None
     message_worker_task = None
     worker_flag = os.getenv("ENABLE_MESSAGE_WORKER", "").strip().lower()
-    worker_enabled = settings.app_env == "production" or worker_flag in {"1", "true", "yes", "on"}
+    worker_enabled = (
+        worker_flag in {"1", "true", "yes", "on"}
+        if worker_flag
+        else settings.app_env == "production"
+    )
     if worker_enabled:
         from .workers.message_worker import MessageWorker
 
@@ -539,6 +544,11 @@ async def request_security(request: Request, call_next):
         return response
 
     response = await call_next(request)
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        # Any successful or failed write may have changed public catalogue or
+        # content data. Clearing is process-local and cheap; the five-second
+        # TTL still protects other web workers from serving stale data long.
+        public_read_cache.clear()
     for key, value in rate_limit.headers.items():
         response.headers.setdefault(key, value)
     _apply_security_headers(request, response)

@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from backend.app.services import outbox_service
 
@@ -93,3 +96,66 @@ def test_resend_payload_contains_arabic_content_logo_and_action_link(monkeypatch
     assert "رفاهية التسوق" in payload["html"]
     assert "logo-OdLYDlxV.png" in payload["html"]
     assert "????" not in payload["html"]
+
+
+@pytest.mark.asyncio
+async def test_critical_email_delivery_returns_provider_acceptance(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        email_provider="resend",
+        resend_api_key="resend_test_key",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="no-reply@luxuryshoppings.com",
+        smtp_host="",
+        smtp_username="",
+        smtp_password="",
+        smtp_from_email="",
+    )
+    sent = []
+
+    def fake_send(recipient, subject, message, extra_data=None):
+        sent.append((recipient, subject, message, extra_data))
+
+    monkeypatch.setattr(outbox_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(outbox_service, "_send_email_sync", fake_send)
+    row = SimpleNamespace(
+        status="pending",
+        email="customer@example.com",
+        title="استعادة كلمة المرور",
+        message="رابط الاختبار",
+        extra_data={},
+    )
+    session = SimpleNamespace(flush=AsyncMock())
+
+    result = await outbox_service.deliver_email_now(session, row)
+
+    assert result["status"] == "provider_accepted"
+    assert result["provider"] == "resend"
+    assert sent and sent[0][0] == "customer@example.com"
+    session.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_critical_email_delivery_blocks_when_provider_is_unconfigured(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        email_provider="resend",
+        resend_api_key="",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="",
+        smtp_host="",
+        smtp_username="",
+        smtp_password="",
+        smtp_from_email="",
+    )
+    monkeypatch.setattr(outbox_service, "get_settings", lambda: settings)
+    row = SimpleNamespace(
+        status="pending",
+        email="customer@example.com",
+        title="استعادة كلمة المرور",
+        message="رابط الاختبار",
+        extra_data={},
+    )
+    session = SimpleNamespace(flush=AsyncMock())
+
+    result = await outbox_service.deliver_email_now(session, row)
+
+    assert result == {"status": "blocked_configuration", "provider": None, "error_code": "delivery_configuration_missing"}
