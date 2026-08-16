@@ -231,8 +231,13 @@ def _send_email_sync(
 ) -> None:
     settings = get_settings()
     extra = extra_data or {}
+    sender = str(settings.smtp_from_email or settings.smtp_username or "").strip()
+    # Google displays App Passwords in groups separated by spaces. Render may
+    # preserve those spaces when the secret is pasted, but Gmail expects the
+    # compact 16-character value during SMTP authentication.
+    smtp_password = re.sub(r"\s+", "", str(settings.smtp_password or ""))
     email = EmailMessage(policy=SMTP)
-    email["From"] = settings.smtp_from_email or settings.smtp_username
+    email["From"] = sender
     email["To"] = recipient
     email["Subject"] = str(subject or "Luxury Shopping")[:200].replace("\r", " ").replace("\n", " ")
     email.set_content(str(message or ""))
@@ -244,13 +249,13 @@ def _send_email_sync(
     action_html = ""
     if action_url and action_url.startswith(("https://", "http://")):
         action_html = (
-            f'<p style="margin:28px 0 8px;text-align:center">'
+            f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:28px 0 12px"><tr><td align="center">'
             f'<a href="{escape(action_url, quote=True)}" '
-            'style="display:inline-block;background:#976817;color:#fff;text-decoration:none;'
-            'padding:14px 28px;border-radius:10px;font-weight:700">'
-            f"{escape(action_label)}</a></p>"
-            f'<p style="font-size:12px;color:#6b7280;word-break:break-all;text-align:center">'
-            f"إذا لم يعمل الزر، انسخ هذا الرابط:<br>{escape(action_url)}</p>"
+            'style="display:inline-block;background:#b88618;color:#fff;text-decoration:none;'
+            'padding:15px 30px;border-radius:12px;font-weight:700;font-size:16px;line-height:1.5">'
+            f"{escape(action_label)}</a></td></tr></table>"
+            f'<p style="font-size:12px;color:#78808f;word-break:break-word;text-align:center;line-height:1.8;margin:0">'
+            f"إذا ما فتح الزر، انسخ الرابط التالي:<br><span dir=\"ltr\">{escape(action_url)}</span></p>"
         )
     plain_message = str(message or "رفاهية التسوق")
     if action_url and action_url.startswith(("https://", "http://")):
@@ -258,12 +263,16 @@ def _send_email_sync(
     email.set_content(plain_message)
     email.add_alternative(
         f"""<!doctype html>
-<html lang=\"ar\" dir=\"rtl\"><body style=\"margin:0;background:#f7f3ec;font-family:Arial,sans-serif;color:#172033\">
-<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"padding:32px 12px\"><tr><td align=\"center\">
-<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:620px;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 10px 30px rgba(23,32,51,.08)\">
-<tr><td style=\"background:#172033;padding:26px;text-align:center\"><img src=\"{escape(logo_url, quote=True)}\" alt=\"رفاهية التسوق\" width=\"180\" style=\"display:block;margin:0 auto;max-width:180px;height:auto\"></td></tr>
- <tr><td style=\"padding:34px 30px\"><p style=\"margin:0 0 12px;color:#9a6a05;font-size:14px;font-weight:700\">رفاهية التسوق</p><h1 style=\"margin:0 0 22px;font-size:25px\">{safe_subject}</h1><p style=\"font-size:16px;line-height:1.9;margin:0\">{safe_message}</p>{action_html}</td></tr>
-<tr><td style=\"padding:18px 30px;background:#faf8f4;color:#6b7280;text-align:center;font-size:12px\">هذه رسالة آلية من رفاهية التسوق. لا ترد على هذا البريد.</td></tr>
+<html lang=\"ar\" dir=\"rtl\">
+<head><meta charset=\"utf-8\"><meta name=\"x-apple-disable-message-reformatting\"><meta name=\"format-detection\" content=\"telephone=no\"></head>
+<body dir=\"rtl\" style=\"margin:0;padding:0;background:#f4efe7;color:#172033;font-family:Tahoma,Arial,sans-serif;line-height:1.8\">
+<div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">رسالة من رفاهية التسوق</div>
+<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4efe7;padding:34px 12px\"><tr><td align=\"center\">
+<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:620px;background:#ffffff;border:1px solid #eadfce;border-radius:24px;overflow:hidden\">
+<tr><td style=\"height:5px;background:#c89a2b;font-size:0;line-height:0\">&nbsp;</td></tr>
+<tr><td style=\"background:#182235;padding:28px 24px;text-align:center\"><img src=\"{escape(logo_url, quote=True)}\" alt=\"رفاهية التسوق\" width=\"190\" style=\"display:block;margin:0 auto;max-width:190px;height:auto\"><p style=\"margin:12px 0 0;color:#e8c76b;font-size:12px;line-height:1.5;letter-spacing:normal\">تجربة تسوق تليق بك</p></td></tr>
+<tr><td style=\"padding:36px 30px 30px;text-align:right;direction:rtl\"><p style=\"margin:0 0 10px;color:#a87810;font-size:14px;font-weight:700;line-height:1.6\">رفاهية التسوق</p><h1 style=\"margin:0 0 18px;color:#182235;font-size:25px;line-height:1.35;font-weight:700\">{safe_subject}</h1><p style=\"margin:0;color:#4f5a6b;font-size:16px;line-height:1.9\">{safe_message}</p>{action_html}</td></tr>
+<tr><td style=\"padding:19px 30px;background:#fbf8f2;border-top:1px solid #f0e7da;color:#78808f;text-align:center;font-size:12px;line-height:1.8\">هذه رسالة آلية من رفاهية التسوق.<br>إذا لم تطلب هذه الرسالة، يمكنك تجاهلها بأمان.</td></tr>
 </table></td></tr></table></body></html>""",
         subtype="html",
     )
@@ -279,12 +288,12 @@ def _send_email_sync(
         return
     if settings.smtp_port == 465:
         with _IPv4SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=20, context=ssl.create_default_context()) as client:
-            client.login(settings.smtp_username, settings.smtp_password)
+            client.login(settings.smtp_username.strip(), smtp_password)
             client.send_message(email)
         return
     with _IPv4SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as client:
         client.starttls()
-        client.login(settings.smtp_username, settings.smtp_password)
+        client.login(settings.smtp_username.strip(), smtp_password)
         client.send_message(email)
 
 

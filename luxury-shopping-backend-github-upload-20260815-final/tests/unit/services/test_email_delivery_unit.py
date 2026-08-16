@@ -98,6 +98,53 @@ def test_resend_payload_contains_arabic_content_logo_and_action_link(monkeypatch
     assert "????" not in payload["html"]
 
 
+def test_smtp_strips_google_app_password_spaces_and_uses_branded_html(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        email_provider="smtp",
+        smtp_host="smtp.gmail.com",
+        smtp_port=587,
+        smtp_username="luxuryshoppingsye@gmail.com",
+        smtp_password="abcd efgh ijkl mnop",
+        smtp_from_email="luxuryshoppingsye@gmail.com",
+        resend_api_key="",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="",
+    )
+    captured = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def starttls(self):
+            return None
+
+        def login(self, username, password):
+            captured["credentials"] = (username, password)
+
+        def send_message(self, message):
+            captured["message"] = message
+
+    monkeypatch.setattr(outbox_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(outbox_service, "_IPv4SMTP", lambda *args, **kwargs: FakeClient())
+
+    outbox_service._send_email_sync(
+        "customer@example.com",
+        "استعادة كلمة المرور",
+        "اضغط الزر لاستعادة كلمة المرور.",
+        {"reset_url": "https://luxuryshoppings.com/reset-password?token=test"},
+    )
+
+    assert captured["credentials"] == ("luxuryshoppingsye@gmail.com", "abcdefghijklmnop")
+    html = captured["message"].get_body(preferencelist=("html",)).get_content()
+    assert "https://luxuryshoppings.com/assets/logo-OdLYDlxV.png" in html
+    assert "تجربة تسوق تليق بك" in html
+    assert "letter-spacing:normal" in html
+
+
 @pytest.mark.asyncio
 async def test_critical_email_delivery_returns_provider_acceptance(monkeypatch) -> None:
     settings = SimpleNamespace(
