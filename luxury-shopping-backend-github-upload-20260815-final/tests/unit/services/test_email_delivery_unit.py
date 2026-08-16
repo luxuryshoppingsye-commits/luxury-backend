@@ -159,3 +159,37 @@ async def test_critical_email_delivery_blocks_when_provider_is_unconfigured(monk
     result = await outbox_service.deliver_email_now(session, row)
 
     assert result == {"status": "blocked_configuration", "provider": None, "error_code": "delivery_configuration_missing"}
+
+
+@pytest.mark.asyncio
+async def test_critical_email_delivery_reports_gmail_authentication_failure(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        email_provider="smtp",
+        smtp_host="smtp.gmail.com",
+        smtp_port=587,
+        smtp_username="sender@example.com",
+        smtp_password="app-password",
+        smtp_from_email="sender@example.com",
+        resend_api_key="",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="",
+    )
+
+    monkeypatch.setattr(outbox_service, "get_settings", lambda: settings)
+
+    def fake_send(*_args, **_kwargs):
+        raise outbox_service.smtplib.SMTPAuthenticationError(535, b"5.7.8 Authentication failed")
+
+    monkeypatch.setattr(outbox_service, "_send_email_sync", fake_send)
+    row = SimpleNamespace(
+        status="pending",
+        email="customer@example.com",
+        title="استعادة كلمة المرور",
+        message="رابط الاختبار",
+        extra_data={},
+    )
+    session = SimpleNamespace(flush=AsyncMock())
+
+    result = await outbox_service.deliver_email_now(session, row)
+
+    assert result == {"status": "failed_permanent", "provider": None, "error_code": "smtp_auth_535"}

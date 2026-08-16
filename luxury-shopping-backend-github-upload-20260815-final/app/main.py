@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 
-from .api.routes import auth, commerce, e2e_verification, internal, operations, resources
+from .api.routes import auth, commerce, e2e_verification, internal, operations, resources, share
 from .config import get_settings
 from .database import database_ready, engine
 from .models import Base
@@ -659,6 +659,7 @@ app.include_router(operations.router)
 app.include_router(resources.router)
 app.include_router(e2e_verification.router)
 app.include_router(internal.router)
+app.include_router(share.router)
 app.include_router(auth.router, prefix="/api", include_in_schema=False)
 app.include_router(commerce.router, prefix="/api", include_in_schema=False)
 app.include_router(operations.router, prefix="/api", include_in_schema=False)
