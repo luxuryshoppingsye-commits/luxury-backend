@@ -183,6 +183,7 @@ PUBLIC_GET_PREFIXES = (
     "/api/reviews/store/public",
     "/uploads",
     "/api/uploads",
+    "/share/products",
 )
 PUBLIC_POST_PATHS = frozenset(
     {

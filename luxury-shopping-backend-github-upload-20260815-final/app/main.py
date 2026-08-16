@@ -348,12 +348,17 @@ def _has_auth_context(request: Request) -> bool:
 def _apply_cache_headers(request: Request, response) -> None:
     path = request.url.path
     has_auth_context = _has_auth_context(request)
+    is_share_image = (
+        request.method in {"GET", "HEAD"}
+        and path.lower().endswith("/image")
+        and _matches_prefix(path, ("/share/products",))
+    )
     is_static_file = (
         request.method in {"GET", "HEAD"}
         and not has_auth_context
         and _matches_prefix(path, ("/uploads", "/api/uploads"))
     )
-    if is_static_file:
+    if (is_static_file or is_share_image) and not has_auth_context:
         response.headers["Cache-Control"] = "public, max-age=86400, immutable"
         if "Pragma" in response.headers:
             del response.headers["Pragma"]
@@ -369,6 +374,11 @@ def _apply_cache_headers(request: Request, response) -> None:
 
 def _apply_security_headers(request: Request, response) -> None:
     path = request.url.path
+    is_share_image = (
+        request.method in {"GET", "HEAD"}
+        and path.lower().endswith("/image")
+        and _matches_prefix(path, ("/share/products",))
+    )
     response.headers[REQUEST_ID_HEADER] = request_id_from_request(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -382,7 +392,8 @@ def _apply_security_headers(request: Request, response) -> None:
     )
     response.headers["Cross-Origin-Resource-Policy"] = (
         "cross-origin"
-        if request.method in {"GET", "HEAD"} and _matches_prefix(path, ("/uploads", "/api/uploads"))
+        if request.method in {"GET", "HEAD"}
+        and (_matches_prefix(path, ("/uploads", "/api/uploads")) or is_share_image)
         else "same-origin"
     )
     if settings.app_env in {"production", "staging"} or request.url.scheme == "https":

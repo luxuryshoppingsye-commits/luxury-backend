@@ -28,6 +28,8 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
         "/api/suppliers/counts/products",
         "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e",
         "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/stats",
+        "/share/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e",
+        "/share/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/image",
     )
     for path in public_reads:
         policy = policy_for_route("GET", path)

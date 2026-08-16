@@ -1,7 +1,7 @@
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.main import _apply_cache_headers
+from app.main import _apply_cache_headers, _apply_security_headers
 
 
 def _request(path: str, method: str = "GET", headers: dict[str, str] | None = None) -> Request:
@@ -79,6 +79,18 @@ def test_public_uploads_keep_static_file_cache_headers():
     _apply_cache_headers(_request("/uploads/products/example.webp"), response)
 
     assert response.headers["cache-control"] == "public, max-age=86400, immutable"
+
+
+def test_share_images_are_cross_origin_and_cacheable():
+    response = Response()
+
+    _apply_security_headers(
+        _request("/share/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/image"),
+        response,
+    )
+
+    assert response.headers["cache-control"] == "public, max-age=86400, immutable"
+    assert response.headers["cross-origin-resource-policy"] == "cross-origin"
 
 
 def test_public_catalog_with_refresh_cookie_is_not_persistently_cacheable():
