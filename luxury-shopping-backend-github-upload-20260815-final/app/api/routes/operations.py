@@ -541,14 +541,23 @@ def _storage_diagnostics() -> dict[str, Any]:
 @router.get("/api/health")
 async def health(session: AsyncSession = Depends(get_session)):
     settings = get_settings()
+    public_payload = {
+        "status": "ok",
+        "mode": "postgresql",
+        "database": "connected",
+        "database_connected": True,
+    }
+    # Keep detailed counts and runtime diagnostics available to local
+    # development/tests, but never expose database names, fixture flags, or
+    # catalog counts from the public production health endpoint.
+    if settings.app_env not in {"development", "test"}:
+        return public_payload
     counts = {}
     for table in ("users", "products", "categories", "orders"):
         model = MODEL_BY_TABLE[table]
         counts[table] = int((await session.execute(select(func.count()).select_from(model))).scalar_one())
     return {
-        "status": "ok",
-        "mode": "postgresql",
-        "database": "connected",
+        **public_payload,
         "app_env": settings.app_env,
         "database_name": settings.database_name,
         "allow_test_fixtures": settings.allow_test_fixtures,
@@ -562,6 +571,8 @@ async def health(session: AsyncSession = Depends(get_session)):
 @router.get("/health/live")
 async def health_live():
     settings = get_settings()
+    if settings.app_env not in {"development", "test"}:
+        return {"status": "ok"}
     return {
         "status": "ok",
         "app_env": settings.app_env,
@@ -573,7 +584,7 @@ async def health_live():
 
 
 @router.get("/health/storage")
-async def health_storage():
+async def health_storage(_: User = Depends(require_admin)):
     return storage.r2_diagnostics()
 
 
@@ -620,10 +631,16 @@ async def health_ready(session: AsyncSession = Depends(get_session)):
         except Exception:
             critical_schema = {"ready": False, "missing_tables": ["schema_check_failed"]}
     ready = ready and bool(critical_schema.get("ready"))
-    return {
+    public_payload = {
         "status": "ok" if ready else "unavailable",
         "mode": "postgresql",
         "database": "connected" if ready else "unavailable",
+        "database_connected": ready,
+    }
+    if settings.app_env not in {"development", "test"}:
+        return public_payload
+    return {
+        **public_payload,
         "critical_schema": critical_schema,
         "app_env": settings.app_env,
         "database_name": settings.database_name,

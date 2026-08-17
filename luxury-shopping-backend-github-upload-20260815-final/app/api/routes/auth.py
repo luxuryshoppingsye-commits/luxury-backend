@@ -343,7 +343,6 @@ def _web_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("access_token"):
         session_payload = {
             "access_token": payload.get("access_token"),
-            "refresh_token": payload.get("refresh_token"),
             "token_type": payload.get("token_type", "bearer"),
             "expires_in": payload.get("expires_in"),
         }
@@ -363,6 +362,7 @@ def _web_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _set_refresh_cookie(response: Response, payload: dict[str, Any]) -> None:
+    secure_cookie = get_settings().app_env in {"production", "staging"}
     access_token = payload.get("access_token")
     if access_token:
         response.set_cookie(
@@ -370,7 +370,7 @@ def _set_refresh_cookie(response: Response, payload: dict[str, Any]) -> None:
             str(access_token),
             httponly=True,
             samesite="lax",
-            secure=False,
+            secure=secure_cookie,
             path="/",
             max_age=int(payload.get("expires_in") or 3600),
         )
@@ -381,7 +381,7 @@ def _set_refresh_cookie(response: Response, payload: dict[str, Any]) -> None:
             str(token),
             httponly=True,
             samesite="lax",
-            secure=False,
+            secure=secure_cookie,
             path="/",
             max_age=60 * 60 * 24 * 30,
         )
@@ -396,6 +396,11 @@ async def _firebase_auth_payload(
     session: AsyncSession,
 ) -> dict[str, Any]:
     claims = await verify_firebase_id_token(body.id_token)
+    # Never bind a Firebase identity to a local account using an unverified
+    # email claim. Google/Apple social sign-in must prove ownership of the
+    # address before the backend can create or resume a local session.
+    if claims.get("email_verified") is not True:
+        raise HTTPException(status_code=403, detail="firebase_email_not_verified")
     email = str(claims.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(status_code=422, detail="firebase_email_required")

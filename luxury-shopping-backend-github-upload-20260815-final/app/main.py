@@ -206,8 +206,12 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Luxury Shopping API",
     version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # API documentation is useful during local development and tests, but
+    # exposing the schema on the public production service advertises every
+    # route, parameter, and model to unauthenticated scanners.
+    openapi_url="/openapi.json" if settings.app_env in {"development", "test"} else None,
+    docs_url="/docs" if settings.app_env in {"development", "test"} else None,
+    redoc_url="/redoc" if settings.app_env in {"development", "test"} else None,
     lifespan=lifespan,
 )
 
