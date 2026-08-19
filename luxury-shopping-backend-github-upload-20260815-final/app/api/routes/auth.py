@@ -47,7 +47,7 @@ from ...services.auth_service import (
     cleanup_security_artifacts,
     create_phone_otp_token,
     create_user,
-    create_verification_token,
+    create_email_verification_code,
     extract_client_ip,
     record_login_attempt,
     record_security_event,
@@ -285,28 +285,34 @@ async def _queue_email_verification(
     user: User,
     request: Request,
 ) -> dict[str, Any]:
-    raw_token = await create_verification_token(
+    code = await create_email_verification_code(
         session,
         user=user,
-        purpose="email_verification",
         target=user.email,
         request=request,
-        expires_minutes=60,
+        expires_minutes=10,
     )
     settings = get_settings()
-    verify_link = f"{settings.frontend_public_url.rstrip('/')}/verify-email?token={raw_token}"
+    verify_link = (
+        f"{settings.frontend_public_url.rstrip('/')}/verify-email?"
+        f"{urlencode({'email': user.email, 'code': code})}"
+    )
     status = _email_delivery_status()
     session.add(
         EMAIL_OUTBOX(
             user_id=user.id,
             title="فعّل حسابك في رفاهية التسوق",
             email=user.email,
-            message="مرحبًا بك في رفاهية التسوق. فعّل حسابك بالضغط على الزر أدناه خلال 60 دقيقة.",
+            message=(
+                "مرحبًا بك في رفاهية التسوق. رمز تفعيل حسابك هو: "
+                f"{code}. ينتهي الرمز خلال 10 دقائق. يمكنك أيضًا الضغط على زر تفعيل الحساب."
+            ),
             status=status,
             extra_data={
                 "purpose": "email_verification",
                 "verification_url": verify_link,
                 "action_label": "تفعيل الحساب",
+                "verification_expires_minutes": 10,
             },
         )
     )
@@ -315,10 +321,14 @@ async def _queue_email_verification(
         user_id=user.id,
         event_type="email_verification_requested",
         status=status,
-        description="Email verification token generated.",
+        description="Email verification code generated.",
         request=request,
     )
-    return {"requires_verification": True, "delivery_status": status}
+    return {
+        "requires_verification": True,
+        "delivery_status": status,
+        "verification_expires_minutes": 10,
+    }
 
 
 @router.post("/auth/login")
@@ -892,10 +902,26 @@ async def verify_email_alias(
     session: AsyncSession = Depends(get_session),
 ):
     now = datetime.now(timezone.utc)
+    user_hint = None
+    if body.code is not None:
+        normalized_email = str(body.email).strip().lower()
+        user_hint = (
+            await session.execute(
+                select(User).where(
+                    func.lower(User.email) == normalized_email,
+                    User.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if user_hint is None:
+            raise HTTPException(status_code=400, detail="invalid_or_expired_verification_token")
+        verification_hash = token_hash(f"{user_hint.id}:{body.code}")
+    else:
+        verification_hash = token_hash(body.token or "")
     result = await session.execute(
         select(VerificationToken)
         .where(
-            VerificationToken.token_hash == token_hash(body.token),
+            VerificationToken.token_hash == verification_hash,
             VerificationToken.purpose == "email_verification",
         )
         .with_for_update()
@@ -903,7 +929,7 @@ async def verify_email_alias(
     token = result.scalar_one_or_none()
     if token is None or token.used_at is not None or token.invalidated_at is not None or token.expires_at <= now:
         raise HTTPException(status_code=400, detail="invalid_or_expired_verification_token")
-    user = await session.get(User, token.user_id, with_for_update=True)
+    user = user_hint or await session.get(User, token.user_id, with_for_update=True)
     if user is None or user.deleted_at is not None:
         raise HTTPException(status_code=400, detail="invalid_or_expired_verification_token")
     token.used_at = now
@@ -930,7 +956,7 @@ async def verify_email_alias(
         user_id=user.id,
         event_type="email_verification_completed",
         status="success",
-        description="Email verification token consumed.",
+        description="Email verification code consumed.",
         request=request,
     )
     await session.commit()

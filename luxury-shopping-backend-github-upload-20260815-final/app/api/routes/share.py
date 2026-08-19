@@ -61,6 +61,7 @@ def _frontend_origin() -> str:
 
 def _identifier(value: str) -> str:
     identifier = unquote(str(value or "")).strip()
+    identifier = re.sub(r"\.html$", "", identifier, flags=re.IGNORECASE)
     if not identifier or len(identifier) > 160 or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
         raise HTTPException(status_code=404, detail="product_not_found")
     return identifier

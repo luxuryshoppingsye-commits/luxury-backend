@@ -194,7 +194,26 @@ class ProfileUpdateRequest(BaseModel):
 class EmailVerificationConfirm(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    token: str = Field(min_length=32, max_length=512)
+    token: str | None = Field(default=None, min_length=32, max_length=512)
+    email: EmailStr | None = None
+    code: str | None = Field(default=None, min_length=6, max_length=6)
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, value: str | None) -> str | None:
+        if value is not None and not value.isdigit():
+            raise ValueError("invalid_verification_code")
+        return value
+
+    @model_validator(mode="after")
+    def require_token_or_code(self) -> "EmailVerificationConfirm":
+        if self.token is None and self.code is None:
+            raise ValueError("verification_token_or_code_required")
+        if self.token is not None and self.code is not None:
+            raise ValueError("verification_token_or_code_exclusive")
+        if self.code is not None and self.email is None:
+            raise ValueError("email_required_for_verification_code")
+        return self
 
 
 class EmailVerificationRequest(BaseModel):

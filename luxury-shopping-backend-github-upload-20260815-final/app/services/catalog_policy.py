@@ -155,6 +155,7 @@ def public_product_base_clauses(model: type[Product] = Product) -> list[Any]:
     return [
         model.deleted_at.is_(None),
         public_approval_clause(model),
+        public_product_safe_text_clause(model),
     ]
 
 
@@ -171,6 +172,10 @@ def public_product_safe_text_clause(model: type[Product] = Product) -> Any:
         "%FIXTURE%",
         "%RUN_ID%",
         "Imported product%",
+        "%QA%",
+        "%اختبار%",
+        "%تحقق%",
+        "منتج قديم مؤرشف%",
         "Unknown product%",
         "Unknown item%",
     ):

@@ -39,6 +39,7 @@ def test_image_signature_detection_rejects_html() -> None:
 
 def test_share_identifier_rejects_path_traversal() -> None:
     assert share._identifier("4f7bbdb4-0782-4b90-9f5c-a4c7cbad0bb4")
+    assert share._identifier("mMsxpQ.html") == "mMsxpQ"
     try:
         share._identifier("../secret")
     except Exception as error:

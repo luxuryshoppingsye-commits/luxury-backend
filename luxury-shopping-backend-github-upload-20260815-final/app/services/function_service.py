@@ -28,6 +28,7 @@ from .auth_service import account_security_for, bump_security_version, roles_for
 from .catalog_policy import public_product_clauses
 from .financial_calculator import money
 from .outbox_service import process_email_outbox
+from .notification_service import NotificationPayload, NotificationService
 
 
 STAFF_ROLES = {"admin", "manager", "finance", "logistics", "staff", "employee"}
@@ -1543,6 +1544,23 @@ async def _approve_partner(
             is_active=True,
         )
         session.add(storefront)
+    else:
+        storefront.status = "active"
+        storefront.is_active = True
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=application.user_id,
+            title="تمت الموافقة على طلب متجرك",
+            body="تمت الموافقة على طلب متجرك ويمكنك الآن تجهيز المنتجات للمراجعة.",
+            notification_type="partner_application_approved",
+            category="partner",
+            priority="high",
+            entity_type="partner_applications",
+            entity_id=str(application.id),
+            created_by=actor.id,
+            deduplication_key=f"partner-application-review:{application.id}:approved",
+        )
+    )
     await _queue_message(
         session,
         "email_outbox",

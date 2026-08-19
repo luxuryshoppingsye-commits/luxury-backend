@@ -95,6 +95,7 @@ class NotificationPayload:
     action_url: str | None = None
     entity_type: str | None = None
     entity_id: str | None = None
+    order_id: uuid.UUID | None = None
     payload: dict[str, Any] | None = None
     created_by: uuid.UUID | None = None
     source: str = "fastapi"
@@ -153,6 +154,7 @@ class NotificationService:
         row = model(
             user_id=payload.user_id,
             recipient_id=payload.user_id,
+            order_id=payload.order_id,
             title=payload.title,
             body=payload.body,
             message=payload.body,
@@ -557,7 +559,8 @@ class NotificationService:
             channels.append("mobile_push")
         if pref.web_push_enabled and _category_allowed(pref, category):
             channels.append("web_push")
-        channels.append("email")
+        if email_delivery_configured(get_settings()):
+            channels.append("email")
         if category in SECURITY_CATEGORIES:
             for required in ("in_app", "mobile_push", "web_push"):
                 if required not in channels:

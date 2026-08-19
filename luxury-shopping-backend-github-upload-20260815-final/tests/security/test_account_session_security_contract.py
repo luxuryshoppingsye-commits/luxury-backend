@@ -82,6 +82,25 @@ async def _latest_email_token(user_id: uuid.UUID, purpose_key: str) -> str:
     raise AssertionError(f"missing email token for {purpose_key}")
 
 
+async def _latest_email_verification_code(user_id: uuid.UUID) -> str:
+    async with SessionFactory() as session:
+        outbox = MODEL_BY_TABLE["email_outbox"]
+        rows = (
+            await session.execute(
+                select(outbox)
+                .where(outbox.user_id == user_id)
+                .order_by(outbox.created_at.desc())
+            )
+        ).scalars().all()
+        for row in rows:
+            url = (row.extra_data or {}).get("verification_url")
+            if url:
+                code = parse_qs(urlparse(str(url)).query).get("code", [None])[0]
+                if code:
+                    return code
+    raise AssertionError("missing email verification code")
+
+
 async def test_email_verification_gates_new_customer_and_invalidates_old_links() -> None:
     _assert_safe_database()
     run_id = f"acct-{uuid.uuid4().hex[:8]}"
@@ -102,18 +121,27 @@ async def test_email_verification_gates_new_customer_and_invalidates_old_links()
         assert blocked_login.status_code == 403
         assert blocked_login.json()["detail"] == "pending_email_verification"
 
-        old_token = await _latest_email_token(user_id, "verification_url")
+        old_code = await _latest_email_verification_code(user_id)
         resend = await client.post("/api/auth/resend-verification", json={"email": email})
         assert resend.status_code == 200, resend.text
-        latest_token = await _latest_email_token(user_id, "verification_url")
-        assert latest_token != old_token
+        latest_code = await _latest_email_verification_code(user_id)
+        assert latest_code != old_code
 
-        old_verify = await client.post("/api/auth/verify-email", json={"token": old_token})
+        old_verify = await client.post(
+            "/api/auth/verify-email",
+            json={"email": email, "code": old_code},
+        )
         assert old_verify.status_code == 400
 
-        latest_verify = await client.post("/api/auth/verify-email", json={"token": latest_token})
+        latest_verify = await client.post(
+            "/api/auth/verify-email",
+            json={"email": email, "code": latest_code},
+        )
         assert latest_verify.status_code == 200
-        replay = await client.post("/api/auth/verify-email", json={"token": latest_token})
+        replay = await client.post(
+            "/api/auth/verify-email",
+            json={"email": email, "code": latest_code},
+        )
         assert replay.status_code == 400
 
         login = await client.post("/auth/login", json={"email": email, "password": "ValidPass123"})
@@ -474,7 +502,7 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
         rejected_review = await client.post(
             f"/admin/partner-applications/{rejected_application.id}/review",
             headers={"Authorization": admin_tokens["header"]},
-            json={"status": "rejected"},
+            json={"status": "rejected", "reason": "المستندات غير مكتملة"},
         )
         assert rejected_review.status_code == 200, rejected_review.text
         rejected_login = await client.post("/auth/login", json={"email": rejected_email, "password": "ValidPass123"})

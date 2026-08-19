@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.app.schemas.auth import (
+    EmailVerificationConfirm,
     LoginRequest,
     PasswordChangeRequest,
     PasswordResetConfirm,
@@ -11,6 +12,31 @@ from backend.app.schemas.auth import (
     RefreshRequest,
     RegisterRequest,
 )
+
+
+def test_email_verification_confirm_accepts_code_with_email() -> None:
+    payload = EmailVerificationConfirm.model_validate(
+        {"email": "new.customer@luxury-unit.com", "code": "123456"}
+    )
+
+    assert str(payload.email) == "new.customer@luxury-unit.com"
+    assert payload.code == "123456"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"code": "123456"},
+        {"email": "new.customer@luxury-unit.com", "code": "12345"},
+        {"email": "new.customer@luxury-unit.com", "code": "12AB56"},
+        {"token": "t" * 32, "code": "123456", "email": "new.customer@luxury-unit.com"},
+    ],
+)
+def test_email_verification_confirm_rejects_invalid_code_payloads(
+    payload: dict[str, str],
+) -> None:
+    with pytest.raises(ValidationError):
+        EmailVerificationConfirm.model_validate(payload)
 
 
 def test_login_request_accepts_existing_short_legacy_passwords() -> None:

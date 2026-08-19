@@ -1,7 +1,7 @@
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.main import _apply_cache_headers, _apply_security_headers
+from app.main import _apply_cache_headers, _apply_security_headers, _should_invalidate_public_cache
 
 
 def _request(path: str, method: str = "GET", headers: dict[str, str] | None = None) -> Request:
@@ -24,14 +24,14 @@ def _request(path: str, method: str = "GET", headers: dict[str, str] | None = No
     )
 
 
-def test_public_catalog_without_auth_is_not_cached():
+def test_public_catalog_without_auth_is_edge_cacheable():
     response = Response()
 
     _apply_cache_headers(_request("/api/catalog/products"), response)
 
-    assert response.headers["cache-control"] == "no-store"
-    assert response.headers["pragma"] == "no-cache"
-    assert response.headers["expires"] == "0"
+    assert response.headers["cache-control"] == "public, max-age=30, stale-while-revalidate=30"
+    assert "pragma" not in response.headers
+    assert "expires" not in response.headers
 
 
 def test_public_catalog_with_auth_is_not_persistently_cacheable():
@@ -48,7 +48,7 @@ def test_public_catalog_with_auth_is_not_persistently_cacheable():
     assert "Authorization" in response.headers["vary"]
 
 
-def test_public_catalog_with_non_auth_cookie_is_not_cached():
+def test_public_catalog_with_non_auth_cookie_is_edge_cacheable():
     response = Response()
 
     _apply_cache_headers(
@@ -59,8 +59,8 @@ def test_public_catalog_with_non_auth_cookie_is_not_cached():
         response,
     )
 
-    assert response.headers["cache-control"] == "no-store"
-    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["cache-control"] == "public, max-age=30, stale-while-revalidate=30"
+    assert "pragma" not in response.headers
 
 
 def test_health_is_not_cached():
@@ -126,3 +126,13 @@ def test_mutations_are_no_store_even_on_public_paths():
 
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
+
+
+def test_unrelated_writes_do_not_evict_public_read_cache():
+    assert not _should_invalidate_public_cache(_request("/orders", method="POST"))
+    assert not _should_invalidate_public_cache(_request("/api/analytics/events", method="POST"))
+
+
+def test_catalog_and_content_writes_evict_public_read_cache():
+    assert _should_invalidate_public_cache(_request("/manage/products/123", method="PATCH"))
+    assert _should_invalidate_public_cache(_request("/api/content/site/homepage", method="PATCH"))

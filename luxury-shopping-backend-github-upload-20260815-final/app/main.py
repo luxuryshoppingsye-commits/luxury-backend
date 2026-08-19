@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from io import BytesIO
@@ -313,10 +314,20 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/api/catalog/categories",
     "/brands",
     "/api/catalog/brands",
+    "/stores",
+    "/partners",
     "/partner-storefronts",
     "/api/catalog/stores",
+    "/api/catalog/currencies",
     "/settings/theme",
     "/api/settings/theme",
+    "/content/site",
+    "/content/menus",
+    "/content/social-links",
+    "/content/theme",
+    "/content/sections",
+    "/content/pages",
+    "/content/settings/public",
     "/api/content/pages",
     "/api/content/blog",
     "/api/content/menus",
@@ -324,8 +335,29 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/api/content/social-links",
     "/api/content/theme",
     "/api/content/shipping-zones",
+    "/api/content/settings/public",
     "/uploads",
     "/api/uploads",
+)
+
+PUBLIC_CACHE_INVALIDATION_PREFIXES = (
+    "/manage/products",
+    "/manage/brands",
+    "/api/admin/products",
+    "/api/catalog/admin/products",
+    "/api/catalog/admin/categories",
+    "/api/catalog/admin/brands",
+    "/api/admin-data/import/products",
+    "/resources/products",
+    "/resources/product_variants",
+    "/resources/categories",
+    "/resources/brands",
+    "/resources/banners",
+    "/resources/partner_storefronts",
+    "/partner/storefront",
+    "/admin/partner-storefronts",
+    "/api/content",
+    "/content",
 )
 
 AUTH_COOKIE_NAMES = frozenset({"at", "rt"})
@@ -349,6 +381,14 @@ def _has_auth_context(request: Request) -> bool:
     return any(name in request.cookies for name in AUTH_COOKIE_NAMES)
 
 
+def _should_invalidate_public_cache(request: Request) -> bool:
+    """Invalidate catalog/content reads only after writes that can change them."""
+
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    return _matches_prefix(request.url.path, PUBLIC_CACHE_INVALIDATION_PREFIXES)
+
+
 def _apply_cache_headers(request: Request, response) -> None:
     path = request.url.path
     has_auth_context = _has_auth_context(request)
@@ -370,6 +410,23 @@ def _apply_cache_headers(request: Request, response) -> None:
             del response.headers["Expires"]
         response.headers["Vary"] = "Accept-Encoding"
         return
+    is_public_read = (
+        request.method in {"GET", "HEAD"}
+        and not has_auth_context
+        and _matches_prefix(path, PUBLIC_CACHEABLE_PREFIXES)
+    )
+    if is_public_read:
+        public_ttl = max(int(settings.public_read_cache_ttl_seconds), 0)
+        if public_ttl > 0:
+            response.headers["Cache-Control"] = (
+                f"public, max-age={public_ttl}, stale-while-revalidate={public_ttl}"
+            )
+            if "Pragma" in response.headers:
+                del response.headers["Pragma"]
+            if "Expires" in response.headers:
+                del response.headers["Expires"]
+            response.headers["Vary"] = "Accept-Encoding, Origin"
+            return
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -501,6 +558,7 @@ def _error_content(request: Request, status_code: int, detail, *, code: str | No
 
 @app.middleware("http")
 async def request_security(request: Request, call_next):
+    started_at = time.perf_counter()
     request_id = sanitize_request_id(request.headers.get(REQUEST_ID_HEADER))
     request.state.request_id = request_id
     set_current_request_id(request_id)
@@ -559,22 +617,23 @@ async def request_security(request: Request, call_next):
         return response
 
     response = await call_next(request)
-    if request.method not in {"GET", "HEAD", "OPTIONS"}:
-        # Any successful or failed write may have changed public catalogue or
-        # content data. Clearing is process-local and cheap; the five-second
-        # TTL still protects other web workers from serving stale data long.
+    if _should_invalidate_public_cache(request):
+        # Keep unrelated customer/admin writes from evicting hot public reads.
+        # The cache is process-local; the TTL remains the cross-instance stale
+        # data bound for workers that did not receive this write.
         public_read_cache.clear()
     for key, value in rate_limit.headers.items():
         response.headers.setdefault(key, value)
     _apply_security_headers(request, response)
 
     logger.info(
-        "request_complete request_id=%s method=%s path=%s status=%s policy=%s cache=%s",
+        "request_complete request_id=%s method=%s path=%s status=%s policy=%s duration_ms=%.1f cache=%s",
         request_id,
         request.method,
         request.url.path,
         getattr(response, "status_code", 0),
         policy.policy_name,
+        (time.perf_counter() - started_at) * 1000,
         "bypass",
     )
     return response

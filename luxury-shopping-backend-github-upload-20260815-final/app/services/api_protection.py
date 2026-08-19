@@ -163,6 +163,7 @@ PUBLIC_GET_PREFIXES = (
     "/api/catalog/settings",
     "/api/catalog/banners",
     "/api/payments/accounts",
+    "/api/payment-methods",
     "/api/shopping/global-sites",
     "/api/shopping/local/options",
     "/api/shopping/local/partners",
@@ -175,6 +176,17 @@ PUBLIC_GET_PREFIXES = (
     "/api/content/theme",
     "/api/content/settings/public",
     "/api/content/theme/preview",
+    # Compatibility routes used by older storefront clients.  These are
+    # read-only public content endpoints too; leaving them out makes the
+    # security middleware classify them as private and return 401 before the
+    # cached route handler can run.
+    "/content/site",
+    "/content/menus",
+    "/content/social-links",
+    "/content/theme",
+    "/content/settings/public",
+    "/content/sections",
+    "/content/pages",
     "/api/content/shipping-zones",
     "/api/content/",
     "/api/marketing/campaigns/active",

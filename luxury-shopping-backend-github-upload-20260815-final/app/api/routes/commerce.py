@@ -41,7 +41,6 @@ from ...services.catalog_policy import (
     normalize_product_mutation_values,
     public_product_base_clauses,
     public_product_clauses,
-    public_fallback_partner_storefront_response,
     public_main_storefront_response,
     public_storefront_response,
     validate_public_product_or_404,
@@ -59,12 +58,13 @@ from ...services.product_identifier import decode_compact_uuid
 from ...services.commerce_rules import (
     eligible_line,
     parse_strict_quantity,
-    validate_payment_method,
     validate_customer_checkout_address,
     validate_shipping_address,
 )
+from ...services.payment_methods import validate_payment_method_for_checkout
 from ...services.staff_permissions import require_staff_permission
 from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof
+from ...services.notification_service import NotificationPayload, NotificationService
 from ...storage import FileStorage
 
 
@@ -1243,28 +1243,47 @@ async def catalog_product_detail(identifier: str, session: AsyncSession = Depend
 
 @router.get("/partner-storefronts")
 async def partner_storefronts(limit: int = Query(80, ge=1, le=5000), session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("catalog-stores", limit=limit),
+        lambda: _partner_storefronts_uncached(limit=limit, session=session),
+    )
+
+
+async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
     model = MODEL_BY_TABLE["partner_storefronts"]
+    result = await session.execute(
+        select(model)
+        .where(model.deleted_at.is_(None), model.is_active.is_(True))
+        .order_by(model.name)
+        .limit(limit)
+    )
+    storefront_rows = list(result.scalars())
+    storefront_partner_ids = {
+        value
+        for item in storefront_rows
+        for value in (getattr(item, "partner_id", None), getattr(item, "user_id", None))
+        if value
+    }
+    product_owner_clause = [Product.partner_id.is_(None)]
+    if storefront_partner_ids:
+        product_owner_clause.append(Product.partner_id.in_(storefront_partner_ids))
     count_result = await session.execute(
         select(Product.partner_id, func.count(Product.id))
         .where(*public_product_clauses(Product))
+        .where(or_(*product_owner_clause))
         .group_by(Product.partner_id)
     )
     product_counts = {
         partner_id: int(count or 0)
         for partner_id, count in count_result.all()
     }
-    result = await session.execute(
-        select(model).where(model.deleted_at.is_(None), model.is_active.is_(True)).limit(limit)
-    )
     rows = []
-    used_partner_ids: set[Any] = set()
     main_store_count = int(product_counts.get(None, 0) or 0)
     if main_store_count > 0:
         rows.append(public_main_storefront_response(products_count=main_store_count))
-    for item in result.scalars():
+    for item in storefront_rows:
         if _safe_public_display_text(getattr(item, "name", None)):
             partner_values = {value for value in (item.partner_id, item.user_id) if value}
-            used_partner_ids.update(partner_values)
             count = sum(int(product_counts.get(value, 0) or 0) for value in partner_values)
             # A storefront without a currently publishable product is not a
             # customer-facing store. Excluding it also prevents old QA
@@ -1273,15 +1292,8 @@ async def partner_storefronts(limit: int = Query(80, ge=1, le=5000), session: As
             if count <= 0:
                 continue
             rows.append(public_storefront_response(item, products_count=count))
-    for partner_id, count in product_counts.items():
-        if partner_id is None or partner_id in used_partner_ids:
-            continue
-        rows.append(
-            public_fallback_partner_storefront_response(
-                partner_id,
-                products_count=int(count or 0),
-            )
-        )
+    # A partner id without a real storefront record is not a customer-facing
+    # store. Do not invent a UUID-based name for it in the public catalog.
     return rows
 
 
@@ -1639,6 +1651,35 @@ async def api_create_partner_request(
 
 
 async def _create_notification(session: AsyncSession, table_name: str, **values: Any) -> None:
+    if table_name == "notifications" and values.get("user_id"):
+        order_id = values.get("order_id")
+        if order_id is not None and not isinstance(order_id, uuid.UUID):
+            order_id = _uuid(order_id, "order_id")
+        payload = values.get("payload") if isinstance(values.get("payload"), dict) else {}
+        if order_id is not None:
+            payload = {**payload, "order_id": str(order_id)}
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=values["user_id"],
+                title=str(values.get("title") or "رفاهية التسوق"),
+                body=str(values.get("body") or values.get("message") or ""),
+                notification_type=str(values.get("type") or values.get("notification_type") or "message"),
+                category=str(values.get("category") or "system"),
+                priority=str(values.get("priority") or "normal"),
+                image_url=values.get("image_url"),
+                action_type=values.get("action_type"),
+                action_url=values.get("url"),
+                entity_type=values.get("entity_type") or ("order" if order_id else None),
+                entity_id=values.get("entity_id") or (str(order_id) if order_id else None),
+                order_id=order_id,
+                payload=payload,
+                created_by=values.get("created_by"),
+                source=str(values.get("source") or "commerce"),
+                deduplication_key=values.get("deduplication_key"),
+                expires_at=values.get("expires_at"),
+            )
+        )
+        return
     model = MODEL_BY_TABLE[table_name]
     session.add(model(**values))
 
@@ -1726,7 +1767,10 @@ async def checkout_preview(
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="invalid_checkout_request")
-    validate_payment_method(body.get("paymentMethod") or body.get("payment_method"))
+    validate_payment_method = await validate_payment_method_for_checkout(
+        session,
+        body.get("paymentMethod") or body.get("payment_method"),
+    )
     shipping_address = validate_customer_checkout_address(
         body.get("shippingAddress") or body.get("shipping_address")
     )
@@ -1778,7 +1822,10 @@ async def checkout(
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="invalid_checkout_request")
-    payment_method = validate_payment_method(body.get("paymentMethod") or body.get("payment_method"))
+    payment_method = await validate_payment_method_for_checkout(
+        session,
+        body.get("paymentMethod") or body.get("payment_method"),
+    )
     shipping_address = validate_customer_checkout_address(
         body.get("shippingAddress") or body.get("shipping_address")
     )
@@ -1886,7 +1933,10 @@ async def create_manual_order(
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="invalid_manual_order_request")
-    payment_method = validate_payment_method(body.get("paymentMethod") or body.get("payment_method"))
+    payment_method = await validate_payment_method_for_checkout(
+        session,
+        body.get("paymentMethod") or body.get("payment_method"),
+    )
     key = _normalize_idempotency_key(idempotency_key or body.get("idempotencyKey"))
     request_hash = _request_hash(body)
     if key:
@@ -2583,36 +2633,35 @@ async def create_product(request: Request, user: User = Depends(current_user), r
         raise HTTPException(status_code=422, detail={"code": "product_name_required", "message": "Product name is required"})
     await _apply_brand_supplier_name_refs(session, body, values)
     await _validate_product_references(session, values)
-    if "partner" in roles and not roles.intersection({"admin", "manager"}):
-        storefront_model = MODEL_BY_TABLE["partner_storefronts"]
-        storefront = (
-            await session.execute(
-                select(storefront_model).where(
-                    or_(
-                        storefront_model.user_id == user.id,
-                        storefront_model.partner_id == user.id,
-                    ),
-                    storefront_model.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-        if (
-            storefront is None
-            or not storefront.is_active
-            or not str(storefront.name or "").strip()
-            or not str(storefront.logo_url or "").strip()
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "complete_storefront_required",
-                    "message": "أكمل اسم المتجر وشعاره قبل إضافة المنتجات.",
-                    "action": "/partner/storefront",
-                },
-            )
     product = Product(**values)
     _enforce_product_public_quality(product, roles)
     session.add(product)
+    await session.flush()
+    if "partner" in roles and not roles.intersection({"admin", "manager"}):
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=product.partner_id or user.id,
+                title="منتجك قيد المراجعة",
+                body=(
+                    f"تم حفظ المنتج {product.name} وإرساله للمراجعة والتوثيق. "
+                    "ستصلك رسالة عند الموافقة أو الرفض مع السبب."
+                ),
+                notification_type="product_submitted_for_review",
+                category="system",
+                priority="high",
+                action_type="open_product",
+                action_url="/partner/products",
+                entity_type="products",
+                entity_id=str(product.id),
+                payload={
+                    "productId": str(product.id),
+                    "approvalStatus": str(product.approval_status or "pending"),
+                    "deep_link": "/partner/products",
+                },
+                created_by=user.id,
+                deduplication_key=f"product-review:{product.id}:submitted",
+            )
+        )
     await session.commit()
     return serialize_record(product)
 

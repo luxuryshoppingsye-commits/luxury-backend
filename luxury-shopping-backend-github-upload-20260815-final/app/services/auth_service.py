@@ -838,6 +838,46 @@ async def create_verification_token(
     return raw_token
 
 
+async def create_email_verification_code(
+    session: AsyncSession,
+    *,
+    user: User,
+    target: str,
+    request: Request | None = None,
+    expires_minutes: int = 10,
+) -> str:
+    """Create a short-lived email code without storing the code itself.
+
+    The user id is included in the digest so the same six-digit value can be
+    safely active for different accounts without colliding on the unique
+    token_hash column.
+    """
+    now = datetime.now(timezone.utc)
+    await session.execute(
+        update(VerificationToken)
+        .where(
+            VerificationToken.user_id == user.id,
+            VerificationToken.purpose == "email_verification",
+            VerificationToken.used_at.is_(None),
+            VerificationToken.invalidated_at.is_(None),
+        )
+        .values(invalidated_at=now)
+    )
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    session.add(
+        VerificationToken(
+            user_id=user.id,
+            purpose="email_verification",
+            target=target,
+            token_hash=token_hash(f"{user.id}:{code}"),
+            expires_at=now + timedelta(minutes=expires_minutes),
+            requested_ip=extract_client_ip(request),
+        )
+    )
+    await session.flush()
+    return code
+
+
 async def create_phone_otp_token(
     session: AsyncSession,
     *,

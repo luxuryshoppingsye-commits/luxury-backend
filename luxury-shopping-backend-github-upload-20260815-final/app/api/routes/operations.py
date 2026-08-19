@@ -21,7 +21,7 @@ from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...config import BACKEND_DIR, get_settings
-from ...database import SessionFactory, database_ready, get_session
+from ...database import SessionFactory, get_session
 from ...dependencies import bearer, current_user, optional_user, require_admin, require_courier, require_marketer, require_partner, require_staff, user_roles
 from ...models import MODEL_BY_TABLE, RESOURCE_TABLES
 from ...models.domain import FileAsset, Order, OrderItem, Product, ProductVariant, Profile, User, UserRole
@@ -36,7 +36,6 @@ from ...services.catalog_policy import (
     normalize_product_mutation_values,
     public_product_base_clauses,
     public_product_clauses,
-    public_fallback_partner_storefront_response,
     public_main_storefront_response,
     public_storefront_response,
     validate_public_product_or_404,
@@ -71,6 +70,12 @@ from ...services.payment_refund_security import (
     review_payment_receipt,
     signed_receipt_file_response,
     update_refund_workflow_status,
+)
+from ...services.payment_methods import (
+    PAYMENT_METHODS_SETTING_KEY,
+    normalize_payment_method_rows,
+    payment_methods_payload,
+    read_payment_method_rows,
 )
 from ...services.public_read_cache import cache_key, public_read_cache
 from ...services.product_identifier import decode_compact_uuid
@@ -539,7 +544,7 @@ def _storage_diagnostics() -> dict[str, Any]:
 
 @router.get("/health")
 @router.get("/api/health")
-async def health(session: AsyncSession = Depends(get_session)):
+async def health():
     settings = get_settings()
     public_payload = {
         "status": "ok",
@@ -552,10 +557,11 @@ async def health(session: AsyncSession = Depends(get_session)):
     # catalog counts from the public production health endpoint.
     if settings.app_env not in {"development", "test"}:
         return public_payload
-    counts = {}
-    for table in ("users", "products", "categories", "orders"):
-        model = MODEL_BY_TABLE[table]
-        counts[table] = int((await session.execute(select(func.count()).select_from(model))).scalar_one())
+    async with SessionFactory() as session:
+        counts = {}
+        for table in ("users", "products", "categories", "orders"):
+            model = MODEL_BY_TABLE[table]
+            counts[table] = int((await session.execute(select(func.count()).select_from(model))).scalar_one())
     return {
         **public_payload,
         "app_env": settings.app_env,
@@ -623,14 +629,16 @@ async def _critical_schema_ready(session: AsyncSession) -> dict[str, Any]:
 @router.get("/health/ready")
 async def health_ready(session: AsyncSession = Depends(get_session)):
     settings = get_settings()
-    ready = await database_ready()
     critical_schema = {"ready": False, "missing_tables": []}
-    if ready:
-        try:
-            critical_schema = await _critical_schema_ready(session)
-        except Exception:
-            critical_schema = {"ready": False, "missing_tables": ["schema_check_failed"]}
-    ready = ready and bool(critical_schema.get("ready"))
+    try:
+        # Reuse the request session for both probes.  Opening one engine
+        # connection in database_ready() and another one for the schema query
+        # added a full network round trip to every Render health check.
+        await session.execute(text("SELECT 1"))
+        critical_schema = await _critical_schema_ready(session)
+    except Exception:
+        critical_schema = {"ready": False, "missing_tables": ["schema_check_failed"]}
+    ready = bool(critical_schema.get("ready"))
     public_payload = {
         "status": "ok" if ready else "unavailable",
         "mode": "postgresql",
@@ -888,7 +896,13 @@ async def save_partner_storefront(request: Request, user: User = Depends(require
     result = await session.execute(select(model).where(or_(model.user_id == user.id, model.partner_id == user.id)).with_for_update())
     row = result.scalar_one_or_none()
     if row is None:
-        row = model(user_id=user.id, partner_id=user.id, name=str(body.get("storeName") or body.get("name") or "متجر"), status="active", is_active=True)
+        row = model(
+            user_id=user.id,
+            partner_id=user.id,
+            name=str(body.get("storeName") or body.get("name") or "متجر"),
+            status="pending",
+            is_active=False,
+        )
         session.add(row)
     mapping = {"storeName": "name", "name": "name", "email": "email", "phone": "phone", "description": "description", "storeDescription": "description", "logoUrl": "logo_url", "storeLogoUrl": "logo_url"}
     for source, target in mapping.items():
@@ -900,6 +914,94 @@ async def save_partner_storefront(request: Request, user: User = Depends(require
     await session.flush()
     await session.commit()
     await session.refresh(row)
+    return {"data": serialize_record(row)}
+
+
+@router.get("/admin/partner-storefronts")
+async def admin_partner_storefronts(
+    limit: int = Query(500, ge=1, le=2000),
+    status: str | None = Query(None),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    model = MODEL_BY_TABLE["partner_storefronts"]
+    clauses = [model.deleted_at.is_(None)]
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status:
+        clauses.append(model.status == normalized_status)
+    result = await session.execute(
+        select(model)
+        .where(*clauses)
+        .order_by(model.updated_at.desc(), model.created_at.desc())
+        .limit(limit)
+    )
+    return {"data": [serialize_record(row) for row in result.scalars()]}
+
+
+@router.post("/admin/partner-storefronts/{storefront_id}/review")
+async def review_partner_storefront(
+    storefront_id: uuid.UUID,
+    request: Request,
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    status = str(body.get("status") or "").lower().strip()
+    if status not in {"approved", "rejected"}:
+        raise HTTPException(status_code=422, detail="invalid_storefront_status")
+    reason = str(
+        body.get("reason")
+        or body.get("rejectionReason")
+        or body.get("approvalNotes")
+        or ""
+    ).strip()
+    if status == "rejected" and not reason:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "storefront_rejection_reason_required",
+                "message": "اكتب سبب رفض المتجر قبل الحفظ.",
+            },
+        )
+    model = MODEL_BY_TABLE["partner_storefronts"]
+    row = await session.get(model, storefront_id, with_for_update=True)
+    if row is None or getattr(row, "deleted_at", None) is not None:
+        raise HTTPException(status_code=404, detail="storefront_not_found")
+    row.status = status
+    row.is_active = status == "approved"
+    if "extra_data" in row.__table__.c:
+        metadata = dict(getattr(row, "extra_data", None) or {})
+        metadata["review_reason"] = reason if status == "rejected" else None
+        metadata["reviewed_by"] = str(admin.id)
+        metadata["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        row.extra_data = metadata
+    partner_id = getattr(row, "partner_id", None) or getattr(row, "user_id", None)
+    if partner_id:
+        title = (
+            "مبروك تمت الموافقة على متجرك"
+            if status == "approved"
+            else "تم رفض طلب متجرك"
+        )
+        message = (
+            "تمت الموافقة على متجرك وأصبح جاهزاً لاستقبال المنتجات والعملاء."
+            if status == "approved"
+            else f"سبب الرفض: {reason}"
+        )
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=partner_id,
+                title=title,
+                body=message,
+                notification_type=f"storefront_{status}",
+                category="partner",
+                priority="high",
+                entity_type="partner_storefronts",
+                entity_id=str(row.id),
+                created_by=admin.id,
+                deduplication_key=f"storefront-review:{row.id}:{status}:{getattr(row, 'updated_at', None)}",
+            )
+        )
+    await session.commit()
     return {"data": serialize_record(row)}
 
 
@@ -1246,6 +1348,15 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
     status = str(body.get("status") or "").lower()
     if status not in {"approved", "rejected"}:
         raise HTTPException(status_code=400, detail="invalid_application_status")
+    reason = str(body.get("reason") or body.get("rejectionReason") or "").strip()
+    if status == "rejected" and not reason:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "partner_rejection_reason_required",
+                "message": "اكتب سبب رفض طلب المتجر قبل الحفظ.",
+            },
+        )
     model = MODEL_BY_TABLE["partner_applications"]
     result = await session.execute(select(model).where(model.id == application_id).with_for_update())
     application = result.scalar_one_or_none()
@@ -1254,6 +1365,10 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
     application.status = status
     application.reviewed_by = admin.id
     application.reviewed_at = datetime.now(timezone.utc)
+    if "extra_data" in application.__table__.c:
+        metadata = dict(getattr(application, "extra_data", None) or {})
+        metadata["review_reason"] = reason if status == "rejected" else None
+        application.extra_data = metadata
     if status == "approved" and application.user_id:
         approved_user = await session.get(User, application.user_id, with_for_update=True)
         if approved_user is not None:
@@ -1277,6 +1392,9 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
                 status="active", description=application.description, logo_url=application.logo_url, is_active=True,
             )
             session.add(storefront)
+        else:
+            storefront.status = "active"
+            storefront.is_active = True
     elif status == "rejected" and application.user_id:
         rejected_user = await session.get(User, application.user_id, with_for_update=True)
         if rejected_user is not None:
@@ -1292,6 +1410,27 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
                 if role is not None:
                     await session.delete(role)
             await bump_security_version(session, rejected_user, reason="merchant_rejected", request=request)
+    if application.user_id:
+        title = "تمت الموافقة على طلب متجرك" if status == "approved" else "تم رفض طلب المتجر"
+        message = (
+            "تمت الموافقة على طلب متجرك ويمكنك الآن تجهيز المنتجات للمراجعة."
+            if status == "approved"
+            else f"سبب الرفض: {reason}"
+        )
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=application.user_id,
+                title=title,
+                body=message,
+                notification_type=f"partner_application_{status}",
+                category="partner",
+                priority="high",
+                entity_type="partner_applications",
+                entity_id=str(application.id),
+                created_by=admin.id,
+                deduplication_key=f"partner-application-review:{application.id}:{status}",
+            )
+        )
     await session.commit()
     approved_user = await session.get(User, application.user_id) if application.user_id else None
     return {"application": serialize_record(application), "auth": await auth_payload(session, approved_user, issue_tokens=False) if approved_user else None}
@@ -2024,6 +2163,51 @@ async def api_public_payment_accounts():
     return {"data": _payment_account_options()}
 
 
+@router.get("/api/payment-methods")
+async def api_public_payment_methods(session: AsyncSession = Depends(get_session)):
+    return payment_methods_payload(await read_payment_method_rows(session))
+
+
+@router.get("/api/admin/payment-methods")
+async def api_admin_payment_methods(
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    return payment_methods_payload(await read_payment_method_rows(session))
+
+
+@router.patch("/api/admin/payment-methods")
+async def api_update_payment_methods(
+    request: Request,
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    current = await read_payment_method_rows(session)
+    rows = normalize_payment_method_rows(body.get("methods"), base_rows=current)
+    model = MODEL_BY_TABLE["site_settings"]
+    result = await session.execute(
+        select(model)
+        .where(model.name == PAYMENT_METHODS_SETTING_KEY, model.deleted_at.is_(None))
+        .limit(1)
+    )
+    setting = result.scalar_one_or_none()
+    if setting is None:
+        setting = model(name=PAYMENT_METHODS_SETTING_KEY, status="active", is_active=True)
+        session.add(setting)
+    setting.status = "active"
+    setting.is_active = True
+    setting.extra_data = {"configured_by_admin": True, "methods": rows}
+    _add_audit_log(
+        session,
+        admin.id,
+        "admin.payment_methods.update",
+        "Updated payment method availability",
+    )
+    await session.commit()
+    return payment_methods_payload(rows)
+
+
 @router.get("/api/shopping/global-sites")
 async def api_public_global_sites(
     limit: int = Query(100, ge=1, le=500),
@@ -2360,28 +2544,17 @@ async def api_list_suppliers(
         .limit(500)
     )
     rows = []
-    used_partner_ids: set[Any] = set()
     main_store_count = int(product_counts.get(None, 0) or 0)
     if main_store_count > 0 and active is not True:
         rows.append(public_main_storefront_response(products_count=main_store_count))
     for storefront in result.scalars():
         partner_values = [value for value in (storefront.partner_id, storefront.user_id) if value]
-        used_partner_ids.update(partner_values)
         products_count = sum(int(product_counts.get(value, 0) or 0) for value in partner_values)
         if products_count <= 0:
             continue
         rows.append(public_storefront_response(storefront, products_count=products_count))
-    for partner_id, products_count in product_counts.items():
-        if partner_id is None or partner_id in used_partner_ids:
-            continue
-        if active is True and int(products_count or 0) <= 0:
-            continue
-        rows.append(
-            public_fallback_partner_storefront_response(
-                partner_id,
-                products_count=int(products_count or 0),
-            )
-        )
+    # A partner id without a real storefront record is not a customer-facing
+    # store. Do not invent a UUID-based name for it in the public catalog.
     return {"data": rows}
 
 
@@ -3684,16 +3857,80 @@ async def api_admin_product_approval(product_id: uuid.UUID, request: Request, st
     next_status = str(body.get("status") or row.approval_status or "approved").lower()
     if next_status not in {"approved", "active", "published", "pending", "reviewing", "rejected"}:
         raise HTTPException(status_code=422, detail={"code": "invalid_approval_status", "message": "Invalid product approval status"})
+    reason = str(
+        body.get("reason")
+        or body.get("rejectionReason")
+        or body.get("approvalNotes")
+        or ""
+    ).strip()
+    if next_status == "rejected" and not reason:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "product_rejection_reason_required",
+                "message": "اكتب سبب رفض المنتج قبل الحفظ.",
+            },
+        )
     row.approval_status = next_status
     if next_status in {"approved", "active", "published"}:
         row.approved_by = staff.id
         row.approved_at = datetime.now(timezone.utc)
         row.is_active = True
+        row.approval_notes = None
     else:
         row.approved_by = None
         row.approved_at = None
         if next_status in {"pending", "reviewing", "rejected"}:
             row.is_active = False
+        if next_status == "rejected":
+            row.approval_notes = reason
+        elif next_status in {"pending", "reviewing"}:
+            row.approval_notes = None
+    if row.partner_id:
+        approved = next_status in {"approved", "active", "published"}
+        rejected = next_status == "rejected"
+        title = (
+            "مبروك تم الموافقة على عرض منتجك"
+            if approved
+            else "تم رفض عرض منتجك"
+            if rejected
+            else "منتجك قيد المراجعة"
+        )
+        message = (
+            f"تمت الموافقة على عرض المنتج {row.name} ويمكن للعملاء رؤيته الآن."
+            if approved
+            else f"سبب الرفض: {reason}"
+            if rejected
+            else f"تم إبقاء المنتج {row.name} قيد المراجعة والتوثيق."
+        )
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=row.partner_id,
+                title=title,
+                body=message,
+                notification_type=(
+                    "product_approved"
+                    if approved
+                    else "product_rejected"
+                    if rejected
+                    else "product_submitted_for_review"
+                ),
+                category="system",
+                priority="high",
+                action_type="open_product",
+                action_url="/partner/products",
+                entity_type="products",
+                entity_id=str(row.id),
+                payload={
+                    "productId": str(row.id),
+                    "approvalStatus": next_status,
+                    "deep_link": "/partner/products",
+                    **({"rejectionReason": reason} if rejected else {}),
+                },
+                created_by=staff.id,
+                deduplication_key=f"product-review:{row.id}:{next_status}:{row.approved_at or reason}",
+            )
+        )
     await session.commit()
     return {"data": serialize_record(row)}
 

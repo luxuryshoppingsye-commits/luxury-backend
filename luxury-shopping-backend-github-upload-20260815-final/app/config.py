@@ -189,7 +189,7 @@ class Settings(BaseSettings):
         le=60.0,
     )
     public_read_cache_ttl_seconds: float = Field(
-        5.0,
+        30.0,
         alias="PUBLIC_READ_CACHE_TTL_SECONDS",
         ge=0.0,
         le=60.0,

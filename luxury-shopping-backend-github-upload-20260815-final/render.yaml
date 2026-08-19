@@ -58,11 +58,13 @@ services:
       - key: WS_BASE_URL
         value: wss://api.luxuryshoppings.com
       - key: ENABLE_MESSAGE_WORKER
-        value: "true"
+        # Keep provider calls and outbox polling off the request-serving event
+        # loop.  The dedicated worker service below owns this workload.
+        value: "false"
       - key: MESSAGE_WORKER_POLL_SECONDS
         value: "5"
       - key: PUBLIC_READ_CACHE_TTL_SECONDS
-        value: "5"
+        value: "30"
       - key: FIREBASE_PROJECT_ID
         value: luxury-345be
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
@@ -113,3 +115,111 @@ services:
         value: "900"
       - key: GEMINI_API_KEY
         sync: false
+  - type: worker
+    name: luxury-shopping-message-worker
+    runtime: python
+    plan: starter
+    region: virginia
+    branch: main
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: python -m app.workers.message_worker
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: ALLOW_TEST_FIXTURES
+        value: "false"
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: DATABASE_URL
+      - key: JWT_SECRET
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: JWT_SECRET
+      - key: MESSAGE_WORKER_POLL_SECONDS
+        value: "5"
+      - key: FIREBASE_PROJECT_ID
+        value: luxury-345be
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: GOOGLE_APPLICATION_CREDENTIALS_JSON
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: FIREBASE_SERVICE_ACCOUNT_JSON
+      - key: VAPID_PUBLIC_KEY
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: VAPID_PUBLIC_KEY
+      - key: VAPID_PRIVATE_KEY
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: VAPID_PRIVATE_KEY
+      - key: VAPID_SUBJECT
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: VAPID_SUBJECT
+      - key: SMTP_HOST
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: SMTP_HOST
+      - key: SMTP_PORT
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: SMTP_PORT
+      - key: SMTP_USERNAME
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: SMTP_USERNAME
+      - key: SMTP_PASSWORD
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: SMTP_PASSWORD
+      - key: SMTP_FROM_EMAIL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: SMTP_FROM_EMAIL
+      - key: EMAIL_PROVIDER
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: EMAIL_PROVIDER
+      - key: RESEND_API_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: RESEND_API_URL
+      - key: RESEND_API_KEY
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: RESEND_API_KEY
+      - key: RESEND_FROM_EMAIL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: RESEND_FROM_EMAIL
+      - key: WHATSAPP_PROVIDER_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: WHATSAPP_PROVIDER_URL
+      - key: WHATSAPP_ACCESS_TOKEN
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: WHATSAPP_ACCESS_TOKEN
