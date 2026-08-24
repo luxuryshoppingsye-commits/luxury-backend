@@ -110,12 +110,13 @@ def _product_image_candidates(product: dict[str, Any]) -> list[str]:
     return candidates
 
 
-def _allowed_remote_image_host() -> str | None:
-    configured = str(settings.r2_public_base_url or "").strip()
-    parsed = urlparse(configured)
-    if parsed.scheme != "https" or not parsed.hostname:
-        return None
-    return parsed.hostname.lower()
+def _allowed_remote_image_hosts() -> set[str]:
+    hosts: set[str] = set()
+    for configured in (settings.r2_public_base_url, settings.api_base_url):
+        parsed = urlparse(str(configured or "").strip())
+        if parsed.scheme == "https" and parsed.hostname:
+            hosts.add(parsed.hostname.lower())
+    return hosts
 
 
 def _detect_image_type(data: bytes) -> str | None:
@@ -152,8 +153,8 @@ async def _read_image(source: str) -> tuple[bytes, str] | None:
         return (data, media_type) if media_type else None
 
     parsed = urlparse(source)
-    allowed_host = _allowed_remote_image_host()
-    if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() != allowed_host:
+    allowed_hosts = _allowed_remote_image_hosts()
+    if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in allowed_hosts:
         return None
 
     try:

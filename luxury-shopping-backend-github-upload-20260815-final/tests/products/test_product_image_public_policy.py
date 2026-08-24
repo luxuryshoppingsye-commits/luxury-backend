@@ -12,6 +12,8 @@ from backend.app.api.routes.commerce import (
     _normalize_public_product_images,
     _row_has_valid_public_primary_image,
 )
+from backend.app.services import catalog_policy
+from backend.app.api.routes import share
 from backend.app.models.domain import Product
 from PIL import Image
 from io import BytesIO
@@ -67,6 +69,45 @@ def test_legacy_cdn_image_is_moved_behind_the_canonical_proxy() -> None:
 
     assert row["image_url"] == "/api/catalog/image-proxy/products/item-1.webp"
     assert row["images"] == ["/api/catalog/image-proxy/products/item-1.webp"]
+
+
+def test_legacy_cdn_image_uses_absolute_api_proxy_in_production(monkeypatch) -> None:
+    class ProductionSettings:
+        app_env = "production"
+        api_base_url = "https://api.luxuryshoppings.com"
+        r2_public_base_url = "https://images.luxuryshoppings.com"
+
+    monkeypatch.setattr(catalog_policy, "get_settings", lambda: ProductionSettings())
+
+    assert catalog_policy._public_upload_url(
+        "https://images.luxuryshoppings.com/products/item-1.webp"
+    ) == "https://api.luxuryshoppings.com/api/catalog/image-proxy/products/item-1.webp"
+
+
+def test_catalog_proxy_path_uses_absolute_api_url_in_production(monkeypatch) -> None:
+    class ProductionSettings:
+        app_env = "production"
+        api_base_url = "https://api.luxuryshoppings.com"
+        r2_public_base_url = "https://images.luxuryshoppings.com"
+
+    monkeypatch.setattr(catalog_policy, "get_settings", lambda: ProductionSettings())
+
+    assert catalog_policy._public_upload_url(
+        "/api/catalog/image-proxy/products/item-1.webp"
+    ) == "https://api.luxuryshoppings.com/api/catalog/image-proxy/products/item-1.webp"
+
+
+def test_share_image_reader_allows_configured_api_and_r2_hosts(monkeypatch) -> None:
+    class ProductionSettings:
+        api_base_url = "https://api.luxuryshoppings.com"
+        r2_public_base_url = "https://images.luxuryshoppings.com"
+
+    monkeypatch.setattr(share, "settings", ProductionSettings())
+
+    assert share._allowed_remote_image_hosts() == {
+        "api.luxuryshoppings.com",
+        "images.luxuryshoppings.com",
+    }
 
 
 def test_canonical_proxy_repairs_jpeg_eoi_and_reports_actual_mime() -> None:

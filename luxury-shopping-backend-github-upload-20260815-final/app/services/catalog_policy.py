@@ -467,6 +467,12 @@ def _public_upload_url(value: Any) -> str | None:
     if not raw:
         return None
     lowered = raw.lower()
+    if lowered.startswith(("/api/catalog/image-proxy/", "api/catalog/image-proxy/")):
+        relative = raw.lstrip("/")
+        settings = get_settings()
+        if settings.app_env == "production" and str(settings.api_base_url).strip():
+            return f"{str(settings.api_base_url).rstrip('/')}/{relative}"
+        return f"/{relative}"
     for marker in ("/api/uploads/", "/uploads/", "uploads/", "backend/data/uploads/"):
         index = lowered.find(marker)
         if index >= 0:
@@ -478,6 +484,9 @@ def _public_upload_url(value: Any) -> str | None:
         configured_public_host = urlparse(
             str(get_settings().r2_public_base_url or "")
         ).hostname
+        configured_api_host = urlparse(
+            str(get_settings().api_base_url or "")
+        ).hostname
         parsed = urlparse(raw)
         # Legacy product objects were uploaded under this hostname with a
         # `.webp` suffix even when the bytes were JPEG. Route these objects
@@ -486,12 +495,19 @@ def _public_upload_url(value: Any) -> str | None:
         if parsed.scheme == "https" and parsed.hostname and parsed.hostname.lower() == "images.luxuryshoppings.com":
             relative = parsed.path.lstrip("/")
             if relative and ".." not in relative.split("/"):
+                settings = get_settings()
+                if settings.app_env == "production" and str(settings.api_base_url).strip():
+                    return f"{str(settings.api_base_url).rstrip('/')}/api/catalog/image-proxy/{relative}"
                 return f"/api/catalog/image-proxy/{relative}"
         if (
             parsed.scheme == "https"
-            and configured_public_host
             and parsed.hostname
-            and parsed.hostname.lower() == configured_public_host.lower()
+            and parsed.hostname.lower()
+            in {
+                host.lower()
+                for host in (configured_public_host, configured_api_host)
+                if host
+            }
         ):
             return raw
         return None
