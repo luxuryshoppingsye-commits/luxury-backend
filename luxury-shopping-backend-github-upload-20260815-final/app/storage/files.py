@@ -146,7 +146,10 @@ class StoragePolicyRegistry:
             visibility="public",
             allowed_content_types=IMAGE_MIMES,
             max_bytes=8 * 1024 * 1024,
-            upload_roles=frozenset({"partner", "admin", "manager", "staff"}),
+            # A customer must be able to attach the store image while the
+            # merchant application is still awaiting approval. The asset is
+            # owned by the authenticated user and remains a public image.
+            upload_roles=frozenset({"customer", "partner", "admin", "manager", "staff"}),
             read_roles=frozenset(),
         ),
         "merchant_document": StoragePolicy(

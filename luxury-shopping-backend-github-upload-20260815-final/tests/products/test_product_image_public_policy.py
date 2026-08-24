@@ -7,10 +7,14 @@ from fastapi import HTTPException
 
 from backend.app.api.routes.commerce import (
     PRODUCT_IMAGE_REQUIRED_DETAIL,
+    _canonicalize_catalog_image,
     _ensure_product_image_for_public_visibility,
+    _normalize_public_product_images,
     _row_has_valid_public_primary_image,
 )
 from backend.app.models.domain import Product
+from PIL import Image
+from io import BytesIO
 
 
 def _jpeg(path):
@@ -37,6 +41,57 @@ def test_public_product_requires_local_primary_image(tmp_path) -> None:
         {"image_url": "/uploads/products/product-1.jpg"},
         upload_dir=tmp_path,
     )
+
+
+def test_public_product_accepts_first_image_when_primary_is_missing(tmp_path) -> None:
+    _jpeg(tmp_path / "products" / "product-1.jpg")
+
+    assert _row_has_valid_public_primary_image(
+        {
+            "image_url": None,
+            "images": ["/uploads/products/product-1.jpg"],
+        },
+        upload_dir=tmp_path,
+    )
+
+
+def test_legacy_cdn_image_is_moved_behind_the_canonical_proxy() -> None:
+    row = _normalize_public_product_images(
+        {
+            "image_url": None,
+            "images": [
+                "https://images.luxuryshoppings.com/products/item-1.webp",
+            ],
+        }
+    )
+
+    assert row["image_url"] == "/api/catalog/image-proxy/products/item-1.webp"
+    assert row["images"] == ["/api/catalog/image-proxy/products/item-1.webp"]
+
+
+def test_canonical_proxy_repairs_jpeg_eoi_and_reports_actual_mime() -> None:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (220, 170, 20)).save(output, format="JPEG")
+    incomplete = output.getvalue().removesuffix(b"\xff\xd9")
+
+    canonical = _canonicalize_catalog_image(incomplete)
+
+    assert canonical is not None
+    data, media_type = canonical
+    assert media_type == "image/jpeg"
+    assert data.endswith(b"\xff\xd9")
+
+
+def test_canonical_proxy_transcodes_webp_to_android_safe_jpeg() -> None:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (220, 170, 20)).save(output, format="WEBP")
+
+    canonical = _canonicalize_catalog_image(output.getvalue())
+
+    assert canonical is not None
+    data, media_type = canonical
+    assert media_type == "image/jpeg"
+    assert data.startswith(b"\xff\xd8\xff")
 
 
 @pytest.mark.parametrize(

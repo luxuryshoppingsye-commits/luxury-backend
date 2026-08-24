@@ -511,6 +511,12 @@ async def register_customer(
     session: AsyncSession = Depends(get_session),
 ):
     normalized_email = str(body.email).strip().lower()
+    phone = str(body.phone or "").strip()
+    city = str(body.city or "").strip()
+    street = str(body.street or "").strip()
+    address_details = str(body.address_details or "").strip()
+    if not phone or not city or not (street or address_details):
+        raise HTTPException(status_code=400, detail="profile_details_required")
     captcha_status = await _assert_registration_allowed(
         session,
         request,
@@ -523,14 +529,14 @@ async def register_customer(
             email=normalized_email,
             password=body.password,
             full_name=body.full_name,
-            phone=body.phone,
-            city=body.city,
+            phone=phone,
+            city=city,
             extra_data={
                 key: value
                 for key, value in {
                     "gender": body.gender,
-                    "street": body.street,
-                    "address_details": body.address_details,
+                    "street": street,
+                    "address_details": address_details,
                 }.items()
                 if value is not None and str(value).strip()
             },
@@ -540,6 +546,21 @@ async def register_customer(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    address_model = MODEL_BY_TABLE["customer_addresses"]
+    session.add(
+        address_model(
+            user_id=user.id,
+            label="العنوان الافتراضي",
+            recipient_name=body.full_name.strip(),
+            phone=phone,
+            governorate=city,
+            city=city,
+            address=" - ".join(
+                part for part in (street, address_details) if part
+            ),
+            is_default=True,
+        )
+    )
     verification = await _queue_email_verification(session, user=user, request=request)
     payload = await auth_payload(session, user, request=request, issue_tokens=False)
     payload.update(verification)
@@ -564,53 +585,75 @@ async def web_register_customer(
 @router.post("/auth/register-merchant", status_code=201)
 async def register_merchant(
     request: Request,
+    user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ):
     body = await request.json()
-    register = RegisterRequest.model_validate({
-        "email": body.get("email"),
-        "password": body.get("password"),
-        "fullName": body.get("ownerName") or body.get("fullName") or body.get("storeName"),
-        "phone": body.get("phone"),
-        "city": body.get("city"),
-        "captchaToken": body.get("captchaToken") or body.get("captcha_token"),
-    })
-    normalized_email = str(register.email).strip().lower()
-    captcha_status = await _assert_registration_allowed(
-        session,
-        request,
-        email=normalized_email,
-        captcha_token=register.captcha_token,
-    )
-    try:
-        user = await create_user(
-            session,
-            email=normalized_email,
-            password=register.password,
-            full_name=register.full_name,
-            phone=register.phone,
-            city=register.city,
-            role=None,
-            account_status="pending_merchant_review",
-            is_active=False,
+    store_name = str(body.get("storeName") or body.get("businessName") or "").strip()
+    if len(store_name) < 2:
+        raise HTTPException(status_code=400, detail="store_name_required")
+
+    profile = (
+        await session.execute(
+            select(Profile).where(
+                Profile.user_id == user.id,
+                Profile.deleted_at.is_(None),
+            )
         )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error))
+    ).scalar_one_or_none()
+    phone = str((profile.phone if profile is not None else None) or "").strip()
+    city = str((profile.city if profile is not None else None) or "").strip()
+    if not phone or not city:
+        raise HTTPException(status_code=400, detail="profile_incomplete")
+
+    address_model = MODEL_BY_TABLE["customer_addresses"]
+    default_address = (
+        await session.execute(
+            select(address_model).where(
+                address_model.user_id == user.id,
+                address_model.is_default.is_(True),
+                address_model.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    existing = (
+        await session.execute(
+            select(PartnerApplication)
+            .where(
+                PartnerApplication.user_id == user.id,
+                PartnerApplication.deleted_at.is_(None),
+                PartnerApplication.status.in_(["pending", "approved"]),
+            )
+            .order_by(PartnerApplication.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "merchant_already_active"
+                if existing.status == "approved"
+                else "merchant_application_exists"
+            ),
+        )
+
     application = PartnerApplication(
         user_id=user.id,
-        name=str(body.get("storeName") or body.get("businessName") or register.full_name),
-        email=str(register.email),
-        phone=register.phone,
+        name=store_name,
+        email=user.email,
+        phone=phone,
         status="pending",
         description=str(body.get("description") or ""),
         logo_url=body.get("logoUrl"),
         extra_data={
-            key: body.get(key)
-            for key in (
-                "businessType", "city", "commercialRegisterUrl",
-                "storeInsideImageUrl", "storeOutsideImageUrl",
-            )
-            if body.get(key) is not None
+            "city": city,
+            **(
+                {"address_id": str(default_address.id)}
+                if default_address is not None
+                and str(default_address.address or "").strip()
+                else {}
+            ),
         },
     )
     session.add(application)
@@ -619,7 +662,7 @@ async def register_merchant(
         user_id=user.id,
         event_type="merchant_application_submitted",
         status="pending",
-        description="Merchant account created in pending review state.",
+        description="Existing customer submitted a merchant application.",
         request=request,
     )
     payload = await auth_payload(session, user, request=request, issue_tokens=False)
@@ -627,7 +670,6 @@ async def register_merchant(
         "application_status": "pending",
         "merchant_portal_enabled": False,
         "requires_review": True,
-        "captcha_status": captcha_status,
     })
     await session.commit()
     return payload

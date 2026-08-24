@@ -146,6 +146,7 @@ PUBLIC_GET_PREFIXES = (
     "/deployment/status",
     "/products",
     "/api/catalog/products",
+    "/api/catalog/image-proxy",
     "/api/catalog/recommendations",
     "/offers",
     "/api/catalog/offers",

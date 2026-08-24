@@ -4,12 +4,14 @@ import hashlib
 import json
 import re
 import uuid
+from io import BytesIO
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -571,11 +573,42 @@ def _valid_product_primary_image_ref(value: Any, upload_dir: Path | None = None)
 
 
 def _row_has_valid_public_primary_image(row: dict[str, Any], upload_dir: Path | None = None) -> bool:
-    return _valid_product_primary_image_ref(row.get("image_url") or row.get("imageUrl"), upload_dir=upload_dir)
+    primary = row.get("image_url") or row.get("imageUrl")
+    if _valid_product_primary_image_ref(primary, upload_dir=upload_dir):
+        return True
+    images = row.get("images")
+    if isinstance(images, list):
+        return any(_valid_product_primary_image_ref(image, upload_dir=upload_dir) for image in images)
+    return False
 
 
 def _product_has_valid_primary_image(product: Product, upload_dir: Path | None = None) -> bool:
-    return _valid_product_primary_image_ref(product.image_url, upload_dir=upload_dir)
+    if _valid_product_primary_image_ref(product.image_url, upload_dir=upload_dir):
+        return True
+    return any(
+        _valid_product_primary_image_ref(image, upload_dir=upload_dir)
+        for image in (product.images or [])
+    )
+
+
+def _normalize_public_product_images(row: dict[str, Any]) -> dict[str, Any]:
+    """Return one canonical image list and derive the primary image from it."""
+    candidates: list[Any] = []
+    candidates.extend((row.get("image_url"), row.get("imageUrl")))
+    images = row.get("images")
+    if isinstance(images, list):
+        candidates.extend(images)
+    normalized: list[str] = []
+    for candidate in candidates:
+        value = _public_upload_url(candidate)
+        if value and value not in normalized:
+            normalized.append(value)
+    primary = normalized[0] if normalized else None
+    row["image_url"] = primary
+    row["imageUrl"] = primary
+    row["images"] = normalized
+    row["primary_image"] = primary
+    return row
 
 
 def _public_visibility_requires_valid_image(product: Product) -> bool:
@@ -646,6 +679,7 @@ async def _product_payload(session: AsyncSession, product: Product) -> dict[str,
     _hide_placeholder_product_images(row)
     if product.image_url and not row.get("images"):
         row["images"] = [product.image_url]
+    _normalize_public_product_images(row)
     if product.category_id:
         category = await session.get(Category, product.category_id)
         if category:
@@ -720,6 +754,7 @@ async def _product_payloads(session: AsyncSession, products: list[Product]) -> l
         _hide_placeholder_product_images(row)
         if product.image_url and not row.get("images"):
             row["images"] = [product.image_url]
+        _normalize_public_product_images(row)
         category = categories_by_id.get(product.category_id)
         if category:
             row["category"] = serialize_record(category)
@@ -958,22 +993,43 @@ async def categories(limit: int = Query(100, ge=1, le=5000), session: AsyncSessi
 
 
 async def _categories_uncached(limit: int, session: AsyncSession) -> list[dict[str, Any]]:
-    statement = (
-        select(Category, func.count(Product.id).label("product_count"))
-        .outerjoin(
-            Product,
-            and_(Product.category_id == Category.id, *public_product_clauses(Product)),
-        )
+    category_result = await session.execute(
+        select(Category)
         .where(Category.deleted_at.is_(None), Category.is_active.is_(True))
-        .group_by(Category.id)
         .order_by(Category.sort_order, Category.name)
-        .limit(limit)
+        .limit(5000)
     )
-    result = await session.execute(statement)
+    all_categories = list(category_result.scalars())
+    if not all_categories:
+        return []
+    category_ids = [category.id for category in all_categories]
+    product_count_result = await session.execute(
+        select(Product.category_id, func.count(Product.id))
+        .where(Product.category_id.in_(category_ids), *public_product_clauses(Product))
+        .group_by(Product.category_id)
+    )
+    direct_counts = {
+        category_id: int(count or 0)
+        for category_id, count in product_count_result.all()
+    }
+    children: dict[uuid.UUID | None, list[Category]] = {}
+    for category in all_categories:
+        children.setdefault(category.parent_id, []).append(category)
+
+    def total_for(category: Category, seen: set[uuid.UUID]) -> int:
+        if category.id in seen:
+            return direct_counts.get(category.id, 0)
+        next_seen = {*seen, category.id}
+        return direct_counts.get(category.id, 0) + sum(
+            total_for(child, next_seen)
+            for child in children.get(category.id, [])
+        )
+
     rows = []
-    for category, product_count in result.all():
+    for category in all_categories[: max(int(limit), 1)]:
+        product_count = total_for(category, set())
         row = serialize_record(category)
-        row["product_count"] = int(product_count)
+        row["product_count"] = product_count
         if _safe_public_display_text(row.get("name")) or _safe_public_display_text(row.get("name_en")):
             rows.append(row)
     return rows
@@ -1295,6 +1351,98 @@ async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
     # A partner id without a real storefront record is not a customer-facing
     # store. Do not invent a UUID-based name for it in the public catalog.
     return rows
+
+
+MAX_CATALOG_IMAGE_BYTES = 12 * 1024 * 1024
+
+
+def _catalog_image_mime(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _canonicalize_catalog_image(data: bytes) -> tuple[bytes, str] | None:
+    media_type = _catalog_image_mime(data)
+    if media_type is None:
+        return None
+    # A legacy object can be named .webp while carrying JPEG bytes and omit
+    # only the terminal EOI marker. Restore that marker before decoding.
+    if media_type == "image/jpeg" and not data.endswith(b"\xff\xd9"):
+        data = data + b"\xff\xd9"
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            # Android devices are not consistent when an object is named
+            # .webp but the edge/CDN metadata is incomplete. Return one
+            # decoder-safe representation from the proxy so the URL suffix,
+            # Content-Type, and bytes always agree.
+            if media_type == "image/webp":
+                converted = image.convert("RGB")
+                output = BytesIO()
+                converted.save(output, format="JPEG", quality=92, optimize=True)
+                return output.getvalue(), "image/jpeg"
+    except Exception:
+        return None
+    return data, media_type
+
+
+@router.get("/catalog/image-proxy/{image_path:path}")
+async def catalog_image_proxy(image_path: str):
+    """Serve legacy CDN images with bytes and Content-Type aligned.
+
+    This route is deliberately allow-listed to one historical image hostname;
+    it is not a general URL fetcher and therefore cannot become an SSRF proxy.
+    """
+    relative = str(image_path or "").replace("\\", "/").lstrip("/")
+    if not relative or ".." in Path(relative).parts:
+        raise HTTPException(status_code=404, detail="image_not_found")
+    source = f"https://images.luxuryshoppings.com/{relative}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=False,
+            headers={"Accept": "image/*", "User-Agent": "LuxuryShoppingImageProxy/1.0"},
+        ) as client:
+            async with client.stream("GET", source) as upstream:
+                if upstream.status_code != 200:
+                    raise HTTPException(status_code=404, detail="image_not_found")
+                declared_size = int(upstream.headers.get("content-length") or 0)
+                if declared_size > MAX_CATALOG_IMAGE_BYTES:
+                    raise HTTPException(status_code=413, detail="image_too_large")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in upstream.aiter_bytes(64 * 1024):
+                    total += len(chunk)
+                    if total > MAX_CATALOG_IMAGE_BYTES:
+                        raise HTTPException(status_code=413, detail="image_too_large")
+                    chunks.append(chunk)
+                if declared_size and total != declared_size:
+                    raise HTTPException(status_code=502, detail="image_incomplete")
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, OSError, ValueError) as error:
+        raise HTTPException(status_code=502, detail="image_upstream_unavailable") from error
+    canonical = _canonicalize_catalog_image(b"".join(chunks))
+    if canonical is None:
+        raise HTTPException(status_code=502, detail="image_invalid")
+    data, media_type = canonical
+    return Response(
+        data,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=86400, s-maxage=604800, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/stores")

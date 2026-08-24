@@ -1446,6 +1446,101 @@ async def admin_customers(
     return await AdminCustomerAccessService.list_customers(session, roles=roles, limit=limit, full=True)
 
 
+@router.get("/api/admin/account-deletion-requests")
+async def admin_account_deletion_requests(
+    status: str = Query("pending"),
+    limit: int = Query(200, ge=1, le=1000),
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    request_model = MODEL_BY_TABLE["account_deletion_requests"]
+    profile_model = MODEL_BY_TABLE["profiles"]
+    normalized_status = str(status or "pending").strip().lower()
+    statement = (
+        select(request_model, User, profile_model)
+        .join(User, User.id == request_model.user_id)
+        .outerjoin(
+            profile_model,
+            and_(
+                profile_model.user_id == User.id,
+                profile_model.deleted_at.is_(None),
+            ),
+        )
+        .where(request_model.deleted_at.is_(None))
+        .order_by(request_model.created_at.desc())
+        .limit(limit)
+    )
+    if normalized_status != "all":
+        statement = statement.where(request_model.status == normalized_status)
+    result = await session.execute(statement)
+    data = []
+    for deletion_request, user, profile in result.all():
+        data.append(
+            {
+                **serialize_record(deletion_request),
+                "user": {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "is_active": bool(user.is_active),
+                    "full_name": getattr(profile, "full_name", None) if profile else None,
+                    "phone": getattr(profile, "phone", None) if profile else None,
+                },
+            }
+        )
+    return {"data": data}
+
+
+@router.patch("/api/admin/account-deletion-requests/{request_id}")
+async def review_account_deletion_request(
+    request_id: uuid.UUID,
+    request: Request,
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    next_status = str(body.get("status") or "").strip().lower()
+    if next_status not in {"approved", "rejected"}:
+        raise HTTPException(status_code=422, detail="invalid_account_deletion_status")
+
+    request_model = MODEL_BY_TABLE["account_deletion_requests"]
+    deletion_request = await session.get(request_model, request_id, with_for_update=True)
+    if deletion_request is None or getattr(deletion_request, "deleted_at", None) is not None:
+        raise HTTPException(status_code=404, detail="account_deletion_request_not_found")
+    if str(deletion_request.status or "").lower() not in {"pending", "processing"}:
+        raise HTTPException(status_code=409, detail="account_deletion_request_already_reviewed")
+
+    target_user = await session.get(User, deletion_request.user_id, with_for_update=True)
+    if target_user is None:
+        raise HTTPException(status_code=404, detail="account_owner_not_found")
+
+    now = datetime.now(timezone.utc)
+    deletion_request.status = next_status
+    if "extra_data" in deletion_request.__table__.c:
+        metadata = dict(getattr(deletion_request, "extra_data", None) or {})
+        metadata["reviewed_by"] = str(admin.id)
+        metadata["reviewed_at"] = now.isoformat()
+        metadata["review_reason"] = str(body.get("reason") or "").strip() or None
+        deletion_request.extra_data = metadata
+
+    account_state = await account_security_for(session, target_user.id, for_update=True)
+    if next_status == "approved":
+        target_user.is_active = False
+        target_user.deleted_at = now
+        account_state.account_status = "deleted"
+        account_state.disabled_at = now
+        await bump_security_version(session, target_user, reason="account_deletion_approved")
+        await revoke_all_refresh_tokens(session, target_user.id, now=now)
+    else:
+        target_user.is_active = True
+        target_user.deleted_at = None
+        account_state.account_status = "active"
+        account_state.disabled_at = None
+        await bump_security_version(session, target_user, reason="account_deletion_rejected")
+
+    await session.commit()
+    return {"data": serialize_record(deletion_request), "status": next_status}
+
+
 SECTION_TABLES = {
     "suppliers": "suppliers", "warehouses": "warehouses", "inventory": "inventory",
     "brands": "brands", "categories": "categories", "merchants": "partner_profiles",
@@ -2264,22 +2359,62 @@ async def api_create_local_shopping_request(
     session: AsyncSession = Depends(get_session),
 ):
     body = await request.json()
-    description = _first_text(body.get("product_description"), body.get("description"))
-    if len(description) < 10:
-        raise HTTPException(status_code=422, detail="product_description_required")
-    try:
-        quantity = int(body.get("quantity") or 1)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="invalid_quantity")
-    if quantity < 1 or quantity > 100:
-        raise HTTPException(status_code=422, detail="invalid_quantity")
+    raw_items = body.get("items")
+    items = raw_items if isinstance(raw_items, list) and raw_items else None
+    item_descriptions: list[str] = []
+    total_quantity = 0
+    total_amount = Decimal("0")
+    if items is not None:
+        for item in items:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=422, detail="invalid_item")
+            try:
+                item_quantity = int(item.get("quantity") or 1)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="invalid_quantity")
+            if item_quantity < 1 or item_quantity > 100:
+                raise HTTPException(status_code=422, detail="invalid_quantity")
+            item_description = _first_text(
+                item.get("description"),
+                item.get("product_description"),
+                item.get("product_name"),
+                item.get("product_url"),
+                default="منتج محلي",
+            )
+            item_descriptions.append(item_description)
+            total_quantity += item_quantity
+            total_amount += _money_from_payload(
+                item.get("amount")
+                or item.get("unit_price")
+                or item.get("estimated_price")
+                or 0
+            ) * item_quantity
+        quantity = total_quantity
+        description = _first_text(
+            body.get("product_description"),
+            body.get("description"),
+            ", ".join(item_descriptions[:3]),
+            default="طلب تسوق محلي متعدد المنتجات",
+        )
+        amount = total_amount
+    else:
+        description = _first_text(body.get("product_description"), body.get("description"))
+        if len(description) < 10:
+            raise HTTPException(status_code=422, detail="product_description_required")
+        try:
+            quantity = int(body.get("quantity") or 1)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_quantity")
+        if quantity < 1 or quantity > 100:
+            raise HTTPException(status_code=422, detail="invalid_quantity")
+        amount = _money_from_payload(body.get("amount") or body.get("estimated_amount") or 0)
     payload = {
         **body,
         "user_id": user.id,
         "status": "pending",
         "description": description,
         "quantity": quantity,
-        "amount": _money_from_payload(body.get("amount") or body.get("estimated_amount") or 0),
+        "amount": amount,
     }
     row = await _api_create(session, "local_shopping_requests", payload, user)
     await session.commit()

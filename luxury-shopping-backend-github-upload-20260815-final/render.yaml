@@ -9,7 +9,11 @@ services:
     preDeployCommand: python -m alembic upgrade head
     # Migrations run once in preDeployCommand. Running them again on every
     # process start needlessly delays cold starts and restarts.
-    startCommand: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # uvloop + httptools are installed by uvicorn[standard] and provide the
+    # fastest supported event loop and HTTP parser on Render's Linux runtime.
+    # Access logging is disabled because the app already emits one redacted
+    # structured request-completion log per request.
+    startCommand: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --loop uvloop --http httptools --no-access-log
     healthCheckPath: /health/ready
     autoDeployTrigger: commit
     envVars:
@@ -88,7 +92,7 @@ services:
       - key: SMTP_FROM_EMAIL
         value: luxuryshoppingsye@gmail.com
       - key: EMAIL_PROVIDER
-        value: smtp
+        value: auto
       - key: RESEND_API_URL
         value: https://api.resend.com/emails
       - key: RESEND_API_KEY
@@ -139,6 +143,81 @@ services:
           type: web
           name: luxury-shopping-backend
           envVarKey: JWT_SECRET
+      - key: RENDER_PUBLIC_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: RENDER_PUBLIC_URL
+      - key: UPLOAD_DIR
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: UPLOAD_DIR
+      - key: STORAGE_PROVIDER
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: STORAGE_PROVIDER
+      - key: R2_ENDPOINT_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: R2_ENDPOINT_URL
+      - key: R2_BUCKET
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: R2_BUCKET
+      - key: R2_ACCESS_KEY_ID
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: R2_ACCESS_KEY_ID
+      - key: R2_SECRET_ACCESS_KEY
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: R2_SECRET_ACCESS_KEY
+      - key: R2_REGION
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: R2_REGION
+      - key: R2_PUBLIC_BASE_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: R2_PUBLIC_BASE_URL
+      - key: API_BASE_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: API_BASE_URL
+      - key: APP_PUBLIC_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: APP_PUBLIC_URL
+      - key: FRONTEND_PUBLIC_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: FRONTEND_PUBLIC_URL
+      - key: WS_BASE_URL
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: WS_BASE_URL
+      - key: CORS_ORIGINS
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: CORS_ORIGINS
+      - key: REALTIME_ALLOWED_ORIGINS
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: REALTIME_ALLOWED_ORIGINS
       - key: MESSAGE_WORKER_POLL_SECONDS
         value: "5"
       - key: FIREBASE_PROJECT_ID

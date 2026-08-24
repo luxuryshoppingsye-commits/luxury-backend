@@ -308,6 +308,7 @@ PRIVATE_NO_STORE_PREFIXES = (
 PUBLIC_CACHEABLE_PREFIXES = (
     "/products",
     "/api/catalog/products",
+    "/api/catalog/image-proxy",
     "/offers",
     "/api/catalog/offers",
     "/categories",
@@ -397,12 +398,16 @@ def _apply_cache_headers(request: Request, response) -> None:
         and path.lower().endswith("/image")
         and _matches_prefix(path, ("/share/products",))
     )
+    is_catalog_image_proxy = (
+        request.method in {"GET", "HEAD"}
+        and _matches_prefix(path, ("/api/catalog/image-proxy",))
+    )
     is_static_file = (
         request.method in {"GET", "HEAD"}
         and not has_auth_context
         and _matches_prefix(path, ("/uploads", "/api/uploads"))
     )
-    if (is_static_file or is_share_image) and not has_auth_context:
+    if (is_static_file or is_share_image or is_catalog_image_proxy) and not has_auth_context:
         response.headers["Cache-Control"] = "public, max-age=86400, immutable"
         if "Pragma" in response.headers:
             del response.headers["Pragma"]
@@ -440,6 +445,10 @@ def _apply_security_headers(request: Request, response) -> None:
         and path.lower().endswith("/image")
         and _matches_prefix(path, ("/share/products",))
     )
+    is_catalog_image_proxy = (
+        request.method in {"GET", "HEAD"}
+        and _matches_prefix(path, ("/api/catalog/image-proxy",))
+    )
     response.headers[REQUEST_ID_HEADER] = request_id_from_request(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -454,7 +463,11 @@ def _apply_security_headers(request: Request, response) -> None:
     response.headers["Cross-Origin-Resource-Policy"] = (
         "cross-origin"
         if request.method in {"GET", "HEAD"}
-        and (_matches_prefix(path, ("/uploads", "/api/uploads")) or is_share_image)
+        and (
+            _matches_prefix(path, ("/uploads", "/api/uploads"))
+            or is_share_image
+            or is_catalog_image_proxy
+        )
         else "same-origin"
     )
     if settings.app_env in {"production", "staging"} or request.url.scheme == "https":

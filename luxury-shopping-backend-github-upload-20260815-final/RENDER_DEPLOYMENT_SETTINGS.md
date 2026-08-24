@@ -9,7 +9,7 @@
 - Root directory: فارغ إذا كان هذا المستودع يحتوي الـ Backend وحده
 - Build command: `python -m pip install -r requirements.txt`
 - Pre-deploy command: `python -m alembic upgrade head`
-- Start command: `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Start command: `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --loop uvloop --http httptools --no-access-log`
 - Health check path: `/health/ready`
 - Branch: `main`
 - Persistent Disk: لا تضف Disk للصور

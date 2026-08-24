@@ -7,6 +7,7 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
     public_reads = (
         "/products",
         "/api/catalog/products",
+        "/api/catalog/image-proxy/products/example.webp",
         "/api/catalog/recommendations",
         "/api/catalog/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/variants",
         "/offers",

@@ -154,9 +154,23 @@ def is_public_approval_status(value: Any) -> bool:
 def public_product_base_clauses(model: type[Product] = Product) -> list[Any]:
     return [
         model.deleted_at.is_(None),
+        # Nullable is kept compatible with legacy rows, but an explicit false
+        # must never leak into the customer catalogue.
+        or_(model.is_active.is_(True), model.is_active.is_(None)),
         public_approval_clause(model),
         public_product_safe_text_clause(model),
+        public_product_image_clause(model),
     ]
+
+
+def public_product_image_clause(model: type[Product] = Product) -> Any:
+    """Require a primary URL or a non-empty image collection at the API edge."""
+    has_primary = and_(
+        model.image_url.is_not(None),
+        func.length(func.trim(model.image_url)) > 0,
+    )
+    has_collection = and_(model.images.is_not(None), model.images != [])
+    return or_(has_primary, has_collection)
 
 
 def public_product_safe_text_clause(model: type[Product] = Product) -> Any:
@@ -465,6 +479,14 @@ def _public_upload_url(value: Any) -> str | None:
             str(get_settings().r2_public_base_url or "")
         ).hostname
         parsed = urlparse(raw)
+        # Legacy product objects were uploaded under this hostname with a
+        # `.webp` suffix even when the bytes were JPEG. Route these objects
+        # through the API normalizer so clients receive a truthful MIME type
+        # and a complete byte stream instead of trusting the stale suffix.
+        if parsed.scheme == "https" and parsed.hostname and parsed.hostname.lower() == "images.luxuryshoppings.com":
+            relative = parsed.path.lstrip("/")
+            if relative and ".." not in relative.split("/"):
+                return f"/api/catalog/image-proxy/{relative}"
         if (
             parsed.scheme == "https"
             and configured_public_host
