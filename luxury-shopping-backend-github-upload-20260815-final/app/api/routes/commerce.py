@@ -1680,7 +1680,7 @@ async def delete_wishlist(product_id: uuid.UUID, user: User = Depends(current_us
 
 async def _visible_orders(session: AsyncSession, user: User, roles: set[str], scope: str | None, limit: int):
     statement = select(Order).where(Order.deleted_at.is_(None))
-    if scope == "admin" and roles.intersection({"admin", "manager", "finance", "logistics", "staff"}):
+    if scope == "admin" and roles.intersection({"admin", "manager", "finance", "logistics", "staff", "employee"}):
         pass
     elif scope == "partner" and "partner" in roles:
         order_ids = select(OrderItem.order_id).where(OrderItem.partner_id == user.id)
@@ -1701,7 +1701,7 @@ async def orders(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    if scope == "partner" and "partner" in roles and not roles.intersection({"admin", "manager", "finance", "logistics", "staff"}):
+    if scope == "partner" and "partner" in roles and not roles.intersection({"admin", "manager", "finance", "logistics", "staff", "employee"}):
         rows = await merchant_order_list(session, partner_id=user.id, limit=limit)
         return {"data": rows} if request.url.path.startswith("/api/") else rows
     rows = [_serialize_order(row) for row in await _visible_orders(session, user, roles, scope, limit)]
@@ -2453,7 +2453,7 @@ async def change_order_status(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    if not roles.intersection({"admin", "manager", "logistics", "staff", "courier", "delivery"}):
+    if not roles.intersection({"admin", "manager", "logistics", "staff", "employee", "courier", "delivery"}):
         raise HTTPException(status_code=403, detail="insufficient_permissions")
     body = await request.json()
     next_status = str(body.get("nextStatus") or body.get("status") or "").strip()
@@ -2463,7 +2463,7 @@ async def change_order_status(
     order = result.scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="order_not_found")
-    courier_actor = bool(roles.intersection({"courier", "delivery"}) and not roles.intersection({"admin", "manager", "logistics", "staff"}))
+    courier_actor = bool(roles.intersection({"courier", "delivery"}) and not roles.intersection({"admin", "manager", "logistics", "staff", "employee"}))
     if courier_actor:
         assignment_model = MODEL_BY_TABLE["courier_assignments"]
         assignment = (
