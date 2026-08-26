@@ -81,6 +81,25 @@ def test_public_upload_uses_generated_path_and_public_url(tmp_path: Path) -> Non
     assert (tmp_path / stored.relative_path).is_file()
 
 
+def test_product_description_attachment_accepts_public_pdf(tmp_path: Path) -> None:
+    storage = object.__new__(FileStorage)
+    storage.root = tmp_path.resolve()
+    storage.settings = SimpleNamespace(max_upload_bytes=10 * 1024 * 1024)
+    storage.scanner = LocalSignatureScanner()
+
+    stored = storage.save_bytes(
+        "product-description-attachments",
+        "manual.pdf",
+        b"%PDF-1.7\nproduct manual",
+        "http://api.test",
+        roles={"employee"},
+    )
+
+    assert stored.relative_path.startswith("product-description/")
+    assert stored.public_url == f"http://api.test/uploads/{stored.relative_path}"
+    assert stored.content_type == "application/pdf"
+
+
 def test_public_upload_can_write_to_r2_and_returns_r2_url(monkeypatch, tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 
