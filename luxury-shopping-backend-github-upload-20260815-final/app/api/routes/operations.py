@@ -2190,6 +2190,7 @@ async def api_dashboard_system_health(staff: User = Depends(require_staff), sess
     marketer_model = MODEL_BY_TABLE["marketers"]
     security_model = MODEL_BY_TABLE["security_events"]
     stuck_cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    inventory_counts = _canonical_inventory_stock_counts(await _canonical_inventory_payloads(session))
     return {"data": {
         "total_orders": await _count(session, "orders"),
         "stuck_orders": await _count(session, "orders", order_model.status.in_(("pending", "new", "processing")), order_model.created_at < stuck_cutoff),
@@ -2202,8 +2203,8 @@ async def api_dashboard_system_health(staff: User = Depends(require_staff), sess
         "pending_commissions": float(await _sum_amount(session, "marketer_commissions", MODEL_BY_TABLE["marketer_commissions"].status.in_(("pending", "unpaid")))),
         "pending_international": await _count(session, "international_orders", MODEL_BY_TABLE["international_orders"].status.in_(("pending", "new", "reviewing"))),
         "unlinked": await _count(session, "international_orders", MODEL_BY_TABLE["international_orders"].status.in_(("new", "pending"))),
-        "out_of_stock": await _count(session, "products", product_model.is_active.is_(True), product_model.stock_quantity <= 0),
-        "low_stock": await _count(session, "products", product_model.is_active.is_(True), product_model.stock_quantity > 0, product_model.stock_quantity <= 5),
+        "out_of_stock": inventory_counts["out_of_stock"],
+        "low_stock": inventory_counts["low_stock"],
         "blocked_actions": await _count(session, "security_events", security_model.status.in_(("blocked", "rejected"))),
     }}
 
@@ -2247,10 +2248,11 @@ async def api_dashboard_smart_alerts(staff: User = Depends(require_staff), sessi
     stuck_orders = []
     for row in await _rows(session, "orders", clauses=(order_model.status.in_(("pending", "new", "processing")), order_model.created_at < datetime.now(timezone.utc) - timedelta(days=1)), limit=10):
         stuck_orders.append({"id": str(row.id), "order_number": row.order_number, "created_at": row.created_at.isoformat()})
+    inventory_counts = _canonical_inventory_stock_counts(await _canonical_inventory_payloads(session))
     return {"data": {
         "pending_payments": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))),
-        "low_stock": await _count(session, "products", product_model.is_active.is_(True), product_model.stock_quantity > 0, product_model.stock_quantity <= 5),
-        "out_of_stock": await _count(session, "products", product_model.is_active.is_(True), product_model.stock_quantity <= 0),
+        "low_stock": inventory_counts["low_stock"],
+        "out_of_stock": inventory_counts["out_of_stock"],
         "pending_partners": await _count(session, "partner_applications", MODEL_BY_TABLE["partner_applications"].status.in_(("pending", "reviewing"))),
         "balance_issues": await _count(session, "orders", order_model.status == "delivered", order_model.payment_status != "paid"),
         "pending_commissions": float(await _sum_amount(session, "marketer_commissions", MODEL_BY_TABLE["marketer_commissions"].status.in_(("pending", "unpaid")))),
@@ -3019,6 +3021,20 @@ async def _canonical_inventory_payloads(
     return result
 
 
+def _canonical_inventory_stock_counts(payloads: list[dict[str, Any]]) -> dict[str, int]:
+    """Return dashboard stock counts from the same projection as inventory screens."""
+    active_rows = [
+        payload
+        for payload in payloads
+        if (payload.get("product") or {}).get("is_active", True) is not False
+    ]
+    quantities = [_inventory_quantity(payload.get("quantity")) for payload in active_rows]
+    return {
+        "out_of_stock": sum(1 for quantity in quantities if quantity <= 0),
+        "low_stock": sum(1 for quantity in quantities if 0 < quantity <= 5),
+    }
+
+
 @router.get("/api/admin/inventory/warehouses")
 async def api_inventory_warehouses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return {"data": [serialize_record(row) for row in await _rows(session, "warehouses", limit=500)]}
@@ -3239,7 +3255,26 @@ async def api_admin_list_brands(staff: User = Depends(require_staff), session: A
 @router.get("/api/catalog/admin/products")
 async def api_admin_list_products(staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     await require_staff_permission(session, staff.id, roles, "products.view")
-    return {"data": [serialize_record(row) for row in await _rows(session, "products", limit=5000)]}
+    product_rows = await _rows(session, "products", limit=5000)
+    # The inventory screen and the product screen must use one stock source.
+    # Legacy data can contain a stale products.stock_quantity alongside a
+    # current inventory_locations quantity. Reuse the canonical inventory
+    # projection here so both admin views show the same number without
+    # mutating production data during a read.
+    canonical_inventory = await _canonical_inventory_payloads(session)
+    inventory_quantity_by_product = {
+        str(item.get("product_id")): _inventory_quantity(item.get("quantity"))
+        for item in canonical_inventory
+        if item.get("product_id")
+    }
+    data = []
+    for row in product_rows:
+        payload = serialize_record(row)
+        product_id = str(payload.get("id") or "")
+        if product_id in inventory_quantity_by_product:
+            payload["stock_quantity"] = inventory_quantity_by_product[product_id]
+        data.append(payload)
+    return {"data": data}
 
 
 @router.post("/api/catalog/admin/products/{product_id}/variants", status_code=201)
@@ -3770,11 +3805,12 @@ async def api_dashboard_kpis(staff: User = Depends(require_staff), session: Asyn
     yesterday_revenue = Decimal(yesterday_revenue_data["net_revenue"])
     month_revenue = Decimal(month_revenue_data["net_revenue"])
     today_orders = await _count(session, "orders", order_model.created_at >= today)
+    inventory_counts = _canonical_inventory_stock_counts(await _canonical_inventory_payloads(session))
     return {"data": {
         "revenue": {"today": float(today_revenue), "yesterday": float(yesterday_revenue), "thisMonth": float(month_revenue), "lastMonth": 0, "trend": float(today_revenue - yesterday_revenue)},
         "orders": {"today": today_orders, "pending": await _count(session, "orders", order_model.status.in_(("pending", "new"))), "processing": await _count(session, "orders", order_model.status == "processing"), "completed": await _count(session, "orders", order_model.status.in_(("delivered", "completed"))), "trend": 0},
         "customers": {"total": await _count(session, "users"), "new_today": await _count(session, "users", user_model.created_at >= today), "new_this_month": await _count(session, "users", user_model.created_at >= month), "trend": 0},
-        "products": {"total": await _count(session, "products"), "low_stock": await _count(session, "products", product_model.stock_quantity > 0, product_model.stock_quantity <= 5), "out_of_stock": await _count(session, "products", product_model.stock_quantity <= 0), "pending_approval": await _count(session, "products", product_model.approval_status.in_(("pending", "reviewing")))},
+        "products": {"total": await _count(session, "products"), "low_stock": inventory_counts["low_stock"], "out_of_stock": inventory_counts["out_of_stock"], "pending_approval": await _count(session, "products", product_model.approval_status.in_(("pending", "reviewing")))},
         "payments": {"pending_amount": float(await _sum_amount(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing")))), "pending_count": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))), "collected_today": float(await _sum_amount(session, "order_payments", MODEL_BY_TABLE["order_payments"].created_at >= today)), "collection_rate": 0},
         "expenses": {"today": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= today)), "thisMonth": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= month)), "general": float(await _sum_amount(session, "general_expenses")), "employees": float(await _sum_amount(session, "employee_payments")), "partners": float(await _sum_amount(session, "partner_payments")), "marketers": float(await _sum_amount(session, "marketer_payments")), "netProfit": float(month_revenue)},
         "partners": {"total": await _count(session, "partner_storefronts"), "active": await _count(session, "partner_storefronts", MODEL_BY_TABLE["partner_storefronts"].status.in_(("active", "approved"))), "pending_settlements": await _count(session, "partner_settlements", MODEL_BY_TABLE["partner_settlements"].status.in_(("pending", "unpaid")))},
