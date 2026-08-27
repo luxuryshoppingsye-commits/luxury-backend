@@ -4,20 +4,28 @@ from collections.abc import AsyncIterator
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from .config import get_settings
 
 
 settings = get_settings()
-engine = create_async_engine(
-    settings.database_url,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-    pool_use_lifo=True,
-    pool_recycle=900,
-    pool_timeout=15,
-)
+engine_options = {"pool_pre_ping": True}
+if settings.is_test_environment:
+    # Tests create and tear down event loops per module. A real pool can retain
+    # asyncpg connections bound to an earlier loop and make later test groups
+    # fail with "Future attached to a different loop". A NullPool keeps every
+    # test database connection scoped to the loop that opened it.
+    engine_options["poolclass"] = NullPool
+else:
+    engine_options.update(
+        pool_size=10,
+        max_overflow=20,
+        pool_use_lifo=True,
+        pool_recycle=900,
+        pool_timeout=15,
+    )
+engine = create_async_engine(settings.database_url, **engine_options)
 
 
 @event.listens_for(engine.sync_engine, "connect")

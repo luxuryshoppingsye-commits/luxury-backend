@@ -515,17 +515,20 @@ async def register_customer(
     city = str(body.city or "").strip()
     street = str(body.street or "").strip()
     address_details = str(body.address_details or "").strip()
-    # Street and address details are optional in the customer form. Keep the
-    # account contract aligned with that UI and require only the fields marked
-    # as required there.
-    if not phone or not city:
-        raise HTTPException(status_code=400, detail="profile_details_required")
+    # Reject automated/invalid registrations before reporting profile-field
+    # omissions. This keeps the abuse-control contract deterministic and
+    # ensures a missing CAPTCHA is never masked by form validation.
     captcha_status = await _assert_registration_allowed(
         session,
         request,
         email=normalized_email,
         captcha_token=body.captcha_token,
     )
+    # Street and address details are optional in the customer form. Keep the
+    # account contract aligned with that UI and require only the fields marked
+    # as required there.
+    if not phone or not city:
+        raise HTTPException(status_code=400, detail="profile_details_required")
     try:
         user = await create_user(
             session,
@@ -660,6 +663,9 @@ async def register_merchant(
         },
     )
     session.add(application)
+    account_state = await account_security_for(session, user.id, for_update=True)
+    account_state.account_status = "pending_merchant_review"
+    await bump_security_version(session, user, reason="merchant_application_submitted", request=request)
     await record_security_event(
         session,
         user_id=user.id,
@@ -897,6 +903,17 @@ async def update_me(
     for source, target in mapping.items():
         if source in values:
             setattr(profile, target, _repair_mojibake(values[source]))
+    extra_fields = {"address", "governorate", "district", "preferred_currency"}
+    profile_extra = dict(profile.extra_data or {})
+    for field in extra_fields:
+        if field not in values:
+            continue
+        value = values[field]
+        if value is None or not str(value).strip():
+            profile_extra.pop(field, None)
+        else:
+            profile_extra[field] = _repair_mojibake(str(value).strip())
+    profile.extra_data = profile_extra
     await session.commit()
     return await auth_payload(session, user, request=request, issue_tokens=False)
 

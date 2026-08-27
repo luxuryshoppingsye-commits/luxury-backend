@@ -31,6 +31,7 @@ from ..database import engine
 from ..models import MODEL_BY_TABLE
 from ..models.domain import FileAsset, User
 from ..repositories.resources import serialize_record
+from ..storage.files import FileStorage
 
 
 BACKUP_LOCK_KEY = 0x4C555855525942  # LUXURYB
@@ -325,15 +326,48 @@ class PostgreSQLDumpService:
 
 
 class FileSnapshotService:
-    def __init__(self, *, upload_root: Path) -> None:
+    def __init__(self, *, upload_root: Path, storage: FileStorage | None = None) -> None:
         self.upload_root = upload_root.resolve()
+        self.storage = storage
+
+    @staticmethod
+    def _safe_archive_target(destination: Path, storage_key: str) -> Path:
+        target = (destination / "files" / storage_key).resolve()
+        destination_root = destination.resolve()
+        try:
+            target.relative_to(destination_root)
+        except ValueError as exc:
+            raise RuntimeError("unsafe_file_asset_path") from exc
+        return target
+
+    def _download_r2_file(self, *, storage_key: str, target: Path) -> None:
+        if self.storage is None:
+            raise RuntimeError("r2_storage_unavailable")
+        body = None
+        try:
+            response = self.storage._r2_client().get_object(
+                Bucket=str(self.storage.settings.r2_bucket),
+                Key=storage_key,
+            )
+            body = response["Body"]
+            with target.open("wb") as handle:
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+        except Exception as exc:
+            raise RuntimeError("file_missing_from_r2") from exc
+        finally:
+            if body is not None:
+                body.close()
 
     async def collect(self, session: AsyncSession, destination: Path) -> dict[str, Any]:
         rows = (
             await session.execute(
                 text(
                     """
-                    select id::text, policy_key, visibility, storage_bucket, storage_key,
+                    select id::text, policy_key, visibility, storage_provider, storage_bucket, storage_key,
                            original_filename, content_type, size_bytes, checksum_sha256,
                            entity_type, entity_id::text, created_at, scan_status
                     from file_assets
@@ -347,18 +381,27 @@ class FileSnapshotService:
         files: list[dict[str, Any]] = []
         for row in rows:
             storage_key = str(row["storage_key"]).replace("\\", "/").lstrip("/")
+            archive_path = f"files/{storage_key}"
+            target = self._safe_archive_target(destination, storage_key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            provider = str(row.get("storage_provider") or "local_uploads")
             source = (self.upload_root / storage_key).resolve()
             if source != self.upload_root and self.upload_root not in source.parents:
                 raise RuntimeError("unsafe_file_asset_path")
-            if not source.is_file():
+            if provider == "cloudflare_r2":
+                self._download_r2_file(storage_key=storage_key, target=target)
+            elif source.is_file():
+                shutil.copy2(source, target)
+            else:
                 raise RuntimeError(f"file_missing:{row['id']}")
-            actual_sha = _sha256(source)
+            if not target.is_file():
+                raise RuntimeError(f"file_missing:{row['id']}")
+            expected_size = row.get("size_bytes")
+            if expected_size is not None and target.stat().st_size != int(expected_size):
+                raise RuntimeError(f"file_size_mismatch:{row['id']}")
+            actual_sha = _sha256(target)
             if row["checksum_sha256"] and actual_sha != row["checksum_sha256"]:
                 raise RuntimeError(f"file_checksum_mismatch:{row['id']}")
-            archive_path = f"files/{storage_key}"
-            target = destination / archive_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
             files.append(
                 {
                     "file_id": row["id"],
@@ -366,7 +409,7 @@ class FileSnapshotService:
                     "relative_archive_path": archive_path,
                     "entity_type": row["entity_type"],
                     "entity_id": row["entity_id"],
-                    "size": source.stat().st_size,
+                    "size": target.stat().st_size,
                     "checksum": actual_sha,
                     "mime": row["content_type"],
                     "created_at": row["created_at"].isoformat() if row["created_at"] else None,
@@ -863,7 +906,10 @@ class BackupCoordinator:
                 dump_path,
             )
             await self._set_status(session, row, "collecting_files")
-            file_manifest = await FileSnapshotService(upload_root=self.settings.resolved_upload_dir).collect(session, files_dir)
+            file_manifest = await FileSnapshotService(
+                upload_root=self.settings.resolved_upload_dir,
+                storage=FileStorage(),
+            ).collect(session, files_dir)
             await self._set_status(session, row, "building_manifest")
             manifest = self._build_manifest(row, dump_result, file_manifest)
             self._write_bundle_metadata(files_dir, manifest)
@@ -897,6 +943,11 @@ class BackupCoordinator:
                     timeout_seconds=self.settings.backup_command_timeout_seconds,
                 ).verify(encrypted_path, self.encryption)
                 await self._set_status(session, row, "verifying_restored_files", **restore_result)
+            # The database enforces that a ready backup already has a
+            # non-empty bundle path. Set it before the constrained status
+            # transition, otherwise the transition is rejected even after
+            # dump, encryption, offsite copy, and restore verification pass.
+            row.path = str(encrypted_path)
             await self._set_status(
                 session,
                 row,
@@ -908,7 +959,6 @@ class BackupCoordinator:
                 verification_status="verified",
                 restore_verification_status=restore_result.get("restore_verification_status", "not_required"),
             )
-            row.path = str(encrypted_path)
             await self.retention.apply(session)
             return self._response(row)
         except HTTPException:

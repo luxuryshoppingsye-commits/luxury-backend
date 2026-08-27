@@ -30,7 +30,13 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: RENDER_PUBLIC_URL
-        value: https://luxury-backend-xy9d.onrender.com
+        # Render exposes the real public service URL automatically. Map it to
+        # the setting name used by the FastAPI application instead of keeping
+        # a placeholder hostname in the Blueprint.
+        fromService:
+          type: web
+          name: luxury-shopping-backend
+          envVarKey: RENDER_EXTERNAL_URL
       - key: UPLOAD_DIR
         value: /tmp/luxury-backend-upload-quarantine
       - key: STORAGE_PROVIDER

@@ -163,6 +163,10 @@ class ProfileUpdateRequest(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     city: str | None = Field(default=None, max_length=160)
     avatar_url: str | None = Field(default=None, max_length=2000)
+    address: str | None = Field(default=None, max_length=1000)
+    governorate: str | None = Field(default=None, max_length=160)
+    district: str | None = Field(default=None, max_length=160)
+    preferred_currency: str | None = Field(default=None, max_length=16)
 
     @model_validator(mode="before")
     @classmethod

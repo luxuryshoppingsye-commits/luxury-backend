@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, literal_column, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import MODEL_BY_TABLE
@@ -77,17 +77,21 @@ async def serialize_local_shopping_requests(
 
     request_ids = [str(request.id) for request in requests]
     payment_model = MODEL_BY_TABLE["order_payments"]
+    # Inline the JSON key so PostgreSQL sees the same expression in SELECT,
+    # WHERE, and GROUP BY. asyncpg otherwise binds each JSON accessor key
+    # independently, which makes PostgreSQL reject the grouped query.
+    local_request_id = payment_model.extra_data.op("->>")(literal_column("'local_request_id'"))
     result = await session.execute(
         select(
-            payment_model.extra_data["local_request_id"].astext,
+            local_request_id,
             func.coalesce(func.sum(payment_model.amount), 0),
         )
         .where(
             payment_model.deleted_at.is_(None),
-            payment_model.extra_data["local_request_id"].astext.in_(request_ids),
+            local_request_id.in_(request_ids),
             func.lower(payment_model.status).in_(LOCAL_PAYMENT_SUCCESS_STATUSES),
         )
-        .group_by(payment_model.extra_data["local_request_id"].astext)
+        .group_by(local_request_id)
     )
     paid_by_request = {
         str(request_id): money_or_zero(amount)
@@ -270,7 +274,29 @@ async def _shipping_total(session: AsyncSession, body: dict[str, Any]) -> tuple[
         if row is None or not row.is_active or row.deleted_at is not None:
             raise HTTPException(status_code=404, detail="shipping_zone_not_found")
         return money(row.fee or 0), "shipping_zone", {"shipping_zone_id": str(row.id)}
-    raise HTTPException(status_code=422, detail="shipping_zone_required")
+    # A customer must still be able to complete an order when the catalogue
+    # has no governorate-specific zone yet. The web client displays the same
+    # configured default fee in this case; keep the authoritative calculation
+    # on the backend and record the source for later auditability.
+    default_fee = Decimal("5000.00")
+    settings_model = MODEL_BY_TABLE.get("site_settings")
+    if settings_model is not None:
+        settings_result = await session.execute(
+            select(settings_model)
+            .where(
+                settings_model.name == "shipping_config",
+                settings_model.deleted_at.is_(None),
+            )
+            .limit(1)
+        )
+        settings_row = settings_result.scalar_one_or_none()
+        settings_extra = dict(getattr(settings_row, "extra_data", {}) or {}) if settings_row is not None else {}
+        configured = settings_extra.get("default_fee")
+        if configured is None and isinstance(settings_extra.get("setting_value"), dict):
+            configured = settings_extra["setting_value"].get("default_fee")
+        if configured is not None:
+            default_fee = money(configured)
+    return default_fee, "default_config", {"shipping_zone_id": None}
 
 
 async def calculate_checkout_financials(

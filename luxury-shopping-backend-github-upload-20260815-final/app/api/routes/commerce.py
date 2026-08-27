@@ -44,6 +44,7 @@ from ...services.catalog_policy import (
     public_product_base_clauses,
     public_product_clauses,
     public_main_storefront_response,
+    public_product_response,
     public_storefront_response,
     validate_public_product_or_404,
     _public_upload_url,
@@ -66,7 +67,7 @@ from ...services.commerce_rules import (
 )
 from ...services.payment_methods import validate_payment_method_for_checkout
 from ...services.staff_permissions import require_staff_permission
-from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof
+from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof, normalize_status
 from ...services.notification_service import NotificationPayload, NotificationService
 from ...storage import FileStorage
 
@@ -676,26 +677,27 @@ def _idempotency_replay_response(
 
 
 async def _product_payload(session: AsyncSession, product: Product) -> dict[str, Any]:
-    row = serialize_record(product)
-    _hide_placeholder_product_images(row)
-    if product.image_url and not row.get("images"):
-        row["images"] = [product.image_url]
-    _normalize_public_product_images(row)
+    category = None
+    brand = None
     if product.category_id:
         category = await session.get(Category, product.category_id)
-        if category:
-            row["category"] = serialize_record(category)
-            row["category_name"] = category.name
-            row["category_slug"] = category.slug
     if product.brand_id:
         brand = await session.get(Brand, product.brand_id)
-        if brand:
-            row["brand"] = serialize_record(brand)
-            row["brand_name"] = brand.name
+    row = public_product_response(product, category=category, brand=brand)
+    if category:
+        row["category_name"] = category.name
+        row["category_slug"] = category.slug
+    if brand:
+        row["brand_name"] = brand.name
     return row
 
 
-async def _product_payloads(session: AsyncSession, products: list[Product]) -> list[dict[str, Any]]:
+async def _product_payloads(
+    session: AsyncSession,
+    products: list[Product],
+    *,
+    public: bool = True,
+) -> list[dict[str, Any]]:
     if not products:
         return []
     product_ids = [product.id for product in products]
@@ -703,7 +705,7 @@ async def _product_payloads(session: AsyncSession, products: list[Product]) -> l
     brand_ids = {product.brand_id for product in products if product.brand_id}
     categories_by_id: dict[uuid.UUID, Category] = {}
     brands_by_id: dict[uuid.UUID, Brand] = {}
-    variants_by_product_id: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    variants_by_product_id: dict[uuid.UUID, list[ProductVariant]] = {}
     review_stats_by_product_id: dict[uuid.UUID, tuple[float, int]] = {}
     if category_ids:
         result = await session.execute(select(Category).where(Category.id.in_(category_ids)))
@@ -722,7 +724,7 @@ async def _product_payloads(session: AsyncSession, products: list[Product]) -> l
             .order_by(ProductVariant.sort_order)
         )
         for variant in result.scalars():
-            variants_by_product_id.setdefault(variant.product_id, []).append(serialize_record(variant))
+            variants_by_product_id.setdefault(variant.product_id, []).append(variant)
     review_model = MODEL_BY_TABLE.get("product_reviews")
     if review_model is not None and "rating" in review_model.__table__.c:
         review_columns = review_model.__table__.c
@@ -751,21 +753,37 @@ async def _product_payloads(session: AsyncSession, products: list[Product]) -> l
 
     rows: list[dict[str, Any]] = []
     for product in products:
-        row = serialize_record(product)
-        _hide_placeholder_product_images(row)
-        if product.image_url and not row.get("images"):
-            row["images"] = [product.image_url]
-        _normalize_public_product_images(row)
         category = categories_by_id.get(product.category_id)
-        if category:
-            row["category"] = serialize_record(category)
-            row["category_name"] = category.name
-            row["category_slug"] = category.slug
         brand = brands_by_id.get(product.brand_id)
-        if brand:
-            row["brand"] = serialize_record(brand)
-            row["brand_name"] = brand.name
-        row["variants"] = variants_by_product_id.get(product.id, [])
+        if public:
+            row = public_product_response(
+                product,
+                category=category,
+                brand=brand,
+                variants=variants_by_product_id.get(product.id),
+            )
+            if category:
+                row["category_name"] = category.name
+                row["category_slug"] = category.slug
+            if brand:
+                row["brand_name"] = brand.name
+        else:
+            row = serialize_record(product)
+            _hide_placeholder_product_images(row)
+            if product.image_url and not row.get("images"):
+                row["images"] = [product.image_url]
+            _normalize_public_product_images(row)
+            if category:
+                row["category"] = serialize_record(category)
+                row["category_name"] = category.name
+                row["category_slug"] = category.slug
+            if brand:
+                row["brand"] = serialize_record(brand)
+                row["brand_name"] = brand.name
+            row["variants"] = [
+                serialize_record(variant)
+                for variant in variants_by_product_id.get(product.id, [])
+            ]
         rating_average, rating_count = review_stats_by_product_id.get(product.id, (0.0, 0))
         row["rating_average"] = rating_average
         row["rating_count"] = rating_count
@@ -1482,7 +1500,12 @@ async def catalog_image_proxy(image_path: str):
     relative = str(image_path or "").replace("\\", "/").lstrip("/")
     if not relative or ".." in Path(relative).parts:
         raise HTTPException(status_code=404, detail="image_not_found")
-    source = f"https://images.luxuryshoppings.com/{relative}"
+    # Legacy banner records may point at the public site's hashed /assets
+    # files, while older catalog records point at the historical image CDN.
+    # Keep both upstreams explicit; this remains an allow-listed image proxy,
+    # never a general URL fetcher.
+    upstream_host = "luxuryshoppings.com" if relative.lower().startswith("assets/") else "images.luxuryshoppings.com"
+    source = f"https://{upstream_host}/{relative}"
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(15.0, connect=5.0),
@@ -2629,6 +2652,62 @@ async def change_order_status(
     return serialize_record(order)
 
 
+@router.post("/api/admin/orders/{order_id}/status/rollback")
+async def rollback_order_status(
+    order_id: uuid.UUID,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    """Revert only the latest status event through an audited admin action."""
+    if not roles.intersection({"admin", "manager"}):
+        raise HTTPException(status_code=403, detail="admin_rollback_required")
+    order = (
+        await session.execute(select(Order).where(Order.id == order_id).with_for_update())
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    history_model = MODEL_BY_TABLE["order_status_history"]
+    latest = (
+        await session.execute(
+            select(history_model)
+            .where(history_model.order_id == order.id)
+            .order_by(history_model.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    current_status = normalize_status(order.status or "pending")
+    latest_extra = dict(getattr(latest, "extra_data", None) or {}) if latest is not None else {}
+    if latest is None or normalize_status(getattr(latest, "status", "")) != current_status:
+        raise HTTPException(status_code=409, detail="no_rollback_available")
+    if latest_extra.get("actor") == "admin_rollback":
+        raise HTTPException(status_code=409, detail="no_rollback_available")
+    previous_status = normalize_status(latest_extra.get("previous_status"))
+    if not previous_status or previous_status == current_status:
+        raise HTTPException(status_code=409, detail="no_rollback_available")
+    order.status = previous_status
+    session.add(history_model(
+        order_id=order.id,
+        status=previous_status,
+        notes="Admin rollback of the latest order status",
+        extra_data={
+            "previous_status": current_status,
+            "new_status": previous_status,
+            "actor": "admin_rollback",
+            "rollback_of": str(latest.id),
+        },
+    ))
+    audit_model = MODEL_BY_TABLE["audit_logs"]
+    session.add(audit_model(
+        user_id=user.id,
+        type="order_status_rolled_back",
+        description=f"Rolled back order {order.order_number} status from {current_status} to {previous_status}",
+        extra_data={"order_id": str(order.id), "previous_status": current_status, "new_status": previous_status},
+    ))
+    await session.commit()
+    return serialize_record(order)
+
+
 @router.post("/orders/{order_id}/cancel")
 @router.post("/api/orders/{order_id}/cancel")
 async def cancel_customer_order(
@@ -2851,7 +2930,7 @@ async def catalog_admin_products(
     result = await session.execute(
         select(Product).where(Product.deleted_at.is_(None)).order_by(Product.updated_at.desc()).limit(limit)
     )
-    rows = await _product_payloads(session, list(result.scalars()))
+    rows = await _product_payloads(session, list(result.scalars()), public=False)
     return {"data": rows}
 
 

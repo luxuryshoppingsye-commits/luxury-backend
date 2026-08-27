@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import cached_property, lru_cache
+import os
 from pathlib import Path
 import tempfile
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -49,7 +50,10 @@ class Settings(BaseSettings):
     upload_dir: Path = Field(Path("backend/data/uploads"), alias="UPLOAD_DIR")
     upload_fallback_dir: Path | None = Field(None, alias="UPLOAD_FALLBACK_DIR")
     storage_provider: str = Field("local", alias="STORAGE_PROVIDER")
-    render_public_url: str = Field(OFFICIAL_RENDER_API_ORIGIN, alias="RENDER_PUBLIC_URL")
+    render_public_url: str = Field(
+        default_factory=lambda: os.getenv("RENDER_EXTERNAL_URL") or OFFICIAL_RENDER_API_ORIGIN,
+        alias="RENDER_PUBLIC_URL",
+    )
     r2_endpoint_url: str = Field("", alias="R2_ENDPOINT_URL")
     r2_bucket: str = Field("", alias="R2_BUCKET")
     r2_access_key_id: str = Field("", alias="R2_ACCESS_KEY_ID")

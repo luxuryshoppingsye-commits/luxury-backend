@@ -164,6 +164,10 @@ def serialize_record(record: Any) -> dict[str, Any]:
     for alias, column_name in COMPATIBLE_RESPONSE_ALIASES.get(table_name, {}).items():
         if column_name in result:
             result.setdefault(alias, result[column_name])
+    if table_name == "couriers" and result.get("name"):
+        # Admin clients use full_name as the display contract while the
+        # compatibility schema stores the canonical value in couriers.name.
+        result.setdefault("full_name", result["name"])
     if table_name == "blog_articles" and "created_at" in result:
         result.setdefault("published_at", result["created_at"])
     return result

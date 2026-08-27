@@ -37,7 +37,7 @@ Background Worker باسم `luxury-shopping-message-worker` بنفس كود ال
 | `DATABASE_URL` | رابط Neon PostgreSQL التشغيلي |
 | `DATABASE_MIGRATION_URL` | رابط قاعدة البيانات نفسه إذا كان مطلوبًا في إعدادك |
 | `JWT_SECRET` | نفس قيمة الخدمة القديمة إذا أردت إبقاء الجلسات الحالية، أو قيمة عشوائية قوية جديدة |
-| `RENDER_PUBLIC_URL` | `https://luxury-backend-xy9d.onrender.com` |
+| `RENDER_PUBLIC_URL` | يربطه `render.yaml` تلقائيًا بقيمة Render `RENDER_EXTERNAL_URL` للخدمة الحالية |
 | `API_BASE_URL` | `https://api.luxuryshoppings.com` |
 | `APP_PUBLIC_URL` | `https://api.luxuryshoppings.com` |
 | `WS_BASE_URL` | `wss://api.luxuryshoppings.com` |

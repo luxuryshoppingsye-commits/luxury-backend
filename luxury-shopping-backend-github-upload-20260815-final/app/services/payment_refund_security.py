@@ -356,8 +356,6 @@ async def review_payment_receipt(
     if next_status not in RECEIPT_REVIEW_STATUSES:
         raise HTTPException(status_code=422, detail="invalid_payment_receipt_status")
     reason = _safe_text(body.get("reason") or body.get("rejection_reason"), max_len=500)
-    if next_status == "rejected" and not reason:
-        raise HTTPException(status_code=422, detail="payment_rejection_reason_required")
 
     model = MODEL_BY_TABLE["payment_receipts"]
     row = (
@@ -373,6 +371,12 @@ async def review_payment_receipt(
             payload["idempotency_replayed"] = True
             return payload
         raise HTTPException(status_code=409, detail="payment_receipt_already_reviewed")
+
+    # Resolve the current state before validating decision-specific fields.
+    # A repeated decision must remain an idempotent replay/conflict even when
+    # the repeated request omits fields that only apply to a new decision.
+    if next_status == "rejected" and not reason:
+        raise HTTPException(status_code=422, detail="payment_rejection_reason_required")
 
     row.status = next_status
     row.reviewed_by = staff.id
@@ -423,7 +427,7 @@ async def review_payment_receipt(
     _add_audit_log(
         session,
         user_id=staff.id,
-        action="payment_receipt.reviewed",
+        action="payment_receipt_reviewed",
         description=f"Reviewed payment receipt {payment_id}",
         extra_data={"payment_receipt_id": payment_id, "status": next_status, "reason": reason},
     )

@@ -319,6 +319,22 @@ async def _secure_upload_from_request(
     if upload_content_type.startswith("image/") or Path(upload_filename).suffix.lower() in {
         ".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"
     }:
+        # Scan the original bytes before the image pipeline normalizes them.
+        # Re-encoding can remove an appended active-content signature and
+        # would otherwise let a malicious upload reach the storage scanner as
+        # a clean transformed image.
+        if policy.requires_scan:
+            raw_scan = storage.scanner.scan(data, upload_content_type)
+            if raw_scan.status != "clean":
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "malware_or_active_content_detected",
+                        "scan_status": raw_scan.status,
+                        "scan_provider": raw_scan.provider,
+                        "signature": raw_scan.signature,
+                    },
+                )
         try:
             prepared = await prepare_image_upload(
                 data,
@@ -363,14 +379,16 @@ def _uuid(value: Any, field: str = "id") -> uuid.UUID:
         raise HTTPException(status_code=400, detail=f"invalid_uuid:{field}")
 
 
-async def _rows(session: AsyncSession, table: str, *, clauses=(), limit=500, order_desc=True):
+async def _rows(session: AsyncSession, table: str, *, clauses=(), limit=500, order_desc=True, order_by=()):
     model = MODEL_BY_TABLE[table]
     statement = select(model)
     if "deleted_at" in model.__table__.c:
         statement = statement.where(model.__table__.c.deleted_at.is_(None))
     if clauses:
         statement = statement.where(*clauses)
-    if "created_at" in model.__table__.c:
+    if order_by:
+        statement = statement.order_by(*order_by)
+    elif "created_at" in model.__table__.c:
         statement = statement.order_by(model.__table__.c.created_at.desc() if order_desc else model.__table__.c.created_at.asc())
     result = await session.execute(statement.limit(limit))
     return list(result.scalars())
@@ -1437,7 +1455,8 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
         if rejected_user is not None:
             account_state = await account_security_for(session, rejected_user.id, for_update=True)
             current_roles = set(await roles_for(session, rejected_user.id))
-            if not current_roles or current_roles.issubset({"partner"}):
+            protected_roles = {"admin", "manager", "finance", "logistics", "staff", "employee", "courier", "delivery"}
+            if not current_roles.intersection(protected_roles):
                 rejected_user.is_active = False
                 account_state.account_status = "merchant_rejected"
                 account_state.disabled_at = application.reviewed_at
@@ -2267,7 +2286,7 @@ async def api_dashboard_financial_reconciliation(staff: User = Depends(require_s
 
 @router.get("/api/dashboard/inventory-alerts")
 async def api_dashboard_inventory_alerts(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": {"inventory": [serialize_record(row) for row in await _rows(session, "inventory", limit=200)], "movements": [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=200)]}}
+    return {"data": {"inventory": await _canonical_inventory_payloads(session), "movements": [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=200)]}}
 
 
 @router.get("/api/dashboard/customer-insights")
@@ -2951,6 +2970,55 @@ async def _inventory_reference_maps(session: AsyncSession) -> tuple[dict[str, di
     return products, warehouses
 
 
+async def _canonical_inventory_payloads(
+    session: AsyncSession,
+    warehouse_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build one inventory row per catalog product from the same stock source."""
+    product_rows = await _rows(session, "products", limit=5000)
+    products, warehouses = await _inventory_reference_maps(session)
+    location_payloads = [serialize_record(row) for row in await _rows(session, "inventory_locations", limit=5000)]
+    if not location_payloads:
+        location_payloads = [serialize_record(row) for row in await _rows(session, "inventory", limit=5000)]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for payload in location_payloads:
+        product_id = _inventory_reference_id(payload, "product_id", "productId")
+        if not product_id:
+            continue
+        row_warehouse_id = _inventory_reference_id(payload, "warehouse_id", "warehouseId")
+        if warehouse_id and row_warehouse_id != warehouse_id:
+            continue
+        grouped.setdefault(product_id, []).append(payload)
+
+    result: list[dict[str, Any]] = []
+    for product_row in product_rows:
+        product_id = str(product_row.id)
+        product = products.get(product_id)
+        if product is None:
+            continue
+        rows = grouped.get(product_id, [])
+        if rows:
+            quantity = sum(_inventory_quantity(row.get("quantity")) for row in rows)
+            source = rows[0]
+            source_warehouse_id = warehouse_id or _inventory_reference_id(source, "warehouse_id", "warehouseId")
+        else:
+            quantity = 0 if warehouse_id else _inventory_quantity(product.get("stock_quantity"))
+            source = {}
+            source_warehouse_id = warehouse_id
+        payload = {
+            "id": source.get("id") or f"product:{product_id}",
+            "product_id": product_id,
+            "warehouse_id": source_warehouse_id,
+            "quantity": quantity,
+            "min_quantity": product.get("min_stock_quantity") or 5,
+            "product": product,
+        }
+        if source_warehouse_id and source_warehouse_id in warehouses:
+            payload["warehouse"] = warehouses[source_warehouse_id]
+        result.append(_enrich_inventory_payload(payload, products, warehouses))
+    return result
+
+
 @router.get("/api/admin/inventory/warehouses")
 async def api_inventory_warehouses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return {"data": [serialize_record(row) for row in await _rows(session, "warehouses", limit=500)]}
@@ -2967,22 +3035,7 @@ async def api_inventory_locations(
     staff: User = Depends(require_staff),
     session: AsyncSession = Depends(get_session),
 ):
-    location_payloads = [serialize_record(row) for row in await _rows(session, "inventory_locations", limit=500)]
-    if warehouse_id:
-        location_payloads = [
-            payload
-            for payload in location_payloads
-            if _inventory_reference_id(payload, "warehouse_id", "warehouseId") == warehouse_id
-        ]
-    if not location_payloads and not warehouse_id:
-        location_payloads = [serialize_record(row) for row in await _rows(session, "inventory", limit=500)]
-    products, warehouses = await _inventory_reference_maps(session)
-    return {
-        "data": [
-            _enrich_inventory_payload(payload, products, warehouses)
-            for payload in location_payloads
-        ]
-    }
+    return {"data": await _canonical_inventory_payloads(session, warehouse_id)}
 
 
 @router.get("/api/admin/inventory/movements")
@@ -3011,9 +3064,24 @@ async def api_inventory_movements(
 async def api_create_inventory_movement(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
     warehouse_id = str(body.get("warehouse_id") or body.get("warehouseId") or "")
-    product_id = uuid.UUID(str(body.get("product_id") or body.get("productId")))
-    quantity = int(body.get("quantity") or 0)
-    movement_type = str(body.get("movement_type") or body.get("type") or "in")
+    if not warehouse_id:
+        raise HTTPException(status_code=422, detail="warehouse_required")
+    try:
+        product_id = uuid.UUID(str(body.get("product_id") or body.get("productId")))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="product_required") from exc
+    try:
+        quantity = int(body.get("quantity") or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="quantity_invalid") from exc
+    if quantity <= 0:
+        raise HTTPException(status_code=422, detail="quantity_must_be_positive")
+    movement_type = str(body.get("movement_type") or body.get("type") or "in").strip().lower()
+    if movement_type not in {"in", "out", "remove", "decrease", "adjustment"}:
+        raise HTTPException(status_code=422, detail="movement_type_invalid")
+    product = await session.get(Product, product_id, with_for_update=True)
+    if product is None or product.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="product_not_found")
     loc_model = MODEL_BY_TABLE["inventory_locations"]
     clauses = (loc_model.extra_data["warehouse_id"].astext == warehouse_id, loc_model.extra_data["product_id"].astext == str(product_id))
     locations = await _rows(session, "inventory_locations", clauses=clauses, limit=1)
@@ -3028,6 +3096,13 @@ async def api_create_inventory_movement(request: Request, staff: User = Depends(
         raise HTTPException(status_code=409, detail="insufficient_inventory")
     extra["quantity"] = current + delta
     location.extra_data = extra
+    all_locations = await _rows(
+        session,
+        "inventory_locations",
+        clauses=(loc_model.extra_data["product_id"].astext == str(product_id),),
+        limit=5000,
+    )
+    product.stock_quantity = sum(_inventory_quantity(dict(row.extra_data or {}).get("quantity")) for row in all_locations)
     row = await _api_create(session, "inventory_movements", {
         "product_id": product_id,
         "quantity": quantity,
@@ -5259,6 +5334,7 @@ async def api_unlink_local_international_order(order_id: uuid.UUID, staff: User 
         raise HTTPException(status_code=404, detail="order_not_found")
     extra = dict(row.extra_data or {})
     extra.pop("linked_international_order_id", None)
+    extra.pop("linkedInternationalOrderId", None)
     row.extra_data = extra
     await session.commit()
     return {"data": serialize_record(row)}
@@ -6308,6 +6384,21 @@ async def api_update_admin_courier(record_id: uuid.UUID, request: Request, staff
     return await _create_update_delete_resource("couriers", request, session, staff, record_id, "update")
 
 
+@router.delete("/api/admin/couriers/{record_id}")
+async def api_delete_admin_courier(record_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    assignment_model = MODEL_BY_TABLE["courier_assignments"]
+    active_assignment = await session.execute(
+        select(assignment_model.id).where(
+            or_(assignment_model.courier_id == record_id, assignment_model.user_id == record_id),
+            assignment_model.deleted_at.is_(None),
+            assignment_model.status.in_(("active", "assigned", "accepted", "picked_up", "out_for_delivery")),
+        ).limit(1)
+    )
+    if active_assignment.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=409, detail="courier_has_active_assignments")
+    return await _create_update_delete_resource("couriers", request, session, staff, record_id, "delete")
+
+
 @router.post("/api/suppliers", status_code=201)
 async def api_create_supplier(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return await _create_update_delete_resource("suppliers", request, session, staff)
@@ -7143,6 +7234,46 @@ async def api_delete_contact_message(record_id: uuid.UUID, staff: User = Depends
     await _api_delete(session, "contact_messages", record_id)
     await session.commit()
     return {"ok": True}
+
+
+@router.post("/api/admin/contact-messages/{record_id}/reply", status_code=202)
+async def api_reply_contact_message(
+    record_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Queue an admin reply through the durable email outbox."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="reply_payload_required")
+    message_model = MODEL_BY_TABLE["contact_messages"]
+    contact = await session.get(message_model, record_id)
+    if contact is None:
+        raise HTTPException(status_code=404, detail="message_not_found")
+    subject = str(body.get("subject") or "").strip()
+    message = str(body.get("message") or "").strip()
+    recipient = str(getattr(contact, "email", None) or "").strip()
+    if not subject or len(subject) > 300 or "\r" in subject or "\n" in subject:
+        raise HTTPException(status_code=422, detail="reply_subject_invalid")
+    if not message or len(message) > 20000:
+        raise HTTPException(status_code=422, detail="reply_message_invalid")
+    if not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", recipient):
+        raise HTTPException(status_code=422, detail="contact_email_invalid")
+    outbox = await _api_create(session, "email_outbox", {
+        "user_id": staff.id,
+        "title": subject,
+        "status": "queued",
+        "email": recipient,
+        "message": message,
+        "category": "support",
+        "consent_required": False,
+        "contact_message_id": str(record_id),
+        "reply_to": recipient,
+    }, staff)
+    contact.status = "replied"
+    await session.commit()
+    return {"queued": True, "data": outbox}
 
 
 @router.get("/api/support/tickets")
@@ -8479,6 +8610,7 @@ async def theme_settings(session: AsyncSession = Depends(get_session)):
             ~model.name.like("history:%"),
             ~model.name.like("preview:%"),
         ),
+        order_by=(model.updated_at.desc(), model.created_at.desc()),
         limit=1,
     )
     return serialize_record(rows[0]) if rows else {}
