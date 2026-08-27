@@ -49,6 +49,14 @@ services:
         value: https://images.luxuryshoppings.com
       - key: MAX_UPLOAD_BYTES
         value: "10485760"
+      - key: BACKUP_ENCRYPTION_KEY
+        generateValue: true
+      # The backup service maps these encrypted objects to the already
+      # configured R2 credentials when BACKUP_OFFSITE_PROVIDER is omitted.
+      - key: BACKUP_OFFSITE_PROVIDER
+        value: filesystem
+      - key: BACKUP_S3_PREFIX
+        value: luxury-secure-backups
       - key: CORS_ORIGINS
         value: https://luxuryshoppings.com,https://www.luxuryshoppings.com
       - key: REALTIME_ALLOWED_ORIGINS

@@ -299,9 +299,35 @@ async def test_full_role_flow_writes_api_results_to_postgres() -> None:
         )
         assert address.status_code == 201, address.text
         address_id = address.json()["data"]["id"]
+        alternate_address = await client.post(
+            "/api/profile/addresses",
+            headers=customer_headers,
+            json={
+                "label": "E2E Work",
+                "full_name": "E2E Customer",
+                "phone": "+967711000222",
+                "governorate": "Amanat Al Asimah",
+                "city": "Sanaa",
+                "district": "Al Wahdah",
+                "address": "Office Street",
+                "is_default": "false",
+            },
+        )
+        assert alternate_address.status_code == 201, alternate_address.text
+        assert alternate_address.json()["data"]["is_default"] is False
+        assert alternate_address.json()["data"]["recipient_name"] == "E2E Customer"
+        assert alternate_address.json()["data"]["district"] == "Al Wahdah"
+        alternate_address_id = alternate_address.json()["data"]["id"]
         listed_addresses = await client.get("/api/profile/addresses", headers=customer_headers)
         assert listed_addresses.status_code == 200
         assert any(item["id"] == address_id for item in listed_addresses.json()["data"])
+        promote_alternate = await client.patch(
+            f"/api/profile/addresses/{alternate_address_id}",
+            headers=customer_headers,
+            json={"isDefault": "true"},
+        )
+        assert promote_alternate.status_code == 200, promote_alternate.text
+        assert promote_alternate.json()["data"]["is_default"] is True
         updated_address = await client.patch(
             f"/api/profile/addresses/{address_id}",
             headers=customer_headers,
@@ -480,6 +506,11 @@ async def test_full_role_flow_writes_api_results_to_postgres() -> None:
 
         deleted_address = await client.delete(f"/api/profile/addresses/{address_id}", headers=customer_headers)
         assert deleted_address.status_code == 200
+        deleted_alternate_address = await client.delete(
+            f"/api/profile/addresses/{alternate_address_id}",
+            headers=customer_headers,
+        )
+        assert deleted_alternate_address.status_code == 200
 
         ticket = await client.post(
             "/support/tickets",
@@ -618,6 +649,8 @@ async def test_full_role_flow_writes_api_results_to_postgres() -> None:
         address_model = MODEL_BY_TABLE["customer_addresses"]
         db_address = await session.get(address_model, uuid.UUID(address_id))
         assert db_address is not None and db_address.deleted_at is not None
+        db_alternate_address = await session.get(address_model, uuid.UUID(alternate_address_id))
+        assert db_alternate_address is not None and db_alternate_address.deleted_at is not None
         assert await session.get(ticket_model, uuid.UUID(ticket_id)) is not None
         assert int((await session.execute(select(func.count()).select_from(ticket_message_model).where(ticket_message_model.ticket_id == uuid.UUID(ticket_id)))).scalar_one()) >= 2
         assert int((await session.execute(select(func.count()).select_from(storefront_model).where(storefront_model.email == f"e2e-merchant-{suffix}@example.com"))).scalar_one()) == 1

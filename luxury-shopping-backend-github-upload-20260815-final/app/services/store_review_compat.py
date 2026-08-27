@@ -14,7 +14,11 @@ SELECT sr.id, sr.user_id, sr.rating, sr.comment, sr.customer_name,
        p.full_name AS profile_full_name
 FROM public.store_reviews sr
 LEFT JOIN public.profiles p ON p.user_id = sr.user_id
-WHERE sr.is_approved IS TRUE
+WHERE (
+    sr.is_approved IS TRUE
+    OR LOWER(COALESCE(sr.status, '')) IN ('approved', 'active', 'published', 'visible', 'live', 'accepted', 'approve', 'accept')
+)
+AND sr.is_rejected IS NOT TRUE
 ORDER BY sr.created_at DESC
 LIMIT :limit
 """
@@ -31,27 +35,45 @@ LIMIT 1
 """
 
 _GENERIC_PUBLIC_SQL = """
-SELECT sr.id, sr.user_id, sr.rating,
-       COALESCE(sr.comment, sr.body, sr.title) AS comment,
-       COALESCE(NULLIF(TRIM(sr.customer_name), ''), NULLIF(TRIM(sr.title), '')) AS customer_name,
-       (LOWER(COALESCE(sr.status, '')) = 'approved') AS is_approved,
-       (LOWER(COALESCE(sr.status, '')) = 'rejected') AS is_rejected,
-       sr.admin_notes, sr.created_at, sr.updated_at, sr.status,
+SELECT sr.id, sr.user_id,
+       COALESCE(NULLIF(sr.extra_data ->> 'rating', ''), '0') AS rating,
+       COALESCE(NULLIF(sr.extra_data ->> 'comment', ''), NULLIF(sr.extra_data ->> 'body', ''), NULLIF(sr.body, ''), NULLIF(sr.title, '')) AS comment,
+       COALESCE(NULLIF(TRIM(sr.extra_data ->> 'customer_name'), ''), NULLIF(TRIM(sr.extra_data ->> 'customerName'), ''), NULLIF(TRIM(sr.title), '')) AS customer_name,
+       (
+           LOWER(COALESCE(sr.status, '')) IN ('approved', 'active', 'published', 'visible', 'live', 'accepted', 'approve', 'accept')
+           OR LOWER(COALESCE(sr.extra_data ->> 'is_approved', '')) IN ('true', '1', 'yes')
+       ) AS is_approved,
+       (
+           LOWER(COALESCE(sr.status, '')) IN ('rejected', 'declined', 'denied', 'hidden', 'blocked', 'inactive', 'disabled')
+           OR LOWER(COALESCE(sr.extra_data ->> 'is_rejected', '')) IN ('true', '1', 'yes')
+       ) AS is_rejected,
+       sr.extra_data ->> 'admin_notes' AS admin_notes, sr.created_at, sr.updated_at, sr.status,
        p.full_name AS profile_full_name
 FROM public.store_reviews sr
 LEFT JOIN public.profiles p ON p.user_id = sr.user_id
-WHERE LOWER(COALESCE(sr.status, '')) = 'approved'
+WHERE (
+    LOWER(COALESCE(sr.status, '')) IN ('approved', 'active', 'published', 'visible', 'live', 'accepted', 'approve', 'accept')
+    OR LOWER(COALESCE(sr.extra_data ->> 'is_approved', '')) IN ('true', '1', 'yes')
+)
+AND LOWER(COALESCE(sr.extra_data ->> 'is_rejected', '')) NOT IN ('true', '1', 'yes')
 ORDER BY sr.created_at DESC
 LIMIT :limit
 """
 
 _GENERIC_MINE_SQL = """
-SELECT sr.id, sr.user_id, sr.rating,
-       COALESCE(sr.comment, sr.body, sr.title) AS comment,
-       COALESCE(NULLIF(TRIM(sr.customer_name), ''), NULLIF(TRIM(sr.title), '')) AS customer_name,
-       (LOWER(COALESCE(sr.status, '')) = 'approved') AS is_approved,
-       (LOWER(COALESCE(sr.status, '')) = 'rejected') AS is_rejected,
-       sr.admin_notes, sr.created_at, sr.updated_at, sr.status,
+SELECT sr.id, sr.user_id,
+       COALESCE(NULLIF(sr.extra_data ->> 'rating', ''), '0') AS rating,
+       COALESCE(NULLIF(sr.extra_data ->> 'comment', ''), NULLIF(sr.extra_data ->> 'body', ''), NULLIF(sr.body, ''), NULLIF(sr.title, '')) AS comment,
+       COALESCE(NULLIF(TRIM(sr.extra_data ->> 'customer_name'), ''), NULLIF(TRIM(sr.extra_data ->> 'customerName'), ''), NULLIF(TRIM(sr.title), '')) AS customer_name,
+       (
+           LOWER(COALESCE(sr.status, '')) IN ('approved', 'active', 'published', 'visible', 'live', 'accepted', 'approve', 'accept')
+           OR LOWER(COALESCE(sr.extra_data ->> 'is_approved', '')) IN ('true', '1', 'yes')
+       ) AS is_approved,
+       (
+           LOWER(COALESCE(sr.status, '')) IN ('rejected', 'declined', 'denied', 'hidden', 'blocked', 'inactive', 'disabled')
+           OR LOWER(COALESCE(sr.extra_data ->> 'is_rejected', '')) IN ('true', '1', 'yes')
+       ) AS is_rejected,
+       sr.extra_data ->> 'admin_notes' AS admin_notes, sr.created_at, sr.updated_at, sr.status,
        p.full_name AS profile_full_name
 FROM public.store_reviews sr
 LEFT JOIN public.profiles p ON p.user_id = sr.user_id
@@ -70,6 +92,8 @@ def _json_value(value: Any) -> Any:
 
 
 _STORE_LABEL_NAMES = frozenset({"المتجر الرئيسي", "Main Store", "المتجر", "Store"})
+_APPROVED_STATUS_NAMES = frozenset({"approved", "active", "published", "visible", "live", "accepted", "approve", "accept"})
+_REJECTED_STATUS_NAMES = frozenset({"rejected", "declined", "denied", "hidden", "blocked", "inactive", "disabled"})
 
 
 def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -80,12 +104,13 @@ def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
     comment = row.get("comment")
     if comment is None:
         comment = row.get("body") or row.get("title")
+    status = str(row.get("status") or "").strip().lower()
     is_approved = row.get("is_approved")
     if is_approved is None:
-        is_approved = str(row.get("status") or "").lower() == "approved"
+        is_approved = status in _APPROVED_STATUS_NAMES
     is_rejected = row.get("is_rejected")
     if is_rejected is None:
-        is_rejected = str(row.get("status") or "").lower() == "rejected"
+        is_rejected = status in _REJECTED_STATUS_NAMES
     rating_raw = row.get("rating")
     try:
         rating = int(rating_raw or 0)

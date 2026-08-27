@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     backup_s3_access_key_id: str = Field("", alias="BACKUP_S3_ACCESS_KEY_ID")
     backup_s3_secret_access_key: str = Field("", alias="BACKUP_S3_SECRET_ACCESS_KEY")
     backup_s3_session_token: str = Field("", alias="BACKUP_S3_SESSION_TOKEN")
+    backup_encryption_key: str = Field("", alias="BACKUP_ENCRYPTION_KEY")
     backup_encryption_key_file: Path | None = Field(None, alias="BACKUP_ENCRYPTION_KEY_FILE")
     backup_pg_bin_dir: Path | None = Field(None, alias="BACKUP_PG_BIN_DIR")
     backup_retention_days: int = Field(14, alias="BACKUP_RETENTION_DAYS", ge=1, le=3650)
@@ -360,7 +361,26 @@ class Settings(BaseSettings):
             if any(marker in database_name for marker in forbidden):
                 raise ValueError(f"APP_ENV={self.app_env} cannot use non-operational database {self.database_name}")
         if self.app_env in {"staging", "production"} and self.backup_offsite_provider == "filesystem":
-            self.backup_offsite_provider = "disabled"
+            # Render's local disk is ephemeral.  The project already has a
+            # configured Cloudflare R2 bucket for assets, so use that bucket
+            # for encrypted backup objects when dedicated BACKUP_S3_* values
+            # were not supplied.  The backup prefix keeps these objects
+            # separate from public assets.
+            r2_backup_values = {
+                "endpoint": self.r2_endpoint_url,
+                "bucket": self.r2_bucket,
+                "access_key": self.r2_access_key_id,
+                "secret_key": self.r2_secret_access_key,
+            }
+            if all(str(value).strip() for value in r2_backup_values.values()):
+                self.backup_offsite_provider = "s3"
+                self.backup_s3_endpoint_url = self.backup_s3_endpoint_url or self.r2_endpoint_url
+                self.backup_s3_bucket = self.backup_s3_bucket or self.r2_bucket
+                self.backup_s3_region = self.backup_s3_region or self.r2_region
+                self.backup_s3_access_key_id = self.backup_s3_access_key_id or self.r2_access_key_id
+                self.backup_s3_secret_access_key = self.backup_s3_secret_access_key or self.r2_secret_access_key
+            else:
+                self.backup_offsite_provider = "disabled"
         if self.backup_offsite_provider == "s3" and not self.backup_s3_bucket:
             raise ValueError("BACKUP_S3_BUCKET is required when BACKUP_OFFSITE_PROVIDER=s3")
         if self.app_env == "production":

@@ -286,13 +286,39 @@ def public_variant_response(variant: ProductVariant) -> dict[str, Any]:
     }
 
 
-def public_storefront_response(row: Any, *, products_count: int | None = None) -> dict[str, Any]:
-    name = getattr(row, "name", None) or getattr(row, "business_name", None) or "Merchant store"
+def _storefront_value(row: Any, key: str, default: Any = None) -> Any:
+    """Read storefront fields from columns and the extensible metadata payload."""
+    if isinstance(row, dict):
+        value = row.get(key)
+        extra_data = row.get("extra_data")
+    else:
+        value = getattr(row, key, None)
+        extra_data = getattr(row, "extra_data", None)
+    if value is not None and (not isinstance(value, str) or value.strip()):
+        return value
+    if isinstance(extra_data, dict):
+        extra_value = extra_data.get(key)
+        if extra_value is not None and (not isinstance(extra_value, str) or extra_value.strip()):
+            return extra_value
+    return default
+
+
+def public_storefront_response(
+    row: Any,
+    *,
+    products_count: int | None = None,
+    public_id: Any | None = None,
+    store_type: str | None = None,
+) -> dict[str, Any]:
+    name = _storefront_value(row, "name") or _storefront_value(row, "business_name") or "Merchant store"
+    resolved_id = public_id or _storefront_value(row, "partner_id") or _storefront_value(row, "user_id") or _storefront_value(row, "id") or ""
+    resolved_store_type = store_type or "partner"
+    resolved_partner_id = _storefront_value(row, "partner_id") or _storefront_value(row, "user_id")
     logo_value = (
-        getattr(row, "logo_url", None)
-        or getattr(row, "store_logo_url", None)
-        or getattr(row, "image_url", None)
-        or getattr(row, "avatar_url", None)
+        _storefront_value(row, "logo_url")
+        or _storefront_value(row, "store_logo_url")
+        or _storefront_value(row, "image_url")
+        or _storefront_value(row, "avatar_url")
     )
     # Store images may be saved as a relative upload path or as the public CDN
     # URL returned by the upload endpoint. Normalize upload paths for clients,
@@ -303,31 +329,36 @@ def public_storefront_response(row: Any, *, products_count: int | None = None) -
         else None
     )
     return {
-        "id": str(getattr(row, "partner_id", None) or getattr(row, "user_id", None) or getattr(row, "id")),
+        "id": str(resolved_id),
+        "store_type": resolved_store_type,
+        "partner_id": str(resolved_partner_id) if resolved_store_type == "partner" and resolved_partner_id else None,
+        "supplier_id": str(resolved_id) if resolved_store_type == "local" and resolved_id else None,
         "display_name": name,
         "name": name,
-        "name_en": getattr(row, "name_en", None),
-        "slug": getattr(row, "slug", None),
+        "name_en": _storefront_value(row, "name_en"),
+        "slug": _storefront_value(row, "slug"),
         "logo_url": logo_url,
         "store_logo_url": logo_url,
-        "cover_url": getattr(row, "cover_url", None),
-        "public_description": getattr(row, "description", None),
-        "description": getattr(row, "description", None),
-        "public_city": getattr(row, "city", None),
-        "city": getattr(row, "city", None),
-        "category": getattr(row, "category", None),
-        "rating": _json_value(getattr(row, "rating", None) or 0),
-        "reviews_count": int(getattr(row, "reviews_count", None) or 0),
-        "products_count": int(products_count or getattr(row, "product_count", None) or 0),
-        "product_count": int(products_count or getattr(row, "product_count", None) or 0),
-        "joined_at": _json_value(getattr(row, "created_at", None)),
+        "cover_url": _storefront_value(row, "cover_url"),
+        "public_description": _storefront_value(row, "description"),
+        "description": _storefront_value(row, "description"),
+        "public_city": _storefront_value(row, "city"),
+        "city": _storefront_value(row, "city"),
+        "category": _storefront_value(row, "category"),
+        "rating": _json_value(_storefront_value(row, "rating") or 0),
+        "reviews_count": int(_storefront_value(row, "reviews_count") or 0),
+        "products_count": int(products_count if products_count is not None else (_storefront_value(row, "product_count") or 0)),
+        "product_count": int(products_count if products_count is not None else (_storefront_value(row, "product_count") or 0)),
+        "joined_at": _json_value(_storefront_value(row, "created_at")),
     }
 
 
 def public_main_storefront_response(*, products_count: int = 0) -> dict[str, Any]:
     return {
         "id": "main-store",
+        "store_type": "main",
         "partner_id": None,
+        "supplier_id": None,
         "display_name": "المتجر الرئيسي",
         "name": "المتجر الرئيسي",
         "name_en": "Main Store",
@@ -385,6 +416,7 @@ def public_product_response(
     category: Category | None = None,
     brand: Brand | None = None,
     merchant: Any | None = None,
+    merchant_type: str | None = None,
     variants: list[ProductVariant] | None = None,
 ) -> dict[str, Any]:
     images = [_public_upload_url(image) for image in (product.images or [])]
@@ -421,9 +453,11 @@ def public_product_response(
         "primary_image": primary_image,
         "category": public_category_summary(category),
         "brand": public_brand_summary(brand),
-        "supplier": public_storefront_response(merchant) if merchant is not None else None,
-        "merchant": public_storefront_response(merchant) if merchant is not None else None,
+        "supplier": public_storefront_response(merchant, store_type=merchant_type) if merchant is not None else None,
+        "merchant": public_storefront_response(merchant, store_type=merchant_type) if merchant is not None else None,
         "partner_id": str(product.partner_id) if product.partner_id else None,
+        "supplier_id": str(product.supplier_id) if product.supplier_id else None,
+        "store_type": merchant_type or ("partner" if product.partner_id else "local" if product.supplier_id else "main"),
         "store_name": (
             getattr(merchant, "name", None)
             if merchant is not None
@@ -451,6 +485,7 @@ def public_product_response(
             for variant in variants
             if variant.deleted_at is None and variant.is_active is not False
         ]
+        row["has_variant_options"] = bool(row["variants"])
     return row
 
 
@@ -527,11 +562,13 @@ async def build_public_product_rows(
     category_ids = {product.category_id for product in products if product.category_id}
     brand_ids = {product.brand_id for product in products if product.brand_id}
     partner_ids = {product.partner_id for product in products if product.partner_id}
+    supplier_ids = {product.supplier_id for product in products if product.supplier_id}
     product_ids = [product.id for product in products]
 
     categories: dict[uuid.UUID, Category] = {}
     brands: dict[uuid.UUID, Brand] = {}
     storefronts: dict[uuid.UUID, Any] = {}
+    local_merchants: dict[uuid.UUID, Any] = {}
     variants_by_product: dict[uuid.UUID, list[ProductVariant]] = {}
 
     if category_ids:
@@ -554,6 +591,16 @@ async def build_public_product_rows(
             for key in (getattr(storefront, "partner_id", None), getattr(storefront, "user_id", None)):
                 if key:
                     storefronts[key] = storefront
+    if supplier_ids and "local_merchants" in MODEL_BY_TABLE:
+        local_model = MODEL_BY_TABLE["local_merchants"]
+        result = await session.execute(
+            select(local_model).where(
+                local_model.id.in_(supplier_ids),
+                local_model.deleted_at.is_(None),
+                local_model.is_active.is_(True),
+            )
+        )
+        local_merchants = {merchant.id: merchant for merchant in result.scalars()}
     if include_variants:
         result = await session.execute(
             select(ProductVariant)
@@ -572,7 +619,8 @@ async def build_public_product_rows(
             product,
             category=categories.get(product.category_id),
             brand=brands.get(product.brand_id),
-            merchant=storefronts.get(product.partner_id),
+            merchant=storefronts.get(product.partner_id) or local_merchants.get(product.supplier_id),
+            merchant_type="partner" if product.partner_id and product.partner_id in storefronts else "local" if product.supplier_id in local_merchants else None,
             variants=variants_by_product.get(product.id) if include_variants else None,
         )
         for product in products

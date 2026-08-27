@@ -37,6 +37,78 @@ def money_or_zero(value: Any) -> Decimal:
         return Decimal("0.00")
 
 
+LOCAL_PAYMENT_SUCCESS_STATUSES = ("confirmed", "approved", "paid", "completed")
+
+
+def local_request_total(payload: dict[str, Any]) -> Decimal:
+    """Return the customer-facing total for a local-shopping request."""
+
+    for field in ("final_price", "estimated_price", "amount", "total"):
+        value = money_or_zero(payload.get(field))
+        if value > 0:
+            return value
+    return Decimal("0.00")
+
+
+def derive_local_payment_status(total: Any, paid: Any, existing_status: Any = None) -> str:
+    """Map the confirmed local-payment ledger to the status shown to customers."""
+
+    normalized_total = money_or_zero(total)
+    normalized_paid = money_or_zero(paid)
+    legacy_status = str(existing_status or "").strip().lower()
+    if normalized_total > 0 and normalized_paid >= normalized_total:
+        return "paid"
+    if normalized_paid > 0:
+        return "partial"
+    if legacy_status in {"partial_refund", "refunded"}:
+        return legacy_status
+    return "unpaid"
+
+
+async def serialize_local_shopping_requests(
+    session: AsyncSession,
+    requests: list[Any],
+) -> list[dict[str, Any]]:
+    """Serialize local requests with payment totals derived from confirmed ledger rows."""
+
+    payloads = [serialize_record(request) for request in requests]
+    if not requests:
+        return payloads
+
+    request_ids = [str(request.id) for request in requests]
+    payment_model = MODEL_BY_TABLE["order_payments"]
+    result = await session.execute(
+        select(
+            payment_model.extra_data["local_request_id"].astext,
+            func.coalesce(func.sum(payment_model.amount), 0),
+        )
+        .where(
+            payment_model.deleted_at.is_(None),
+            payment_model.extra_data["local_request_id"].astext.in_(request_ids),
+            func.lower(payment_model.status).in_(LOCAL_PAYMENT_SUCCESS_STATUSES),
+        )
+        .group_by(payment_model.extra_data["local_request_id"].astext)
+    )
+    paid_by_request = {
+        str(request_id): money_or_zero(amount)
+        for request_id, amount in result.all()
+        if request_id
+    }
+
+    for request, payload in zip(requests, payloads):
+        total = local_request_total(payload)
+        ledger_paid = paid_by_request.get(str(request.id), Decimal("0.00"))
+        paid = max(ledger_paid, money_or_zero(payload.get("paid_amount")))
+        payload["paid_amount"] = format(paid, "f")
+        payload["remaining_balance"] = format(max(total - paid, Decimal("0.00")), "f")
+        payload["payment_status"] = derive_local_payment_status(
+            total,
+            paid,
+            payload.get("payment_status"),
+        )
+    return payloads
+
+
 def request_hash(body: Any) -> str:
     payload = dict(body) if isinstance(body, dict) else {"body": body}
     payload.pop("idempotencyKey", None)

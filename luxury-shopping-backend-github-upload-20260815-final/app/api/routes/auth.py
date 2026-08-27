@@ -515,7 +515,10 @@ async def register_customer(
     city = str(body.city or "").strip()
     street = str(body.street or "").strip()
     address_details = str(body.address_details or "").strip()
-    if not phone or not city or not (street or address_details):
+    # Street and address details are optional in the customer form. Keep the
+    # account contract aligned with that UI and require only the fields marked
+    # as required there.
+    if not phone or not city:
         raise HTTPException(status_code=400, detail="profile_details_required")
     captcha_status = await _assert_registration_allowed(
         session,
@@ -1172,6 +1175,41 @@ async def verify_phone_otp(
     return {"ok": True, "verified": True}
 
 
+def _address_boolean(value: Any, *, default: bool = False) -> bool:
+    """Normalize boolean address fields from JSON and older web clients."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+async def _clear_default_address(
+    session: AsyncSession,
+    model: type[Any],
+    user_id: uuid.UUID,
+    *,
+    exclude_id: uuid.UUID | None = None,
+) -> None:
+    """Clear the current default before assigning another one.
+
+    The database has a partial unique index for one active default address per
+    customer. Flushing this UPDATE before an INSERT/UPDATE avoids a transient
+    uniqueness conflict during SQLAlchemy's unit-of-work flush.
+    """
+    statement = update(model).where(
+        model.user_id == user_id,
+        model.deleted_at.is_(None),
+        model.is_default.is_(True),
+    )
+    if exclude_id is not None:
+        statement = statement.where(model.id != exclude_id)
+    await session.execute(statement.values(is_default=False))
+    await session.flush()
+
+
 @router.get("/api/profile/addresses")
 async def list_profile_addresses(
     user: User = Depends(current_user),
@@ -1196,25 +1234,34 @@ async def create_profile_address(
 ):
     body = await request.json()
     model = MODEL_BY_TABLE["customer_addresses"]
+    is_default = _address_boolean(
+        body.get("is_default", body.get("isDefault")),
+    )
+    district = str(body.get("district") or "").strip()
     row = model(
         user_id=user.id,
         label=str(body.get("label") or body.get("name") or "Address"),
-        recipient_name=str(body.get("recipient_name") or body.get("recipientName") or body.get("fullName") or ""),
+        recipient_name=str(
+            body.get("recipient_name")
+            or body.get("full_name")
+            or body.get("recipientName")
+            or body.get("fullName")
+            or ""
+        ).strip(),
         phone=str(body.get("phone") or ""),
         governorate=str(body.get("governorate") or body.get("state") or ""),
         city=str(body.get("city") or ""),
         address=str(body.get("address") or body.get("line1") or ""),
         latitude=body.get("latitude"),
         longitude=body.get("longitude"),
-        is_default=bool(body.get("is_default") or body.get("isDefault")),
+        is_default=False,
+        extra_data={"district": district} if district else {},
     )
-    if row.is_default:
-        existing = (
-            await session.execute(select(model).where(model.user_id == user.id, model.is_default.is_(True)))
-        ).scalars().all()
-        for item in existing:
-            item.is_default = False
+    if is_default:
+        await _clear_default_address(session, model, user.id)
+        row.is_default = True
     session.add(row)
+    await session.flush()
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -1235,6 +1282,7 @@ async def update_profile_address(
         "label": "label",
         "name": "label",
         "recipient_name": "recipient_name",
+        "full_name": "recipient_name",
         "recipientName": "recipient_name",
         "fullName": "recipient_name",
         "phone": "phone",
@@ -1249,14 +1297,27 @@ async def update_profile_address(
     for source, target in mapping.items():
         if source in body:
             setattr(row, target, body[source])
+    if "district" in body:
+        extra_data = dict(row.extra_data or {})
+        district = str(body.get("district") or "").strip()
+        if district:
+            extra_data["district"] = district
+        else:
+            extra_data.pop("district", None)
+        row.extra_data = extra_data
     if "is_default" in body or "isDefault" in body:
-        row.is_default = bool(body.get("is_default") or body.get("isDefault"))
-        if row.is_default:
-            others = (
-                await session.execute(select(model).where(model.user_id == user.id, model.id != row.id, model.is_default.is_(True)))
-            ).scalars().all()
-            for item in others:
-                item.is_default = False
+        is_default = _address_boolean(
+            body.get("is_default", body.get("isDefault")),
+        )
+        if is_default:
+            await _clear_default_address(
+                session,
+                model,
+                user.id,
+                exclude_id=row.id,
+            )
+        row.is_default = is_default
+    await session.flush()
     await session.commit()
     return {"data": serialize_record(row)}
 

@@ -172,6 +172,24 @@ class RecognizedOrderRevenue:
 
 class RevenueRecognitionService:
     @staticmethod
+    async def eligible_orders(
+        session: AsyncSession,
+        *,
+        start: Any = None,
+        end: Any = None,
+    ) -> list[Order]:
+        start_dt, end_dt = _date_range(start, end)
+        statement = select(Order).where(
+            Order.deleted_at.is_(None),
+            ~func.lower(Order.status).in_(tuple(EXCLUDED_ORDER_STATUSES)),
+        )
+        if start_dt is not None:
+            statement = statement.where(Order.created_at >= start_dt)
+        if end_dt is not None:
+            statement = statement.where(Order.created_at <= end_dt)
+        return list((await session.execute(statement.order_by(Order.created_at.desc()))).scalars())
+
+    @staticmethod
     async def order_rows(
         session: AsyncSession,
         *,
@@ -179,21 +197,23 @@ class RevenueRecognitionService:
         end: Any = None,
         partner_id: uuid.UUID | None = None,
     ) -> list[RecognizedOrderRevenue]:
-        start_dt, end_dt = _date_range(start, end)
-        statement = select(Order).where(Order.deleted_at.is_(None), ~func.lower(Order.status).in_(tuple(EXCLUDED_ORDER_STATUSES)))
-        if start_dt is not None:
-            statement = statement.where(Order.created_at >= start_dt)
-        if end_dt is not None:
-            statement = statement.where(Order.created_at <= end_dt)
-        if partner_id is not None:
-            statement = statement.where(
-                Order.id.in_(
-                    select(OrderItem.order_id).where(OrderItem.partner_id == partner_id)
-                )
-            )
-        orders = list((await session.execute(statement.order_by(Order.created_at.desc()))).scalars())
+        orders = await RevenueRecognitionService.eligible_orders(session, start=start, end=end)
         if not orders:
             return []
+        if partner_id is not None:
+            partner_order_ids = set(
+                (
+                    await session.execute(
+                        select(OrderItem.order_id).where(
+                            OrderItem.partner_id == partner_id,
+                            OrderItem.order_id.in_([order.id for order in orders]),
+                        )
+                    )
+                ).scalars()
+            )
+            orders = [order for order in orders if order.id in partner_order_ids]
+            if not orders:
+                return []
         order_ids = [row.id for row in orders]
         payment_model = MODEL_BY_TABLE["order_payments"]
         refund_model = MODEL_BY_TABLE["refunds"]
@@ -278,21 +298,27 @@ class RevenueRecognitionService:
 
     @classmethod
     async def report_source(cls, session: AsyncSession, *, start: Any = None, end: Any = None) -> dict[str, Any]:
+        all_orders = await cls.eligible_orders(session, start=start, end=end)
         revenue_rows = await cls.order_rows(session, start=start, end=end)
-        order_ids = [row.order_id for row in revenue_rows]
-        orders = []
-        if order_ids:
-            result = await session.execute(select(Order).where(Order.id.in_(order_ids)).order_by(Order.created_at.desc()))
-            orders = [serialize_record(row) for row in result.scalars()]
+        order_ids = [row.id for row in all_orders]
+        orders = [serialize_record(row) for row in all_orders]
         item_rows = []
         if order_ids:
             result = await session.execute(select(OrderItem).where(OrderItem.order_id.in_(order_ids)))
             item_rows = [serialize_record(row) for row in result.scalars()]
+        profile_result = await session.execute(
+            select(Profile)
+            .join(UserRole, UserRole.user_id == Profile.user_id)
+            .where(Profile.deleted_at.is_(None), UserRole.role == "customer")
+            .order_by(Profile.created_at.desc())
+            .limit(500)
+        )
+        profiles = [serialize_record(row) for row in profile_result.scalars()]
         summary = await cls.summary(session, start=start, end=end)
         return {
             "orders": orders,
             "items": item_rows,
-            "profiles": [],
+            "profiles": profiles,
             "marketerCommissions": [],
             "partnerCommissions": [],
             "revenue": summary,
@@ -306,6 +332,7 @@ class ReportGenerationService:
         "sales": ("orders", ("order_id", "order_number", "status", "payment_status", "gross", "paid", "refunds", "net")),
         "revenue": ("revenue", ("metric", "value")),
         "summary": ("revenue", ("metric", "value")),
+        "customers": ("customers", ("customer_id", "name", "email", "classification", "created_at", "orders", "total_spent")),
         "merchant_revenue": ("merchant_revenue", ("order_id", "order_number", "merchant_gross", "refunds", "net")),
     }
 
@@ -442,20 +469,60 @@ class ReportGenerationService:
         end = body.get("dateTo") or body.get("date_to") or body.get("end")
         partner_id = _parse_uuid(body.get("partnerId") or body.get("partner_id"), "partner_id") if body.get("partnerId") or body.get("partner_id") else None
         if report_type in {"orders", "sales"}:
-            rows = await RevenueRecognitionService.order_rows(self.session, start=start, end=end)
+            orders = await RevenueRecognitionService.eligible_orders(self.session, start=start, end=end)
+            recognized = await RevenueRecognitionService.order_rows(self.session, start=start, end=end)
+            recognized_by_id = {row.order_id: row for row in recognized}
             return (
                 [
                     {
-                        "order_id": str(row.order_id),
-                        "order_number": row.order_number,
-                        "status": row.status,
-                        "payment_status": row.payment_status,
-                        "gross": format(row.partner_share_gross, "f"),
-                        "paid": format(row.payment_total, "f"),
-                        "refunds": format(row.refund_total, "f"),
-                        "net": format(row.net_revenue, "f"),
+                        "order_id": str(order.id),
+                        "order_number": order.order_number,
+                        "status": order.status,
+                        "payment_status": order.payment_status,
+                        "gross": format(recognized_by_id.get(order.id).partner_share_gross if order.id in recognized_by_id else money(order.total or 0), "f"),
+                        "paid": format(recognized_by_id.get(order.id).payment_total if order.id in recognized_by_id else money(0), "f"),
+                        "refunds": format(recognized_by_id.get(order.id).refund_total if order.id in recognized_by_id else money(0), "f"),
+                        "net": format(recognized_by_id.get(order.id).net_revenue if order.id in recognized_by_id else money(0), "f"),
                     }
-                    for row in rows
+                    for order in orders
+                ],
+                self.DEFINITIONS[report_type][1],
+                await RevenueRecognitionService.summary(self.session, start=start, end=end),
+            )
+        if report_type == "customers":
+            orders = await RevenueRecognitionService.eligible_orders(self.session, start=start, end=end)
+            recognized = await RevenueRecognitionService.order_rows(self.session, start=start, end=end)
+            recognized_by_id = {row.order_id: row for row in recognized}
+            order_counts: dict[uuid.UUID, int] = {}
+            spending: dict[uuid.UUID, Decimal] = {}
+            for order in orders:
+                if not order.user_id:
+                    continue
+                order_counts[order.user_id] = order_counts.get(order.user_id, 0) + 1
+                recognized_order = recognized_by_id.get(order.id)
+                if recognized_order is not None:
+                    spending[order.user_id] = money(spending.get(order.user_id, Decimal("0.00")) + recognized_order.net_revenue)
+            profile_result = await self.session.execute(
+                select(Profile)
+                .join(UserRole, UserRole.user_id == Profile.user_id)
+                .where(Profile.deleted_at.is_(None), UserRole.role == "customer")
+                .distinct()
+                .order_by(Profile.created_at.desc())
+                .limit(500)
+            )
+            profiles = list(profile_result.scalars())
+            return (
+                [
+                    {
+                        "customer_id": str(profile.user_id),
+                        "name": profile.full_name or "غير معروف",
+                        "email": profile.email or "-",
+                        "classification": profile.classification or "normal",
+                        "created_at": str(profile.created_at or ""),
+                        "orders": order_counts.get(profile.user_id, 0),
+                        "total_spent": format(spending.get(profile.user_id, Decimal("0.00")), "f"),
+                    }
+                    for profile in profiles
                 ],
                 self.DEFINITIONS[report_type][1],
                 await RevenueRecognitionService.summary(self.session, start=start, end=end),
@@ -666,7 +733,14 @@ class CampaignService:
     @staticmethod
     def _normalize_body(body: dict[str, Any]) -> dict[str, Any]:
         title = str(body.get("title") or body.get("name") or "").strip()
-        message = str(body.get("message") or body.get("body") or "").strip()
+        message = str(
+            body.get("message")
+            or body.get("body")
+            or body.get("content")
+            or body.get("subtitle")
+            or body.get("title")
+            or ""
+        ).strip()
         if len(title) < 3:
             raise HTTPException(status_code=422, detail="campaign_title_required")
         if len(message) < 3:
@@ -715,7 +789,12 @@ class CampaignService:
         row = await session.get(MODEL_BY_TABLE["marketing_campaigns"], campaign_id)
         if row is None or row.deleted_at is not None:
             raise HTTPException(status_code=404, detail="campaign_not_found")
-        normalized = self._normalize_body({**(row.extra_data or {}), **body})
+        existing = {
+            "title": row.title,
+            "message": row.message,
+            **(row.extra_data or {}),
+        }
+        normalized = self._normalize_body({**existing, **body})
         if row.status in {"completed", "cancelled"}:
             raise HTTPException(status_code=409, detail="campaign_not_editable")
         row.title = normalized["title"]

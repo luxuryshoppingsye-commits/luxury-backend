@@ -15,10 +15,77 @@ from ..repositories.resources import serialize_record
 
 _CREATE_BLOCKED_FIELDS = {"id", "created_at", "updated_at", "deleted_at", "extra_data"}
 _UPDATE_BLOCKED_FIELDS = {"id", "created_at", "deleted_at", "extra_data"}
+_CATEGORY_FIELD_ALIASES = {
+    "nameEn": "name_en",
+    "parentId": "parent_id",
+    "imageUrl": "image_url",
+    "bannerUrl": "banner_url",
+    "bannerTitle": "banner_title",
+    "bannerSubtitle": "banner_subtitle",
+    "bannerColor": "banner_color",
+    "bannerTextColor": "banner_text_color",
+    "descriptionAr": "description_ar",
+    "descriptionEn": "description_en",
+    "sortOrder": "sort_order",
+    "isActive": "is_active",
+    "isFeatured": "is_featured",
+}
+_CATEGORY_BOOLEAN_FIELDS = {"is_active", "is_featured"}
 
 
 def normalize_category_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def normalize_category_mutation_input(body: Any) -> dict[str, Any]:
+    """Return one canonical category payload for every admin API contract.
+
+    The dashboard has historically used both camelCase and snake_case names.
+    Keeping the conversion at the service boundary prevents partial actions
+    such as toggling ``isActive`` from being silently stored in ``extra_data``
+    instead of updating the real column.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_category_payload", "message": "بيانات القسم غير صحيحة"},
+        )
+
+    values: dict[str, Any] = {}
+    for key, value in body.items():
+        canonical_key = _CATEGORY_FIELD_ALIASES.get(key, key)
+        # Prefer an explicitly supplied canonical field over its legacy alias.
+        if canonical_key in values and key != canonical_key:
+            continue
+        values[canonical_key] = value
+
+    if "sort_order" in values and values["sort_order"] not in (None, ""):
+        raw_sort_order = values["sort_order"]
+        try:
+            if isinstance(raw_sort_order, bool):
+                raise ValueError
+            values["sort_order"] = int(str(raw_sort_order).strip())
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_category_sort_order", "field": "sort_order", "message": "ترتيب القسم غير صحيح"},
+            ) from exc
+
+    for field in _CATEGORY_BOOLEAN_FIELDS:
+        if field not in values or isinstance(values[field], bool) or values[field] is None:
+            continue
+        raw_boolean = str(values[field]).strip().lower()
+        if raw_boolean in {"true", "1", "yes", "on"}:
+            values[field] = True
+        elif raw_boolean in {"false", "0", "no", "off"}:
+            values[field] = False
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_category_boolean", "field": field, "message": "قيمة حالة القسم غير صحيحة"},
+            )
+
+    return values
 
 
 def _clean_required_name(value: Any) -> str:
@@ -127,6 +194,7 @@ def _category_values(body: dict[str, Any], *, blocked_fields: set[str]) -> tuple
 
 
 async def create_category_record(session: AsyncSession, body: dict[str, Any]) -> dict[str, Any]:
+    body = normalize_category_mutation_input(body)
     values, extra = _category_values(body, blocked_fields=_CREATE_BLOCKED_FIELDS)
     if "name" not in values:
         values["name"] = _clean_required_name(None)
@@ -139,6 +207,7 @@ async def create_category_record(session: AsyncSession, body: dict[str, Any]) ->
 
 
 async def update_category_record(session: AsyncSession, category_id: uuid.UUID, body: dict[str, Any]) -> dict[str, Any]:
+    body = normalize_category_mutation_input(body)
     row = await session.get(Category, category_id)
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="category_not_found")

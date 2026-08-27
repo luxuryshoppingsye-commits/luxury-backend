@@ -219,8 +219,15 @@ SEARCH_PREFIXES = (
 )
 UPLOAD_PREFIXES = (
     "/storage/upload",
+    # The /api-prefixed routes are compatibility aliases registered from the
+    # same router. They must receive the upload policy too; otherwise the
+    # generic POST policy requires an idempotency key and rejects multipart
+    # image uploads before the route handler can process them.
+    "/api/storage/upload",
     "/storage/presign",
+    "/api/storage/presign",
     "/storage/complete",
+    "/api/storage/complete",
     "/storage/migrate-render-to-r2",
     "/manage/product-image",
     "/me/avatar",
@@ -436,6 +443,10 @@ def policy_for_route(method: str, path: str) -> ApiProtectionPolicy:
         return _policy("e2e_verification", auth=False, rate="internal_diagnostics", sensitive=True, audit=method != "GET")
     if method == "POST" and normalized == "/api/analytics/events":
         return _policy("public_write", auth=False, rate="public_read", public=True, audit=False)
+    if method == "POST" and normalized == "/api/partnership/apply":
+        return _policy("public_write", auth=False, rate="support_write", public=True, sensitive=True, audit=True)
+    if method == "POST" and normalized == "/api/loyalty/initialize":
+        return _policy("customer_write", auth=True, rate="customer_write", sensitive=True, audit=True)
     if method == "POST" and normalized in PUBLIC_POST_PATHS:
         return _policy("public_read", auth=False, rate="public_read", public=True)
     if method in {"GET", "HEAD"} and (_matches(normalized, PUBLIC_GET_PREFIXES) or _is_public_product_review_read(normalized)):

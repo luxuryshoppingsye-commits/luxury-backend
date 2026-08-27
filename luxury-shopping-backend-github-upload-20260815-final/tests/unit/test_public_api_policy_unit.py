@@ -52,6 +52,14 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
     assert cart_hydrate.authentication_required is False
     assert cart_hydrate.policy_name == "public_read"
 
+    partner_application = policy_for_route("POST", "/api/partnership/apply")
+    assert partner_application.authentication_required is False
+    assert partner_application.rate_limit_policy == "support_write"
+
+    loyalty_initialize = policy_for_route("POST", "/api/loyalty/initialize")
+    assert loyalty_initialize.authentication_required is True
+    assert loyalty_initialize.rate_limit_policy == "customer_write"
+
     protected_writes = (
         ("GET", "/api/analytics/events"),
         ("POST", "/api/content/menus"),
@@ -62,6 +70,10 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
         ("POST", "/api/uploads"),
         ("GET", "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/mine"),
         ("GET", "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/eligibility"),
+        ("POST", "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e"),
+        ("PATCH", "/api/reviews/11afafe1-dc42-42ee-b3d1-0bd0f871655e"),
+        ("DELETE", "/api/reviews/11afafe1-dc42-42ee-b3d1-0bd0f871655e"),
+        ("PUT", "/api/engagement/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/like"),
     )
     for method, path in protected_writes:
         policy = policy_for_route(method, path)

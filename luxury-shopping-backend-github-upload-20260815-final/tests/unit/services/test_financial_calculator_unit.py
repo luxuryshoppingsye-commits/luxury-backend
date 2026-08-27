@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 
+from backend.app.models import MODEL_BY_TABLE
 from backend.app.models.domain import Product, ProductVariant
 from backend.app.services import financial_calculator as fc
 
@@ -37,6 +40,54 @@ def test_money_rejects_invalid_or_negative_values(raw: object) -> None:
 def test_money_or_zero_safely_handles_invalid_values() -> None:
     assert fc.money_or_zero("not-money") == Decimal("0.00")
     assert fc.money_or_zero("-10") == Decimal("0.00")
+
+
+@pytest.mark.parametrize(
+    ("total", "paid", "expected"),
+    [
+        ("100.00", "0", "unpaid"),
+        ("100.00", "25.00", "partial"),
+        ("100.00", "100.00", "paid"),
+        ("100.00", "125.00", "paid"),
+    ],
+)
+def test_derive_local_payment_status_from_confirmed_payments(
+    total: str,
+    paid: str,
+    expected: str,
+) -> None:
+    assert fc.derive_local_payment_status(total, paid) == expected
+
+
+def test_local_request_total_prefers_final_price_then_estimate_then_amount() -> None:
+    assert fc.local_request_total({"final_price": "125.00", "estimated_price": "150.00", "amount": "100.00"}) == Decimal("125.00")
+    assert fc.local_request_total({"final_price": "0", "estimated_price": "150.00", "amount": "100.00"}) == Decimal("150.00")
+    assert fc.local_request_total({"amount": "100.00"}) == Decimal("100.00")
+
+
+@pytest.mark.asyncio
+async def test_local_request_serializer_uses_confirmed_payment_ledger() -> None:
+    request_id = uuid.uuid4()
+    request_model = MODEL_BY_TABLE["local_shopping_requests"]
+    request = request_model(
+        id=request_id,
+        user_id=uuid.uuid4(),
+        status="shipping",
+        description="منتج محلي للاختبار",
+        amount=Decimal("100.00"),
+        extra_data={"final_price": "200.00"},
+    )
+
+    class Result:
+        def all(self):
+            return [(str(request_id), Decimal("200.00"))]
+
+    session = SimpleNamespace(execute=AsyncMock(return_value=Result()))
+    rows = await fc.serialize_local_shopping_requests(session, [request])
+
+    assert rows[0]["payment_status"] == "paid"
+    assert rows[0]["paid_amount"] == "200.00"
+    assert rows[0]["remaining_balance"] == "0.00"
 
 
 def test_request_hash_is_canonical_and_ignores_idempotency_key() -> None:

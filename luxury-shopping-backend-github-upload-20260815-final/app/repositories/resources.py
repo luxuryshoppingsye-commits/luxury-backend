@@ -29,6 +29,11 @@ from ..services.catalog_policy import public_product_clauses
 
 
 COMPATIBLE_COLUMN_ALIASES = {
+    "site_settings": {
+        # The Flutter admin client uses the public setting contract while the
+        # PostgreSQL compatibility table stores the key in ``name``.
+        "setting_key": "name",
+    },
     "static_pages": {
         "content": "body",
         "is_published": "is_active",
@@ -37,6 +42,15 @@ COMPATIBLE_COLUMN_ALIASES = {
         "content": "body",
         "is_visible": "is_active",
         "section_name": "title",
+    },
+    "custom_elements": {
+        "element_type": "type",
+        "title": "name",
+        "content": "body",
+        "is_visible": "is_active",
+    },
+    "banners": {
+        "link_url": "url",
     },
     "blog_articles": {
         "content": "body",
@@ -137,10 +151,14 @@ def serialize_record(record: Any) -> dict[str, Any]:
         value = object_state.dict.get(key)
         if key == "extra_data":
             if isinstance(value, dict):
+                if table_name == "site_settings":
+                    result["setting_value"] = _json_value(value)
                 for extra_key, extra_value in value.items():
                     result.setdefault(extra_key, _json_value(extra_value))
             continue
         result[key] = _json_value(value)
+    if table_name == "site_settings" and "name" in result:
+        result.setdefault("setting_key", result["name"])
     if "image_url" in result and result.get("image_url"):
         result.setdefault("imageUrl", result["image_url"])
     for alias, column_name in COMPATIBLE_RESPONSE_ALIASES.get(table_name, {}).items():
@@ -229,6 +247,66 @@ def _parse_is_value(value: Any) -> Any:
         if normalized == "false":
             return False
     return value
+
+
+def _normalize_resource_payload(
+    table: str,
+    raw: dict[str, Any],
+    operation: str,
+) -> dict[str, Any]:
+    """Normalize dashboard aliases before the generic resource writer persists them."""
+    values = dict(raw)
+    if table == "site_settings":
+        # Keep both the REST content API and the resource API on the same
+        # storage contract. Older clients send setting_key/setting_value,
+        # while this compatibility schema stores the key in name and the
+        # JSON value in extra_data.
+        if "setting_key" in values and "name" not in values:
+            values["name"] = values.pop("setting_key")
+        elif "key" in values and "name" not in values:
+            values["name"] = values.pop("key")
+        if "setting_value" in values:
+            setting_value = values.pop("setting_value")
+            values["extra_data"] = (
+                dict(setting_value)
+                if isinstance(setting_value, dict)
+                else {"value": setting_value}
+            )
+        elif "value" in values and "extra_data" not in values:
+            values["extra_data"] = {"value": values.pop("value")}
+        return values
+    aliases = COMPATIBLE_COLUMN_ALIASES.get(table, {})
+    if table not in {"site_settings", "couriers"}:
+        for alias, column_name in aliases.items():
+            if alias in values and column_name not in values:
+                values[column_name] = values.pop(alias)
+        return values
+
+    if "full_name" in values and "name" not in values:
+        values["name"] = values["full_name"]
+    if "isActive" in values and "is_active" not in values:
+        values["is_active"] = values["isActive"]
+    if "vehicleType" in values and "vehicle_type" not in values:
+        values["vehicle_type"] = values["vehicleType"]
+    if "coverageArea" in values and "coverage_area" not in values:
+        values["coverage_area"] = values["coverageArea"]
+
+    if operation in {"insert", "upsert"} or "name" in values:
+        name = str(values.get("name") or "").strip()
+        if len(name) < 2:
+            raise HTTPException(status_code=422, detail="courier_name_required")
+        values["name"] = name
+    if operation in {"insert", "upsert"}:
+        active = values.get("is_active", True)
+        if isinstance(active, str):
+            active = active.strip().lower() not in {"false", "0", "no", "inactive"}
+        values.setdefault("status", "active" if active else "inactive")
+    elif "is_active" in values and "status" not in values:
+        active = values["is_active"]
+        if isinstance(active, str):
+            active = active.strip().lower() not in {"false", "0", "no", "inactive"}
+        values["status"] = "active" if active else "inactive"
+    return values
 
 
 class ResourceRepository:
@@ -602,6 +680,7 @@ class ResourceRepository:
         return rows
 
     def _prepare_data(self, raw: dict[str, Any], operation: str) -> dict[str, Any]:
+        raw = _normalize_resource_payload(self.table, raw, operation)
         table = self.model.__table__
         validate_mutation_payload(
             table=self.table,
@@ -793,12 +872,13 @@ class ResourceRepository:
         if conflict_target is not None:
             clauses = []
             for field in conflict_target:
-                if field not in table.c:
+                resolved_field = COMPATIBLE_COLUMN_ALIASES.get(self.table, {}).get(field, field)
+                if resolved_field not in table.c:
                     raise HTTPException(status_code=422, detail=f"unknown_on_conflict_field:{self.table}:{field}")
-                if field not in data:
+                if resolved_field not in data:
                     raise HTTPException(status_code=422, detail=f"missing_on_conflict_value:{self.table}:{field}")
-                value = data[field]
-                clauses.append(table.c[field].is_(None) if value is None else table.c[field] == value)
+                value = data[resolved_field]
+                clauses.append(table.c[resolved_field].is_(None) if value is None else table.c[resolved_field] == value)
             statement = select(self.model).where(and_(*clauses)).limit(1)
             result = await self.session.execute(statement)
             record = result.scalars().first()

@@ -52,6 +52,7 @@ from ...services.financial_calculator import (
     calculate_checkout_financials,
     line_total,
     money,
+    serialize_local_shopping_requests,
     unit_price,
 )
 from ...services.merchant_order_scope import merchant_order_detail, merchant_order_list
@@ -888,6 +889,19 @@ async def _apply_public_product_filters(
         statement = statement.where(Product.supplier_id == _uuid(supplier_id, "supplierId"))
     if main_store_only:
         statement = statement.where(Product.partner_id.is_(None))
+        local_model = MODEL_BY_TABLE.get("local_merchants")
+        if local_model is not None:
+            local_result = await session.execute(
+                select(local_model.id).where(
+                    local_model.deleted_at.is_(None),
+                    local_model.is_active.is_(True),
+                )
+            )
+            local_ids = list(local_result.scalars())
+            if local_ids:
+                statement = statement.where(
+                    or_(Product.supplier_id.is_(None), ~Product.supplier_id.in_(local_ids))
+                )
     if min_price is not None:
         statement = statement.where(Product.price >= min_price)
     if max_price is not None:
@@ -1090,7 +1104,39 @@ async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dic
     elif "code" in model.__table__.c:
         statement = statement.order_by(model.__table__.c.code)
     result = await session.execute(statement.limit(limit))
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    rows = [serialize_record(row) for row in result.scalars()]
+    if rows:
+        return {"data": rows}
+    # Keep international shopping usable on a fresh deployment before the
+    # administrator has populated the currency table. USD intentionally has
+    # no invented rate; the customer may submit the foreign-currency estimate
+    # and the final conversion is confirmed before purchase.
+    return {
+        "data": [
+            {
+                "id": "default-YER",
+                "code": "YER",
+                "name": "الريال اليمني",
+                "name_en": "Yemeni Rial",
+                "symbol": "ر.ي",
+                "exchange_rate": 1,
+                "is_default": True,
+                "is_active": True,
+                "sort_order": 0,
+            },
+            {
+                "id": "default-USD",
+                "code": "USD",
+                "name": "الدولار الأمريكي",
+                "name_en": "US Dollar",
+                "symbol": "$",
+                "exchange_rate": None,
+                "is_default": False,
+                "is_active": True,
+                "sort_order": 1,
+            },
+        ][: max(int(limit), 1)],
+    }
 
 
 @router.get("/api/catalog/admin/brands")
@@ -1307,6 +1353,7 @@ async def partner_storefronts(limit: int = Query(80, ge=1, le=5000), session: As
 
 async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
     model = MODEL_BY_TABLE["partner_storefronts"]
+    local_model = MODEL_BY_TABLE["local_merchants"]
     result = await session.execute(
         select(model)
         .where(model.deleted_at.is_(None), model.is_active.is_(True))
@@ -1314,43 +1361,73 @@ async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
         .limit(limit)
     )
     storefront_rows = list(result.scalars())
+    local_result = await session.execute(
+        select(local_model)
+        .where(local_model.deleted_at.is_(None), local_model.is_active.is_(True))
+        .order_by(local_model.name)
+        .limit(limit)
+    )
+    local_merchant_rows = list(local_result.scalars())
     storefront_partner_ids = {
         value
         for item in storefront_rows
         for value in (getattr(item, "partner_id", None), getattr(item, "user_id", None))
         if value
     }
+    local_merchant_ids = {getattr(item, "id", None) for item in local_merchant_rows if getattr(item, "id", None)}
     product_owner_clause = [Product.partner_id.is_(None)]
     if storefront_partner_ids:
         product_owner_clause.append(Product.partner_id.in_(storefront_partner_ids))
+    if local_merchant_ids:
+        product_owner_clause.append(Product.supplier_id.in_(local_merchant_ids))
     count_result = await session.execute(
-        select(Product.partner_id, func.count(Product.id))
+        select(Product.supplier_id, Product.partner_id, func.count(Product.id))
         .where(*public_product_clauses(Product))
         .where(or_(*product_owner_clause))
-        .group_by(Product.partner_id)
+        .group_by(Product.supplier_id, Product.partner_id)
     )
-    product_counts = {
-        partner_id: int(count or 0)
-        for partner_id, count in count_result.all()
-    }
+    partner_product_counts: dict[Any, int] = {}
+    local_product_counts: dict[Any, int] = {}
+    main_store_count = 0
+    for supplier_id, partner_id, count in count_result.all():
+        safe_count = int(count or 0)
+        if partner_id is None and supplier_id not in local_merchant_ids:
+            main_store_count += safe_count
+        if partner_id is not None:
+            partner_product_counts[partner_id] = partner_product_counts.get(partner_id, 0) + safe_count
+        if supplier_id in local_merchant_ids:
+            local_product_counts[supplier_id] = local_product_counts.get(supplier_id, 0) + safe_count
     rows = []
-    main_store_count = int(product_counts.get(None, 0) or 0)
     if main_store_count > 0:
         rows.append(public_main_storefront_response(products_count=main_store_count))
-    for item in storefront_rows:
+    store_rows = [(item, False) for item in storefront_rows] + [(item, True) for item in local_merchant_rows]
+    store_rows.sort(key=lambda entry: str(getattr(entry[0], "name", None) or "").casefold())
+    for item, is_local_merchant in store_rows:
         if _safe_public_display_text(getattr(item, "name", None)):
-            partner_values = {value for value in (item.partner_id, item.user_id) if value}
-            count = sum(int(product_counts.get(value, 0) or 0) for value in partner_values)
-            # A storefront without a currently publishable product is not a
-            # customer-facing store. Excluding it also prevents old QA
-            # storefront metadata (including dead logo URLs) from leaking into
-            # the public catalog.
-            if count <= 0:
+            partner_values = {
+                value
+                for value in (getattr(item, "partner_id", None), getattr(item, "user_id", None))
+                if value
+            }
+            if is_local_merchant:
+                count = int(local_product_counts.get(item.id, 0) or 0)
+            else:
+                count = sum(int(partner_product_counts.get(value, 0) or 0) for value in partner_values)
+            # A local merchant is an explicit admin-managed storefront and
+            # should be discoverable before its first product is published.
+            if not is_local_merchant and count <= 0:
                 continue
-            rows.append(public_storefront_response(item, products_count=count))
+            rows.append(
+                public_storefront_response(
+                    item,
+                    products_count=count,
+                    public_id=item.id if is_local_merchant else None,
+                    store_type="local" if is_local_merchant else "partner",
+                )
+            )
     # A partner id without a real storefront record is not a customer-facing
     # store. Do not invent a UUID-based name for it in the public catalog.
-    return rows
+    return rows[:limit]
 
 
 MAX_CATALOG_IMAGE_BYTES = 12 * 1024 * 1024
@@ -1678,10 +1755,19 @@ async def delete_wishlist(product_id: uuid.UUID, user: User = Depends(current_us
     return Response(status_code=204)
 
 
-async def _visible_orders(session: AsyncSession, user: User, roles: set[str], scope: str | None, limit: int):
+async def _visible_orders(
+    session: AsyncSession,
+    user: User,
+    roles: set[str],
+    scope: str | None,
+    limit: int,
+    partner_id: uuid.UUID | None = None,
+):
     statement = select(Order).where(Order.deleted_at.is_(None))
     if scope == "admin" and roles.intersection({"admin", "manager", "finance", "logistics", "staff", "employee"}):
-        pass
+        if partner_id is not None:
+            order_ids = select(OrderItem.order_id).where(OrderItem.partner_id == partner_id)
+            statement = statement.where(Order.id.in_(order_ids))
     elif scope == "partner" and "partner" in roles:
         order_ids = select(OrderItem.order_id).where(OrderItem.partner_id == user.id)
         statement = statement.where(Order.id.in_(order_ids))
@@ -1691,12 +1777,55 @@ async def _visible_orders(session: AsyncSession, user: User, roles: set[str], sc
     return list(result.scalars())
 
 
+async def _serialize_orders_with_financials(session: AsyncSession, orders: list[Order]) -> list[dict[str, Any]]:
+    """Return order rows with one consistent paid/remaining summary.
+
+    The checkout model stores verified receipts in ``payments`` while the
+    administration panel also records manual payment entries in
+    ``order_payments``. Both are valid ledger sources; pending entries are
+    deliberately excluded from the paid amount.
+    """
+    payloads = [_serialize_order(order) for order in orders]
+    if not orders:
+        return payloads
+
+    order_ids = [order.id for order in orders]
+    recognized_statuses = ("confirmed", "approved", "paid", "completed")
+    paid_by_order: dict[uuid.UUID, Decimal] = {order.id: Decimal("0.00") for order in orders}
+    for table_name in ("order_payments", "payments"):
+        payment_model = MODEL_BY_TABLE[table_name]
+        result = await session.execute(
+            select(payment_model.order_id, func.coalesce(func.sum(payment_model.amount), 0))
+            .where(
+                payment_model.order_id.in_(order_ids),
+                payment_model.deleted_at.is_(None),
+                func.lower(payment_model.status).in_(recognized_statuses),
+            )
+            .group_by(payment_model.order_id)
+        )
+        for order_id, amount in result.all():
+            paid_by_order[order_id] = money(paid_by_order.get(order_id, Decimal("0.00")) + _money(amount))
+
+    for order, payload in zip(orders, payloads):
+        # Keep any older derived value when it is larger than the new ledger
+        # total; this makes the rollout safe for legacy orders.
+        paid = max(paid_by_order.get(order.id, Decimal("0.00")), _money(payload.get("paid_amount")))
+        total = _money(payload.get("total"))
+        payload["paid_amount"] = format(money(paid), "f")
+        payload["remaining_balance"] = format(money(max(total - paid, Decimal("0.00"))), "f")
+        if paid > 0 and str(payload.get("payment_status") or "").lower() not in {"refunded", "partial_refund", "partially_refunded"}:
+            payload["payment_status"] = "paid" if total > 0 and paid >= total else "partial"
+        payload.setdefault("shipping_cost", payload.get("shipping_total", "0"))
+    return payloads
+
+
 @router.get("/orders")
 @router.get("/api/orders")
 async def orders(
     request: Request,
     limit: int = Query(50, ge=1, le=1000),
     scope: str | None = None,
+    partnerId: str | None = None,
     user: User = Depends(current_user),
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
@@ -1704,7 +1833,8 @@ async def orders(
     if scope == "partner" and "partner" in roles and not roles.intersection({"admin", "manager", "finance", "logistics", "staff", "employee"}):
         rows = await merchant_order_list(session, partner_id=user.id, limit=limit)
         return {"data": rows} if request.url.path.startswith("/api/") else rows
-    rows = [_serialize_order(row) for row in await _visible_orders(session, user, roles, scope, limit)]
+    partner_uuid = _uuid(partnerId, "partnerId") if partnerId else None
+    rows = await _serialize_orders_with_financials(session, await _visible_orders(session, user, roles, scope, limit, partner_id=partner_uuid))
     return {"data": rows} if request.url.path.startswith("/api/") else rows
 
 
@@ -2296,7 +2426,7 @@ async def api_user_local_shopping_orders(
         .order_by(model.created_at.desc())
         .limit(500)
     )
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    return {"data": await serialize_local_shopping_requests(session, list(result.scalars()))}
 
 
 @router.get("/api/orders/international-shopping")

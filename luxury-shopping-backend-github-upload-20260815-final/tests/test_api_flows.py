@@ -160,6 +160,24 @@ async def test_postgresql_api_end_to_end() -> None:
         assert (await client.get("/wishlist", headers=customer_headers)).status_code == 200
         assert (await client.delete(f"/wishlist/{product_id}", headers=customer_headers)).status_code == 204
 
+        like = await client.put(
+            f"/api/engagement/products/{product_id}/like",
+            headers=customer_headers,
+            json={"liked": True},
+        )
+        assert like.status_code == 200 and like.json()["liked"] is True
+        liked_products = await client.get("/api/engagement/liked-products", headers=customer_headers)
+        assert liked_products.status_code == 200
+        liked_row = next(row for row in liked_products.json()["data"] if row["product_id"] == str(product_id))
+        assert liked_row["products"]["id"] == str(product_id)
+        assert liked_row["products"]["name"] == product.name
+        unliked = await client.put(
+            f"/api/engagement/products/{product_id}/like",
+            headers=customer_headers,
+            json={"liked": False},
+        )
+        assert unliked.status_code == 200 and unliked.json()["liked"] is False
+
         cart = await client.post(
             "/cart",
             headers=customer_headers,

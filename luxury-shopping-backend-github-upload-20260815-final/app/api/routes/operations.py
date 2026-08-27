@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials
@@ -27,7 +29,16 @@ from ...models import MODEL_BY_TABLE, RESOURCE_TABLES
 from ...models.domain import FileAsset, Order, OrderItem, Product, ProductVariant, Profile, User, UserRole
 from ...repositories.resources import ResourceRepository, serialize_record
 from ...security.tokens import decode_token
-from ...services.auth_service import account_security_for, auth_payload, bump_security_version, create_user, revoke_all_refresh_tokens, roles_for
+from ...services.auth_service import (
+    _canonical_role,
+    _roles_from_any,
+    account_security_for,
+    auth_payload,
+    bump_security_version,
+    create_user,
+    revoke_all_refresh_tokens,
+    roles_for,
+)
 from ...services.staff_permissions import require_staff_permission
 from ...services.store_review_compat import fetch_public_store_reviews, fetch_user_store_review
 from ...services.catalog_policy import (
@@ -57,6 +68,7 @@ from ...services.financial_calculator import (
     receipt_amount_for_order,
     refunded_total,
     request_hash,
+    serialize_local_shopping_requests,
     sync_order_payment_status,
 )
 from ...services.outbox_service import process_email_outbox, process_whatsapp_outbox
@@ -104,7 +116,7 @@ from ...services.report_admin_services import (
 from ...services.r2_migration import R2MigrationService
 from ...services.secure_backup import BackupCoordinator
 from ...storage import FileStorage, StoragePolicyRegistry
-from .commerce import _delete_product_file_assets
+from .commerce import _delete_product_file_assets, _serialize_orders_with_financials
 
 
 router = APIRouter(tags=["operations"])
@@ -717,6 +729,27 @@ async def sync_bootstrap(user: User = Depends(current_user), session: AsyncSessi
     return await BootstrapVisibilityService.bootstrap(session, user=user)
 
 
+def _site_content_payload(row: Any) -> dict[str, Any]:
+    """Expose site content using the contract consumed by the admin/storefront UI.
+
+    ``site_content`` is a compatibility table whose canonical columns are
+    ``name`` and ``body``.  The frontend contract uses ``key`` and
+    ``content``; image URLs and metadata live in ``extra_data``.
+    """
+    extra = dict(getattr(row, "extra_data", None) or {})
+    payload = serialize_record(row)
+    payload.update(
+        {
+            "key": str(getattr(row, "name", None) or extra.get("key") or ""),
+            "content": getattr(row, "body", None),
+            "image_url": extra.get("image_url") or extra.get("imageUrl"),
+            "metadata": extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {},
+        }
+    )
+    return payload
+
+
+@router.get("/api/content/site")
 @router.get("/content/site")
 async def public_site_content(session: AsyncSession = Depends(get_session)):
     return await public_read_cache.get_or_set(
@@ -726,7 +759,7 @@ async def public_site_content(session: AsyncSession = Depends(get_session)):
 
 
 async def _public_site_content_uncached(session: AsyncSession) -> dict[str, Any]:
-    return {"data": [serialize_record(row) for row in await _public_rows(session, "site_content")]}
+    return {"data": [_site_content_payload(row) for row in await _public_rows(session, "site_content")]}
 
 
 @router.get("/content/menus")
@@ -755,10 +788,10 @@ async def _public_social_links_uncached(session: AsyncSession) -> dict[str, Any]
 
 @router.get("/content/theme")
 async def public_theme_settings(session: AsyncSession = Depends(get_session)):
-    return await public_read_cache.get_or_set(
-        cache_key("content-theme"),
-        lambda: _public_theme_settings_uncached(session),
-    )
+    # Theme values are small and must reflect an admin publish immediately.
+    # Do not serve a process-local snapshot here; the API middleware also
+    # marks this response as no-store.
+    return await _public_theme_settings_uncached(session)
 
 
 async def _public_theme_settings_uncached(session: AsyncSession) -> dict[str, Any]:
@@ -788,7 +821,7 @@ async def _public_setting_uncached(setting_key: str, session: AsyncSession) -> d
     if row is None:
         return {"data": None}
     record = serialize_record(row)
-    return {"data": {"setting_key": setting_key, "setting_value": record.get("value") or record.get("extra_data") or record}}
+    return {"data": {"setting_key": setting_key, "setting_value": record.get("setting_value") or record.get("value") or record.get("extra_data") or record}}
 
 
 @router.get("/content/sections")
@@ -859,11 +892,15 @@ async def supplier_product_counts(session: AsyncSession = Depends(get_session)):
         .where(*public_product_clauses(Product))
         .group_by(Product.supplier_id, Product.partner_id)
     )
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = {"main-store": 0}
     for supplier_id, partner_id, count in result.all():
-        key = supplier_id or partner_id
-        if key:
-            counts[str(key)] = int(count)
+        safe_count = int(count or 0)
+        if supplier_id:
+            counts[str(supplier_id)] = counts.get(str(supplier_id), 0) + safe_count
+        if partner_id:
+            counts[str(partner_id)] = counts.get(str(partner_id), 0) + safe_count
+        if supplier_id is None and partner_id is None:
+            counts["main-store"] += safe_count
     return {"data": counts}
 
 
@@ -1553,7 +1590,10 @@ CONTENT_TABLES = {
     "social-links": "social_links",
     "theme": "theme_settings",
     "site": "site_settings",
-    "custom-elements": "page_sections",
+    # Custom elements have their own persistence table.  Sending them to
+    # page_sections made the dashboard appear to save successfully while the
+    # element could not be read back by the storefront.
+    "custom-elements": "custom_elements",
     "sections": "page_sections",
     "pages": "static_pages",
     "blog": "site_content",
@@ -1563,6 +1603,125 @@ CONTENT_TABLES = {
 
 
 PUBLIC_CONTENT_STATUSES = {"", "active", "published", "enabled", "visible", "live"}
+
+
+def _blog_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "0", "no", "off", "inactive", "disabled", "draft", "unpublished"}:
+            return False
+        if normalized in {"true", "1", "yes", "on", "active", "enabled", "published", "visible", "live"}:
+            return True
+    return bool(value)
+
+
+def _blog_article_is_published(row: dict[str, Any]) -> bool:
+    if "is_published" in row:
+        return _blog_bool(row.get("is_published"), default=False)
+    if row.get("is_active") is False:
+        return False
+    return str(row.get("status") or "").strip().lower() in PUBLIC_CONTENT_STATUSES
+
+
+def _blog_article_payload(value: Any) -> dict[str, Any]:
+    item = serialize_record(value) if hasattr(value, "__table__") else dict(value or {})
+    extra = dict(getattr(value, "extra_data", None) or {}) if hasattr(value, "__table__") else dict(item.get("extra_data") or {})
+
+    def first_text(*keys: str, default: str = "") -> str:
+        for key in keys:
+            candidate = item.get(key)
+            if candidate is None:
+                candidate = extra.get(key)
+            if str(candidate or "").strip():
+                return str(candidate).strip()
+        return default
+
+    published = _blog_article_is_published({**extra, **item})
+    published_at = item.get("published_at") or extra.get("published_at")
+    if published and not published_at:
+        published_at = item.get("created_at")
+    keywords = item.get("keywords")
+    if keywords is None:
+        keywords = extra.get("keywords")
+    if isinstance(keywords, str):
+        keywords = [word.strip() for word in keywords.split(",") if word.strip()]
+    if not isinstance(keywords, list):
+        keywords = []
+    try:
+        views_count = int(item.get("views_count") or extra.get("views_count") or 0)
+    except (TypeError, ValueError):
+        views_count = 0
+    return {
+        **item,
+        "title": first_text("title", "name", default="مقال بدون عنوان"),
+        "title_en": item.get("title_en") or extra.get("title_en"),
+        "slug": first_text("slug", default=str(item.get("id") or "")),
+        "excerpt": item.get("excerpt") if item.get("excerpt") is not None else extra.get("excerpt"),
+        "excerpt_en": item.get("excerpt_en") if item.get("excerpt_en") is not None else extra.get("excerpt_en"),
+        "content": item.get("content") or item.get("body") or extra.get("content") or "",
+        "content_en": item.get("content_en") or extra.get("content_en"),
+        "cover_image": item.get("cover_image") or item.get("image_url") or extra.get("cover_image"),
+        "meta_title": item.get("meta_title") or extra.get("meta_title"),
+        "meta_description": item.get("meta_description") or extra.get("meta_description"),
+        "keywords": keywords,
+        "category": first_text("category", default="general"),
+        "author_name": first_text("author_name", default="رفاهية التسوق"),
+        "is_published": published,
+        "is_featured": _blog_bool(item.get("is_featured") if item.get("is_featured") is not None else extra.get("is_featured")),
+        "views_count": views_count,
+        "published_at": published_at,
+        "created_by": item.get("created_by") or extra.get("created_by"),
+    }
+
+
+def _normalize_blog_body(body: Any, *, existing: Any = None, for_create: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="blog_payload_required")
+    model = MODEL_BY_TABLE["site_content"]
+    values: dict[str, Any] = {}
+    extra = dict(getattr(existing, "extra_data", None) or {}) if existing is not None else {}
+    for key, value in body.items():
+        if key in model.__table__.c and key not in {"id", "created_at", "updated_at", "deleted_at", "extra_data"}:
+            values[key] = _jsonable(value)
+        elif key not in {"content", "cover_image", "is_published", "published_at"}:
+            extra[key] = _jsonable(value)
+
+    title = _first_text(body.get("title"), body.get("name"))
+    if for_create or "title" in body or "name" in body:
+        if len(title) < 2:
+            raise HTTPException(status_code=422, detail="blog_title_required")
+        values["title"] = title
+    content = body.get("content") if "content" in body else body.get("body")
+    if content is not None:
+        values["body"] = str(content)
+        extra["content"] = str(content)
+    elif for_create:
+        raise HTTPException(status_code=422, detail="blog_content_required")
+    if "cover_image" in body:
+        extra["cover_image"] = _jsonable(body.get("cover_image"))
+
+    current_item = _blog_article_payload(existing) if existing is not None else {}
+    if "is_published" in body:
+        published = _blog_bool(body.get("is_published"))
+    elif for_create:
+        published = False
+    elif "status" in body:
+        published = str(body.get("status") or "").strip().lower() in PUBLIC_CONTENT_STATUSES
+    else:
+        published = _blog_bool(current_item.get("is_published"), default=False)
+    values["status"] = "published" if published else "draft"
+    extra["is_published"] = published
+    if "published_at" in body:
+        extra["published_at"] = _jsonable(body.get("published_at"))
+    elif published:
+        extra.setdefault("published_at", current_item.get("published_at") or datetime.now(timezone.utc).isoformat())
+    else:
+        extra["published_at"] = None
+    return values, extra
 
 
 async def public_optional_user(
@@ -1592,6 +1751,8 @@ def _public_content_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         status = str(row.get("status") or "").strip().lower()
         if status not in PUBLIC_CONTENT_STATUSES:
             continue
+        if "is_published" in row and not _blog_bool(row.get("is_published"), default=False):
+            continue
         public_rows.append(row)
     return public_rows
 
@@ -1602,8 +1763,11 @@ def _public_setting_payload(rows: list[dict[str, Any]], key: str) -> dict[str, A
         return {"data": None}
     value = match.get("value")
     if value is None:
-        value = match.get("extra_data") or {}
-    return {"data": {"setting_key": key, "setting_value": value, **match}}
+        value = match.get("extra_data")
+    if value is None:
+        metadata = {"id", "created_at", "updated_at", "deleted_at", "name", "key", "setting_key", "setting_value", "status", "is_active"}
+        value = {field: field_value for field, field_value in match.items() if field not in metadata}
+    return {"data": {**match, "setting_key": key, "setting_value": value}}
 
 
 @router.get("/api/catalog/currencies")
@@ -2122,9 +2286,90 @@ async def api_dashboard_marketer_stats(staff: User = Depends(require_staff), ses
 
 
 @router.get("/api/admin/partners/options")
+async def api_admin_partner_options(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    profile_model = MODEL_BY_TABLE["profiles"]
+    result = await session.execute(
+        select(storefront_model)
+        .where(storefront_model.deleted_at.is_(None), storefront_model.is_active.is_(True))
+        .order_by(storefront_model.name.asc(), storefront_model.created_at.desc())
+        .limit(1000)
+    )
+    storefronts = list(result.scalars())
+    partner_ids = {
+        value
+        for storefront in storefronts
+        for value in (getattr(storefront, "partner_id", None), getattr(storefront, "user_id", None))
+        if value
+    }
+    profiles: dict[uuid.UUID, Profile] = {}
+    if partner_ids:
+        profile_result = await session.execute(
+            select(profile_model).where(profile_model.user_id.in_(partner_ids))
+        )
+        profiles = {profile.user_id: profile for profile in profile_result.scalars()}
+    data = []
+    for storefront in storefronts:
+        partner_id = getattr(storefront, "partner_id", None) or getattr(storefront, "user_id", None)
+        if partner_id is None:
+            continue
+        profile = profiles.get(partner_id)
+        storefront_row = serialize_record(storefront)
+        profile_name = getattr(profile, "full_name", None) if profile else None
+        store_name = _first_text(
+            storefront_row.get("name"),
+            getattr(profile, "store_name", None) if profile else None,
+            profile_name,
+            storefront_row.get("email"),
+            default="متجر التاجر",
+        )
+        data.append({
+            **storefront_row,
+            "id": str(partner_id),
+            "user_id": str(partner_id),
+            "partner_id": str(partner_id),
+            "full_name": profile_name or store_name,
+            "store_name": store_name,
+            "email": storefront_row.get("email") or getattr(profile, "email", None),
+            "phone": storefront_row.get("phone") or getattr(profile, "phone", None),
+        })
+    return {"data": data}
+
+
 @router.get("/api/partnership/users/options")
-async def api_partner_user_options(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [{"id": str(row.id), "user_id": str(row.id), "email": row.email} for row in await _rows(session, "users", limit=500)]}
+async def api_partnership_user_options(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    partner_role_ids = select(UserRole.user_id).where(UserRole.role == "partner")
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    storefront_partner_ids = select(storefront_model.partner_id).where(
+        storefront_model.deleted_at.is_(None), storefront_model.partner_id.is_not(None)
+    )
+    storefront_user_ids = select(storefront_model.user_id).where(
+        storefront_model.deleted_at.is_(None), storefront_model.user_id.is_not(None)
+    )
+    result = await session.execute(
+        select(User, Profile)
+        .outerjoin(Profile, Profile.user_id == User.id)
+        .where(
+            User.deleted_at.is_(None),
+            User.is_active.is_(True),
+            User.id.not_in(partner_role_ids),
+            User.id.not_in(storefront_partner_ids),
+            User.id.not_in(storefront_user_ids),
+        )
+        .order_by(Profile.full_name.asc().nullslast(), User.email.asc())
+        .limit(1000)
+    )
+    data = []
+    for user, profile in result.all():
+        data.append({
+            "id": str(user.id),
+            "user_id": str(user.id),
+            "email": user.email,
+            "full_name": getattr(profile, "full_name", None) or user.email,
+            "phone": getattr(profile, "phone", None),
+            "city": getattr(profile, "city", None),
+        })
+    return {"data": data}
 
 
 @router.get("/api/admin/customers")
@@ -2245,7 +2490,78 @@ async def api_admin_contact_messages(staff: User = Depends(require_staff), sessi
 
 @router.get("/api/partnership/partners")
 async def api_partnership_partners(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "partner_storefronts", limit=500)]}
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    profile_model = MODEL_BY_TABLE["profiles"]
+    contract_model = MODEL_BY_TABLE["partner_contracts"]
+    product_model = MODEL_BY_TABLE["products"]
+    storefront_result = await session.execute(
+        select(storefront_model)
+        .where(storefront_model.deleted_at.is_(None))
+        .order_by(storefront_model.created_at.desc())
+        .limit(1000)
+    )
+    storefronts = list(storefront_result.scalars())
+    partner_ids = {
+        value
+        for storefront in storefronts
+        for value in (getattr(storefront, "partner_id", None), getattr(storefront, "user_id", None))
+        if value
+    }
+    if not partner_ids:
+        return {"data": []}
+    profile_result = await session.execute(
+        select(profile_model).where(profile_model.user_id.in_(partner_ids))
+    )
+    profiles = {profile.user_id: profile for profile in profile_result.scalars()}
+    count_result = await session.execute(
+        select(product_model.partner_id, func.count(product_model.id))
+        .where(product_model.partner_id.in_(partner_ids), product_model.deleted_at.is_(None))
+        .group_by(product_model.partner_id)
+    )
+    product_counts = {partner_id: int(count or 0) for partner_id, count in count_result.all()}
+    contract_result = await session.execute(
+        select(contract_model)
+        .where(contract_model.partner_id.in_(partner_ids), contract_model.deleted_at.is_(None))
+        .order_by(contract_model.updated_at.desc())
+    )
+    contracts = {}
+    for contract in contract_result.scalars():
+        contracts.setdefault(contract.partner_id, contract)
+    data = []
+    for storefront in storefronts:
+        partner_id = getattr(storefront, "partner_id", None) or getattr(storefront, "user_id", None)
+        if partner_id is None:
+            continue
+        row = serialize_record(storefront)
+        profile = profiles.get(partner_id)
+        contract = contracts.get(partner_id)
+        contract_extra = getattr(contract, "extra_data", {}) if contract else {}
+        if not isinstance(contract_extra, dict):
+            contract_extra = {}
+        name = _first_text(
+            getattr(profile, "full_name", None) if profile else None,
+            row.get("name"),
+            row.get("email"),
+            default="متجر التاجر",
+        )
+        rate = contract_extra.get("commissionRate", contract_extra.get("rate", 85))
+        data.append({
+            **row,
+            "id": str(partner_id),
+            "user_id": str(partner_id),
+            "partner_id": str(partner_id),
+            "name": name,
+            "full_name": name,
+            "store_name": row.get("name") or getattr(profile, "store_name", None) or name,
+            "email": row.get("email") or getattr(profile, "email", None),
+            "phone": row.get("phone") or getattr(profile, "phone", None) or "-",
+            "city": getattr(profile, "city", None) or "-",
+            "joinedAt": row.get("created_at"),
+            "productsCount": product_counts.get(partner_id, 0),
+            "commissionRate": rate,
+            "status": row.get("status") or ("active" if row.get("is_active") else "inactive"),
+        })
+    return {"data": data}
 
 
 @router.get("/api/partnership/applications")
@@ -2349,7 +2665,7 @@ async def api_user_local_shopping_requests(
     if not roles.intersection({"admin", "manager", "staff"}):
         statement = statement.where(model.user_id == user.id)
     result = await session.execute(statement.order_by(model.created_at.desc()).limit(500))
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    return {"data": await serialize_local_shopping_requests(session, list(result.scalars()))}
 
 
 @router.post("/api/shopping/local/requests", status_code=201)
@@ -2464,7 +2780,14 @@ async def api_create_international_shopping_order(
 
 @router.get("/api/admin-shopping/international-orders")
 async def api_admin_international_orders(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": {"orders": [serialize_record(row) for row in await _rows(session, "international_orders", limit=500)], "profiles": []}}
+    rows = await _rows(session, "international_orders", limit=500)
+    orders = await _international_order_payloads(session, rows)
+    profiles_by_id = {
+        str(profile["id"]): profile
+        for profile in (order.get("profiles") for order in orders)
+        if isinstance(profile, dict) and profile.get("id")
+    }
+    return {"data": {"orders": orders, "profiles": list(profiles_by_id.values())}}
 
 
 @router.get("/api/admin-shopping/purchases")
@@ -2474,17 +2797,85 @@ async def api_admin_purchases(staff: User = Depends(require_staff), session: Asy
 
 @router.get("/api/admin-shopping/purchases-unlinked-orders")
 async def api_admin_purchases_unlinked(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": []}
+    rows = [
+        row
+        for row in await _rows(session, "international_orders", limit=500)
+        if not _international_purchase_link_id(row)
+        and str(row.status or "").lower() in {"new", "pending", "reviewing"}
+    ]
+    return {"data": await _international_order_payloads(session, rows)}
+
+
+@router.get("/api/admin-shopping/purchases/{purchase_id}")
+async def api_admin_purchase_details(purchase_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    purchase_model = MODEL_BY_TABLE["international_purchases"]
+    purchase = await session.get(purchase_model, purchase_id)
+    if purchase is None or purchase.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="international_purchase_not_found")
+
+    order_rows = [
+        row
+        for row in await _rows(session, "international_orders", limit=500)
+        if _international_purchase_link_id(row) == str(purchase_id)
+    ]
+    orders = await _international_order_payloads(session, order_rows)
+    items: list[dict[str, Any]] = []
+    for order in orders:
+        order_items = order.get("items") if isinstance(order.get("items"), list) else []
+        for index, item in enumerate(order_items):
+            if not isinstance(item, dict):
+                continue
+            items.append(
+                {
+                    "id": f"{order.get('id')}-{index}",
+                    "profiles": order.get("profiles"),
+                    "order_id": order.get("id"),
+                    "product_name": item.get("product_name") or item.get("notes") or "منتج دولي",
+                    "product_url": item.get("product_url") or item.get("url"),
+                    "quantity": item.get("quantity") or 1,
+                    "size": item.get("size"),
+                    "unit_price": item.get("unit_price") or item.get("final_price") or item.get("estimated_price") or 0,
+                    "total_customer_cost": item.get("line_total") or item.get("subtotal") or item.get("total_customer_cost") or 0,
+                    "currency_code": item.get("currency_code") or item.get("item_currency_code") or order.get("currency_code"),
+                }
+            )
+    return {
+        "data": {
+            "purchase": serialize_record(purchase),
+            "orders": orders,
+            "items": items,
+        }
+    }
 
 
 @router.get("/api/admin-shopping/local-requests")
 async def api_admin_local_requests(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": {"requests": [serialize_record(row) for row in await _rows(session, "local_shopping_requests", limit=500)], "merchants": [serialize_record(row) for row in await _rows(session, "local_merchants", limit=500)]}}
+    requests = await _rows(session, "local_shopping_requests", limit=500)
+    return {"data": {
+        "requests": await serialize_local_shopping_requests(session, requests),
+        "merchants": [serialize_record(row) for row in await _rows(session, "local_merchants", limit=500)],
+    }}
 
 
 @router.get("/api/admin-shopping/order-links/international")
 async def api_admin_order_links(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": []}
+    international_rows = await _rows(session, "international_orders", limit=500)
+    local_rows = await _rows(session, "orders", limit=1000)
+    linked_by_international: dict[str, dict[str, Any]] = {}
+    for local_row in local_rows:
+        local_extra = dict(local_row.extra_data or {})
+        international_id = _first_text(
+            local_extra.get("linked_international_order_id"),
+            local_extra.get("linkedInternationalOrderId"),
+        )
+        if international_id:
+            linked_by_international.setdefault(international_id, serialize_record(local_row))
+    international_payloads = await _international_order_payloads(session, international_rows)
+    for payload in international_payloads:
+        linked_local = linked_by_international.get(str(payload.get("id")))
+        payload["linked_order_id"] = linked_local.get("id") if linked_local else None
+        payload["linked_local_order_id"] = linked_local.get("id") if linked_local else None
+    return {"data": international_payloads}
 
 
 @router.get("/api/loyalty/tiers")
@@ -2495,6 +2886,69 @@ async def api_loyalty_tiers(session: AsyncSession = Depends(get_session)):
 @router.get("/api/loyalty/settings")
 async def api_loyalty_settings(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return {"data": [serialize_record(row) for row in await _rows(session, "loyalty_settings", limit=50)]}
+
+
+INVENTORY_OUT_MOVEMENT_TYPES = frozenset({"out", "remove", "decrease"})
+
+
+def _inventory_reference_id(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
+def _inventory_quantity(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _enrich_inventory_payload(
+    payload: dict[str, Any],
+    products: dict[str, dict[str, Any]],
+    warehouses: dict[str, dict[str, Any]],
+    *,
+    movement: bool = False,
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    product_id = _inventory_reference_id(normalized, "product_id", "productId")
+    warehouse_id = _inventory_reference_id(normalized, "warehouse_id", "warehouseId")
+    if product_id:
+        normalized["product_id"] = product_id
+    if warehouse_id:
+        normalized["warehouse_id"] = warehouse_id
+    if product_id and product_id in products:
+        normalized["product"] = products[product_id]
+    if warehouse_id and warehouse_id in warehouses:
+        normalized["warehouse"] = warehouses[warehouse_id]
+    if movement:
+        movement_type = str(normalized.get("movement_type") or normalized.get("type") or "adjustment").strip().lower()
+        quantity = abs(_inventory_quantity(normalized.get("quantity")))
+        normalized["movement_type"] = movement_type
+        normalized["signed_quantity"] = -quantity if movement_type in INVENTORY_OUT_MOVEMENT_TYPES else quantity
+    else:
+        normalized["quantity"] = _inventory_quantity(normalized.get("quantity"))
+        if normalized.get("min_quantity") in (None, ""):
+            product = normalized.get("product") or {}
+            normalized["min_quantity"] = _inventory_quantity(product.get("min_stock_quantity"), 5) or 5
+    return normalized
+
+
+async def _inventory_reference_maps(session: AsyncSession) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    product_rows = await _rows(session, "products", limit=5000)
+    warehouse_rows = await _rows(session, "warehouses", limit=500)
+    products = {
+        str(row.id): serialize_record(row)
+        for row in product_rows
+    }
+    warehouses = {
+        str(row.id): serialize_record(row)
+        for row in warehouse_rows
+    }
+    return products, warehouses
 
 
 @router.get("/api/admin/inventory/warehouses")
@@ -2508,13 +2962,49 @@ async def api_inventory_products(staff: User = Depends(require_staff), session: 
 
 
 @router.get("/api/admin/inventory/locations")
-async def api_inventory_locations(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "inventory_locations", limit=500)]}
+async def api_inventory_locations(
+    warehouse_id: str | None = Query(default=None, alias="warehouseId"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    location_payloads = [serialize_record(row) for row in await _rows(session, "inventory_locations", limit=500)]
+    if warehouse_id:
+        location_payloads = [
+            payload
+            for payload in location_payloads
+            if _inventory_reference_id(payload, "warehouse_id", "warehouseId") == warehouse_id
+        ]
+    if not location_payloads and not warehouse_id:
+        location_payloads = [serialize_record(row) for row in await _rows(session, "inventory", limit=500)]
+    products, warehouses = await _inventory_reference_maps(session)
+    return {
+        "data": [
+            _enrich_inventory_payload(payload, products, warehouses)
+            for payload in location_payloads
+        ]
+    }
 
 
 @router.get("/api/admin/inventory/movements")
-async def api_inventory_movements(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=500)]}
+async def api_inventory_movements(
+    warehouse_id: str | None = Query(default=None, alias="warehouseId"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    movement_payloads = [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=500)]
+    if warehouse_id:
+        movement_payloads = [
+            payload
+            for payload in movement_payloads
+            if _inventory_reference_id(payload, "warehouse_id", "warehouseId") == warehouse_id
+        ]
+    products, warehouses = await _inventory_reference_maps(session)
+    return {
+        "data": [
+            _enrich_inventory_payload(payload, products, warehouses, movement=True)
+            for payload in movement_payloads
+        ]
+    }
 
 
 @router.post("/api/admin/inventory/movements", status_code=201)
@@ -2573,17 +3063,87 @@ async def api_delete_color_option(record_id: uuid.UUID, request: Request, staff:
 
 @router.get("/api/catalog/admin/options/sizes")
 async def api_size_options(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "size_options", limit=500)]}
+    return {"data": [_serialize_size_option(row) for row in await _rows(session, "size_options", limit=500)]}
+
+
+def _size_option_values(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = []
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = str(value or "").strip()
+        if cleaned and cleaned not in seen:
+            result.append(cleaned)
+            seen.add(cleaned)
+    return result
+
+
+def _normalize_size_option_body(body: dict[str, Any], *, partial: bool = False) -> dict[str, Any]:
+    values = dict(body)
+    category = values.get("category_type") or values.get("category_id") or values.get("category")
+    if category is not None:
+        category = str(category).strip()
+        if not category:
+            raise HTTPException(status_code=422, detail={"code": "size_category_required", "message": "يجب اختيار فئة المقاسات"})
+        values["category_type"] = category
+        values.setdefault("name", category)
+        values.setdefault("code", category)
+    if "sizes" in values:
+        sizes = _size_option_values(values.get("sizes"))
+        if not sizes:
+            raise HTTPException(status_code=422, detail={"code": "size_values_required", "message": "أدخل مقاسًا واحدًا على الأقل"})
+        values["sizes"] = sizes
+    elif not partial:
+        raise HTTPException(status_code=422, detail={"code": "size_values_required", "message": "أدخل مقاسًا واحدًا على الأقل"})
+    if not partial:
+        values.setdefault("status", "active")
+        values.setdefault("is_active", True)
+    return values
+
+
+def _serialize_size_option(row: Any) -> dict[str, Any]:
+    payload = serialize_record(row)
+    return _serialize_size_option_payload(payload)
+
+
+def _serialize_size_option_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(payload)
+    category = (
+        payload.get("category_type")
+        or payload.get("category_id")
+        or payload.get("category")
+        or payload.get("name")
+        or payload.get("code")
+        or ""
+    )
+    sizes = _size_option_values(
+        payload.get("sizes")
+        or payload.get("size_values")
+        or payload.get("values")
+        or payload.get("options")
+    )
+    payload["category_type"] = str(category).strip()
+    payload["sizes"] = sizes
+    return payload
 
 
 @router.post("/api/catalog/admin/options/sizes", status_code=201)
 async def api_create_size_option(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("size_options", request, session, staff)
+    row = await _api_create(session, "size_options", _normalize_size_option_body(await request.json()), staff)
+    await session.commit()
+    return {"data": _serialize_size_option_payload(row)}
 
 
 @router.patch("/api/catalog/admin/options/sizes/{record_id}")
 async def api_update_size_option(record_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("size_options", request, session, staff, record_id, "update")
+    row = await _api_update(session, "size_options", record_id, _normalize_size_option_body(await request.json(), partial=True), staff)
+    await session.commit()
+    return {"data": _serialize_size_option_payload(row)}
 
 
 @router.delete("/api/catalog/admin/options/sizes/{record_id}")
@@ -2747,14 +3307,85 @@ async def api_list_employee_payments(staff: User = Depends(require_staff), sessi
     return {"data": [serialize_record(row) for row in await _rows(session, "employee_payments", limit=500)]}
 
 
+def _general_expense_payload(value: Any) -> dict[str, Any]:
+    payload = serialize_record(value) if hasattr(value, "__table__") else dict(value or {})
+    category = str(
+        payload.get("expense_category")
+        or payload.get("category")
+        or payload.get("type")
+        or "other"
+    ).strip()[:64] or "other"
+    payload["expense_category"] = category
+    payload.setdefault("currency_code", "YER")
+    payload.setdefault(
+        "expense_date",
+        payload.get("created_at") or datetime.now(timezone.utc).isoformat(),
+    )
+    payload.setdefault("description", "")
+    payload["is_recurring"] = bool(payload.get("is_recurring", False))
+    if not payload.get("voucher_number"):
+        payload["voucher_number"] = f"EXP-{str(payload.get('id') or uuid.uuid4())[:8].upper()}"
+    return payload
+
+
 @router.get("/api/finance/expenses")
-async def api_list_expenses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "general_expenses", limit=500)]}
+async def api_list_expenses(
+    category: str | None = Query(None),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    model = MODEL_BY_TABLE["general_expenses"]
+    statement = select(model).where(model.deleted_at.is_(None)).order_by(model.created_at.desc()).limit(500)
+    normalized_category = str(category or "").strip()
+    if normalized_category and "type" in model.__table__.c:
+        statement = statement.where(
+            or_(
+                model.type == normalized_category,
+                model.extra_data["expense_category"].astext == normalized_category,
+            )
+        )
+    result = await session.execute(statement)
+    return {"data": [_general_expense_payload(row) for row in result.scalars()]}
+
+
+def _financial_voucher_payload(value: Any) -> dict[str, Any]:
+    payload = serialize_record(value) if hasattr(value, "__table__") else dict(value or {})
+    extra_data = payload.get("extra_data")
+    if isinstance(extra_data, dict):
+        payload = {**extra_data, **payload}
+    raw_type = str(payload.get("voucher_type") or payload.get("type") or "receipt").strip().lower()
+    voucher_type = raw_type if raw_type in {"receipt", "payment"} else "receipt"
+    payload["voucher_type"] = voucher_type
+    payload["type"] = voucher_type
+    payload.setdefault("currency_code", "YER")
+    payload.setdefault("issued_date", payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+    if not payload.get("voucher_number"):
+        prefix = "RV" if voucher_type == "receipt" else "PV"
+        date_part = str(payload.get("issued_date") or datetime.now(timezone.utc).isoformat())[:10].replace("-", "")
+        payload["voucher_number"] = f"{prefix}-{date_part}-{str(payload.get('id') or uuid.uuid4())[:8].upper()}"
+    return payload
 
 
 @router.get("/api/finance/vouchers")
-async def api_list_vouchers(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "financial_vouchers", limit=500)]}
+async def api_list_vouchers(
+    voucher_type: str | None = Query(None, alias="type"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    normalized_type = str(voucher_type or "").strip().lower()
+    if normalized_type and normalized_type not in {"receipt", "payment"}:
+        raise HTTPException(status_code=422, detail="invalid_voucher_type")
+    model = MODEL_BY_TABLE["financial_vouchers"]
+    clauses = ()
+    if normalized_type:
+        clauses = (
+            or_(
+                model.type == normalized_type,
+                model.extra_data["voucher_type"].astext == normalized_type,
+            ),
+        )
+    rows = await _rows(session, "financial_vouchers", clauses=clauses, limit=500)
+    return {"data": [_financial_voucher_payload(row) for row in rows]}
 
 
 @router.get("/support/tickets")
@@ -2790,15 +3421,34 @@ async def api_admin_notification_recipients(target: str = "all", staff: User = D
         .where(User.is_active.is_(True), User.deleted_at.is_(None))
         .limit(500)
     )
+    rows = None
+    role_map: dict[uuid.UUID, set[str]] = {}
     if normalized in {"customers", "customer", "with_orders"}:
-        statement = statement.where(
-            User.id.in_(select(UserRole.user_id).where(UserRole.role == "customer"))
-        )
+        # Customer accounts created through the current flow have a customer
+        # row in user_roles. Older/imported accounts can instead keep the role
+        # in profile fields, so resolve both representations consistently.
+        result = await session.execute(statement)
+        rows = result.all()
+        user_ids = [user_row.id for user_row, _ in rows]
+        if user_ids:
+            role_result = await session.execute(
+                select(UserRole.user_id, UserRole.role).where(UserRole.user_id.in_(user_ids))
+            )
+            for user_id, role in role_result.all():
+                normalized_role = _canonical_role(role)
+                if normalized_role:
+                    role_map.setdefault(user_id, set()).add(normalized_role)
+        rows = [
+            (user_row, profile_row)
+            for user_row, profile_row in rows
+            if _notification_recipient_is_customer(profile_row, role_map.get(user_row.id, set()))
+        ]
     elif normalized in {"admins", "admin", "staff"}:
         statement = statement.where(
             User.id.in_(select(UserRole.user_id).where(UserRole.role.in_(("admin", "manager", "staff", "employee"))))
         )
-    rows = (await session.execute(statement)).all()
+    if rows is None:
+        rows = (await session.execute(statement)).all()
     return {
         "data": [
             {
@@ -2813,24 +3463,62 @@ async def api_admin_notification_recipients(target: str = "all", staff: User = D
     }
 
 
+def _marketer_payload(value: Any) -> dict[str, Any]:
+    item = serialize_record(value) if hasattr(value, "__table__") else dict(value or {})
+    extra = dict(getattr(value, "extra_data", None) or {}) if hasattr(value, "__table__") else dict(item.get("extra_data") or {})
+    return {
+        **item,
+        "email": extra.get("email") or item.get("email") or "",
+        "referral_code": extra.get("referral_code") or item.get("referral_code") or item.get("code") or "",
+        "commission_rate": float(extra.get("commission_rate") or item.get("commission_rate") or 0),
+        "total_sales": float(extra.get("total_sales") or item.get("total_sales") or 0),
+        "total_commission": float(extra.get("total_commission") or item.get("total_commission") or 0),
+        "pending_commission": float(extra.get("pending_commission") or item.get("pending_commission") or 0),
+        "is_active": bool(extra.get("is_active", item.get("is_active", item.get("status") != "inactive"))),
+        "notes": extra.get("notes") or item.get("notes") or "",
+    }
+
+
+def _normalize_marketer_body(body: Any, *, for_create: bool = False) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="marketer_payload_required")
+    values = dict(body)
+    name = _first_text(values.get("name"), values.get("full_name"))
+    if for_create or "name" in values or "full_name" in values:
+        if not name or len(name) < 2:
+            raise HTTPException(status_code=422, detail="marketer_name_required")
+        values["name"] = name
+        values.pop("full_name", None)
+    raw_user_id = values.get("user_id") or values.get("userId")
+    if raw_user_id is not None:
+        values["user_id"] = _uuid(raw_user_id, "user_id")
+        values.pop("userId", None)
+    elif for_create:
+        raise HTTPException(status_code=422, detail="marketer_user_required")
+    if for_create:
+        values.setdefault("status", "active")
+        if not _first_text(values.get("referral_code"), values.get("referralCode")):
+            values["referral_code"] = f"MKT-{uuid.uuid4().hex[:10].upper()}"
+    if "referralCode" in values and "referral_code" not in values:
+        values["referral_code"] = values.pop("referralCode")
+    if "commission_rate" in values or "commissionRate" in values:
+        raw_rate = values.get("commission_rate", values.get("commissionRate"))
+        try:
+            rate = float(raw_rate)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid_commission_rate") from exc
+        if not 0 <= rate <= 100:
+            raise HTTPException(status_code=422, detail="invalid_commission_rate")
+        values["commission_rate"] = rate
+        values.pop("commissionRate", None)
+    if "is_active" in values:
+        values["status"] = "active" if bool(values["is_active"]) else "inactive"
+    return values
+
+
 @router.get("/api/marketing/marketers")
 async def api_marketers(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    data = []
-    for row in await _rows(session, "marketers", limit=500):
-        item = serialize_record(row)
-        extra = item.get("extra_data") or {}
-        data.append({
-            **item,
-            "email": extra.get("email") or item.get("email") or "",
-            "referral_code": extra.get("referral_code") or item.get("code") or "",
-            "commission_rate": float(extra.get("commission_rate") or 0),
-            "total_sales": float(extra.get("total_sales") or 0),
-            "total_commission": float(extra.get("total_commission") or 0),
-            "pending_commission": float(extra.get("pending_commission") or 0),
-            "is_active": item.get("status") != "inactive",
-            "notes": extra.get("notes") or "",
-        })
-    return {"data": data}
+    return {"data": [_marketer_payload(row) for row in await _rows(session, "marketers", limit=500)]}
 
 
 @router.get("/api/marketing/commissions")
@@ -2852,7 +3540,8 @@ async def api_marketer_commissions(staff: User = Depends(require_staff), session
 
 @router.get("/api/finance/orders")
 async def api_finance_orders(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "orders", limit=500)]}
+    rows = await _rows(session, "orders", limit=500)
+    return {"data": await _serialize_orders_with_financials(session, rows)}
 
 
 @router.get("/api/finance/partner-settlements")
@@ -2867,15 +3556,55 @@ async def api_pending_marketer_commissions(staff: User = Depends(require_staff),
 
 
 @router.get("/api/finance/summary")
-async def api_finance_summary(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    revenue = await RevenueRecognitionService.summary(session)
+async def api_finance_summary(
+    date_from: str | None = Query(None, alias="dateFrom"),
+    date_to: str | None = Query(None, alias="dateTo"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    revenue = await RevenueRecognitionService.summary(session, start=date_from, end=date_to)
+    expense_tables = ("general_expenses", "employee_payments", "partner_payments", "marketer_payments")
+    total_expenses = sum(
+        (await _sum_amount(session, table) for table in expense_tables),
+        Decimal("0"),
+    )
+    month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    monthly_income = Decimal(
+        (await RevenueRecognitionService.summary(session, start=month_start))["net_revenue"]
+    )
+    monthly_expenses = sum(
+        (
+            await _sum_amount(
+                session,
+                table,
+                MODEL_BY_TABLE[table].created_at >= month_start,
+            )
+            for table in expense_tables
+        ),
+        Decimal("0"),
+    )
+    pending_receipt_statuses = ("pending", "uploaded", "reviewing")
+    pending_payments = await _sum_amount(
+        session,
+        "payment_receipts",
+        MODEL_BY_TABLE["payment_receipts"].status.in_(pending_receipt_statuses),
+    )
+    net_income = Decimal(revenue["net_revenue"])
     return {
         "data": {
-            "orders": float(Decimal(revenue["net_revenue"])),
+            # The legacy keys remain available to existing admin screens.
+            "orders": float(net_income),
             "recognized_revenue": revenue,
             "payments": float(Decimal(revenue["paid_amount"])),
             "refunds": float(Decimal(revenue["refund_amount"])),
-            "expenses": float(await _sum_amount(session, "general_expenses")),
+            "expenses": float(total_expenses),
+            # These are the stable dashboard contract consumed by the web UI.
+            "totalIncome": float(net_income),
+            "totalExpenses": float(total_expenses),
+            "netBalance": float(net_income - total_expenses),
+            "pendingPayments": float(pending_payments),
+            "monthlyIncome": float(monthly_income),
+            "monthlyExpenses": float(monthly_expenses),
         }
     }
 
@@ -2884,7 +3613,24 @@ async def api_finance_summary(staff: User = Depends(require_staff), session: Asy
 async def api_finance_today_stats(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     revenue = await RevenueRecognitionService.summary(session, start=today)
-    return {"data": {"orders": [], "collected": float(Decimal(revenue["paid_amount"])), "recognized_revenue": revenue}}
+    order_model = MODEL_BY_TABLE["orders"]
+    statement = (
+        select(order_model)
+        .where(order_model.deleted_at.is_(None), order_model.created_at >= today)
+        .order_by(order_model.created_at.desc())
+        .limit(500)
+    )
+    orders = await _serialize_orders_with_financials(
+        session,
+        list((await session.execute(statement)).scalars()),
+    )
+    return {
+        "data": {
+            "orders": orders,
+            "collected": float(Decimal(revenue["paid_amount"])),
+            "recognized_revenue": revenue,
+        }
+    }
 
 
 @router.get("/api/finance/marketer-payments")
@@ -3068,13 +3814,18 @@ async def api_supplier_product_counts(session: AsyncSession = Depends(get_sessio
     product_model = MODEL_BY_TABLE["products"]
     counts: dict[str, int] = {"main-store": 0}
     result = await session.execute(
-        select(product_model.partner_id, func.count(product_model.id))
+        select(product_model.supplier_id, product_model.partner_id, func.count(product_model.id))
         .where(*public_product_clauses(product_model))
-        .group_by(product_model.partner_id)
+        .group_by(product_model.supplier_id, product_model.partner_id)
     )
-    for partner_id, count in result.all():
-        key = str(partner_id) if partner_id else "main-store"
-        counts[key] = int(count or 0)
+    for supplier_id, partner_id, count in result.all():
+        safe_count = int(count or 0)
+        if supplier_id:
+            counts[str(supplier_id)] = counts.get(str(supplier_id), 0) + safe_count
+        if partner_id:
+            counts[str(partner_id)] = counts.get(str(partner_id), 0) + safe_count
+        if supplier_id is None and partner_id is None:
+            counts["main-store"] += safe_count
     return {"data": counts}
 
 
@@ -3181,6 +3932,237 @@ def _public_product_review_filters(product_id: uuid.UUID):
     return review_model, columns, clauses
 
 
+REVIEW_APPROVED_STATUSES = ("approved", "active", "published", "visible", "live", "accepted", "approve", "accept")
+REVIEW_ORDER_STATUSES = ("delivered", "completed", "received")
+MAX_REVIEW_IMAGES = 5
+MAX_REVIEW_COMMENT_LENGTH = 1000
+
+
+def _normalize_store_review_status_payload(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid_review_status_payload")
+    values = dict(body)
+    if "is_approved" in values or "is_rejected" in values:
+        approved = values.get("is_approved") is True or str(values.get("is_approved") or "").strip().lower() in {"true", "1", "yes"}
+        rejected = values.get("is_rejected") is True or str(values.get("is_rejected") or "").strip().lower() in {"true", "1", "yes"}
+        values["status"] = "rejected" if rejected else "approved" if approved else "pending"
+    return values
+
+
+def _review_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
+def _normalize_review_images(value: Any, request: Request | None = None) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise HTTPException(status_code=422, detail="review_images_must_be_a_list")
+    if len(value) > MAX_REVIEW_IMAGES:
+        raise HTTPException(status_code=422, detail="review_images_limit_exceeded")
+
+    settings = get_settings()
+    allowed_origins = {
+        str(settings.api_base_url).rstrip("/").lower(),
+        str(settings.r2_public_base_url).rstrip("/").lower(),
+    }
+    if request is not None:
+        allowed_origins.add(str(request.base_url).rstrip("/").lower())
+
+    normalized: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str):
+            raise HTTPException(status_code=422, detail="invalid_review_image")
+        candidate = raw.strip()
+        if not candidate or len(candidate) > 1000:
+            raise HTTPException(status_code=422, detail="invalid_review_image")
+        if candidate.lower().startswith(("data:", "blob:", "file:", "javascript:")):
+            raise HTTPException(status_code=422, detail="invalid_review_image")
+        if candidate.startswith("uploads/"):
+            candidate = f"/{candidate}"
+        if candidate.startswith("/uploads/"):
+            if not FileStorage.is_public_relative_path(candidate[len("/uploads/") :]):
+                raise HTTPException(status_code=422, detail="invalid_review_image")
+        elif candidate.startswith("http://") or candidate.startswith("https://"):
+            parsed = urlparse(candidate)
+            origin = f"{parsed.scheme}://{parsed.netloc}".lower()
+            is_allowed_api_url = origin in allowed_origins and parsed.path.startswith("/uploads/")
+            is_allowed_r2_url = (
+                bool(str(settings.r2_public_base_url).strip())
+                and origin == str(settings.r2_public_base_url).rstrip("/").lower()
+            )
+            if not (is_allowed_api_url or is_allowed_r2_url) or parsed.query or parsed.fragment:
+                raise HTTPException(status_code=422, detail="invalid_review_image")
+        else:
+            raise HTTPException(status_code=422, detail="invalid_review_image")
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
+def _notification_recipient_is_customer(profile: Profile | None, explicit_roles: set[str]) -> bool:
+    """Use the same customer role fallback as authentication for legacy accounts."""
+    if explicit_roles:
+        return "customer" in explicit_roles
+    if profile is None:
+        return False
+    profile_roles = _roles_from_any(profile.classification)
+    profile_roles.update(_roles_from_any(profile.extra_data))
+    return "customer" in profile_roles
+
+
+def _review_input_values(body: Any, request: Request) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="review_payload_must_be_an_object")
+    raw_rating = body.get("rating")
+    if isinstance(raw_rating, bool):
+        raise HTTPException(status_code=422, detail="rating_must_be_between_1_and_5")
+    try:
+        rating = int(raw_rating)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="rating_must_be_between_1_and_5")
+    if rating < 1 or rating > 5:
+        raise HTTPException(status_code=422, detail="rating_must_be_between_1_and_5")
+    comment = _review_text(body.get("comment", body.get("body", "")))
+    if len(comment) > MAX_REVIEW_COMMENT_LENGTH:
+        raise HTTPException(status_code=422, detail="review_comment_limit_exceeded")
+    images = _normalize_review_images(body.get("review_images", body.get("reviewImages", [])), request)
+    return {"rating": rating, "comment": comment, "review_images": images}
+
+
+async def _public_review_product(session: AsyncSession, product_id: uuid.UUID) -> Product:
+    result = await session.execute(
+        select(Product).where(Product.id == product_id, *public_product_clauses(Product))
+    )
+    return validate_public_product_or_404(result.scalar_one_or_none())
+
+
+async def _eligible_review_order_id(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    product_id: uuid.UUID,
+) -> uuid.UUID | None:
+    result = await session.execute(
+        select(Order.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(
+            Order.user_id == user_id,
+            OrderItem.product_id == product_id,
+            Order.deleted_at.is_(None),
+            func.lower(func.coalesce(Order.payment_status, "")) == "paid",
+            func.lower(func.coalesce(Order.status, "")).in_(REVIEW_ORDER_STATUSES),
+        )
+        .order_by(Order.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _review_eligibility(
+    session: AsyncSession,
+    *,
+    user: User,
+    product_id: uuid.UUID,
+) -> dict[str, Any]:
+    await _public_review_product(session, product_id)
+    review_model, columns, _ = _public_product_review_filters(product_id)
+    existing_id = (
+        await session.execute(
+            select(review_model.id)
+            .where(
+                columns.user_id == user.id,
+                columns.product_id == product_id,
+                columns.deleted_at.is_(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing_id:
+        return {
+            "can_review": False,
+            "reason": "already_reviewed",
+            "message": "لديك تقييم سابق لهذا المنتج.",
+            "order_id": None,
+            "review_id": str(existing_id),
+            "has_review": True,
+        }
+
+    eligible_order_id = await _eligible_review_order_id(
+        session, user_id=user.id, product_id=product_id
+    )
+    if eligible_order_id:
+        return {
+            "can_review": True,
+            "reason": "eligible",
+            "message": "يمكنك الآن تقييم المنتج بعد استلام طلبك.",
+            "order_id": str(eligible_order_id),
+            "eligible_order_id": str(eligible_order_id),
+            "has_review": False,
+        }
+
+    any_order = (
+        await session.execute(
+            select(Order.id)
+            .join(OrderItem, OrderItem.order_id == Order.id)
+            .where(
+                Order.user_id == user.id,
+                OrderItem.product_id == product_id,
+                Order.deleted_at.is_(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if any_order:
+        return {
+            "can_review": False,
+            "reason": "not_delivered",
+            "message": "سيظهر التقييم بعد دفع الطلب واستلامه.",
+            "order_id": None,
+            "has_review": False,
+        }
+    return {
+        "can_review": False,
+        "reason": "not_purchased",
+        "message": "يمكنك تقييم المنتج بعد شرائه واستلامه.",
+        "order_id": None,
+        "has_review": False,
+    }
+
+
+async def _product_review_response(session: AsyncSession, row: Any) -> dict[str, Any]:
+    raw = serialize_record(row)
+    status = str(raw.get("status") or "").lower()
+    profile = (
+        await session.execute(
+            select(Profile)
+            .where(Profile.user_id == getattr(row, "user_id", None), Profile.deleted_at.is_(None))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    stored_images = getattr(row, "review_images", None)
+    images = [item for item in stored_images if isinstance(item, str)] if isinstance(stored_images, list) else []
+    return {
+        "id": str(row.id),
+        "product_id": str(row.product_id),
+        "rating": int(getattr(row, "rating", 0) or 0),
+        "comment": _review_text(getattr(row, "comment", None) or getattr(row, "body", None)) or None,
+        "review_images": images,
+        "is_approved": bool(getattr(row, "is_approved", None)) or status in REVIEW_APPROVED_STATUSES,
+        "is_verified_purchase": bool(getattr(row, "is_verified_purchase", False)),
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("updated_at"),
+        "reviewer_name": getattr(profile, "full_name", None) or "عميل",
+        "reviewer_avatar_url": getattr(profile, "avatar_url", None),
+    }
+
+
 @router.get("/api/reviews/products/{product_id}")
 async def api_public_product_reviews(
     product_id: uuid.UUID,
@@ -3192,7 +4174,7 @@ async def api_public_product_reviews(
     if "created_at" in columns:
         statement = statement.order_by(columns.created_at.desc())
     result = await session.execute(statement.limit(limit))
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    return {"data": [await _product_review_response(session, row) for row in result.scalars()]}
 
 
 @router.get("/api/reviews/products/{product_id}/stats")
@@ -3219,6 +4201,132 @@ async def api_public_product_review_stats(product_id: uuid.UUID, session: AsyncS
     return {"average": round(float(average or 0), 2), "count": int(count or 0), "distribution": distribution}
 
 
+@router.get("/api/reviews/products/{product_id}/eligibility")
+async def api_product_review_eligibility(
+    product_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _review_eligibility(session, user=user, product_id=product_id)
+
+
+@router.get("/api/reviews/products/{product_id}/mine")
+async def api_my_product_review(
+    product_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    await _public_review_product(session, product_id)
+    review_model, columns, _ = _public_product_review_filters(product_id)
+    result = await session.execute(
+        select(review_model)
+        .where(
+            columns.product_id == product_id,
+            columns.user_id == user.id,
+            columns.deleted_at.is_(None),
+        )
+        .order_by(columns.created_at.desc())
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    return {"data": await _product_review_response(session, row) if row else None}
+
+
+@router.post("/api/reviews/products/{product_id}", status_code=201)
+async def api_create_product_review(
+    product_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    await _public_review_product(session, product_id)
+    values = _review_input_values(await request.json(), request)
+    eligibility = await _review_eligibility(session, user=user, product_id=product_id)
+    if not eligibility["can_review"]:
+        raise HTTPException(status_code=403, detail=eligibility["reason"])
+
+    review_model = MODEL_BY_TABLE["product_reviews"]
+    row = review_model(
+        user_id=user.id,
+        product_id=product_id,
+        order_id=uuid.UUID(str(eligibility["order_id"])),
+        status="pending",
+        title="Product review",
+        body=values["comment"],
+        rating=values["rating"],
+        comment=values["comment"],
+        review_images=values["review_images"],
+        is_verified_purchase=True,
+        is_approved=False,
+        extra_data={},
+    )
+    session.add(row)
+    await session.flush()
+    await session.refresh(row)
+    payload = await _product_review_response(session, row)
+    await session.commit()
+    return {"data": payload}
+
+
+@router.patch("/api/reviews/{review_id}")
+async def api_update_product_review(
+    review_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    review_model = MODEL_BY_TABLE["product_reviews"]
+    columns = review_model.__table__.c
+    result = await session.execute(
+        select(review_model).where(
+            columns.id == review_id,
+            columns.user_id == user.id,
+            columns.deleted_at.is_(None),
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="review_not_found")
+    values = _review_input_values(await request.json(), request)
+    row.rating = values["rating"]
+    row.comment = values["comment"]
+    row.body = values["comment"]
+    row.review_images = values["review_images"]
+    row.status = "pending"
+    row.is_approved = False
+    await session.flush()
+    await session.refresh(row)
+    payload = await _product_review_response(session, row)
+    await session.commit()
+    return {"data": payload}
+
+
+@router.delete("/api/reviews/{review_id}")
+async def api_delete_product_review(
+    review_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    review_model = MODEL_BY_TABLE["product_reviews"]
+    columns = review_model.__table__.c
+    result = await session.execute(
+        select(review_model).where(
+            columns.id == review_id,
+            columns.user_id == user.id,
+            columns.deleted_at.is_(None),
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="review_not_found")
+    product_id = str(row.product_id)
+    review_images = list(getattr(row, "review_images", None) or [])
+    row.deleted_at = datetime.now(timezone.utc)
+    row.status = "deleted"
+    await session.commit()
+    return {"data": {"deleted": True, "product_id": product_id, "review_images": review_images}}
+
+
 @router.post("/api/reviews/store", status_code=201)
 async def api_create_store_review(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     body = await request.json()
@@ -3229,7 +4337,10 @@ async def api_create_store_review(request: Request, user: User = Depends(current
 
 @router.patch("/api/reviews/store/{review_id}/status")
 async def api_update_store_review_status(review_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("store_reviews", request, session, staff, review_id, "update")
+    body = _normalize_store_review_status_payload(await request.json())
+    row = await _api_update(session, "store_reviews", review_id, body, staff)
+    await session.commit()
+    return {"data": row}
 
 
 @router.delete("/api/reviews/store/{review_id}")
@@ -3237,8 +4348,120 @@ async def api_delete_store_review(review_id: uuid.UUID, request: Request, staff:
     return await _create_update_delete_resource("store_reviews", request, session, staff, review_id, "delete")
 
 
-@router.post("/api/partnership/applications", status_code=201)
 @router.post("/api/partnership/apply", status_code=201)
+async def api_public_create_partner_application(
+    request: Request,
+    user: User | None = Depends(optional_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Accept the public merchant application form.
+
+    The management endpoint below remains staff-only.  Keeping this public
+    submission route separate prevents a storefront customer from being
+    evaluated by the staff authorization dependency.
+    """
+    body = await request.json()
+    business_name = str(body.get("businessName") or body.get("name") or "").strip()
+    email = str(body.get("email") or "").strip().lower()
+    phone_digits = re.sub(r"\D", "", str(body.get("phone") or ""))
+    phone = phone_digits[3:] if phone_digits.startswith("967") and len(phone_digits) == 12 else phone_digits
+    business_type = str(body.get("businessType") or "").strip()
+    description = str(body.get("description") or "").strip()
+
+    if len(business_name) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "partner_business_name_invalid", "message": "اسم النشاط التجاري يجب أن يكون حرفين على الأقل."},
+        )
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "partner_email_invalid", "message": "يرجى إدخال بريد إلكتروني صحيح."},
+        )
+    if not re.fullmatch(r"7\d{8}", phone):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "partner_phone_invalid", "message": "رقم الهاتف اليمني يجب أن يكون 9 أرقام ويبدأ بالرقم 7."},
+        )
+
+    application_model = MODEL_BY_TABLE["partner_applications"]
+    duplicate_matchers = [
+        func.lower(application_model.email) == email,
+        application_model.phone == phone,
+    ]
+    if user is not None:
+        duplicate_matchers.append(application_model.user_id == user.id)
+    duplicate_clauses = [
+        application_model.deleted_at.is_(None),
+        application_model.status.in_(["pending", "reviewing", "approved"]),
+        or_(*duplicate_matchers),
+    ]
+    duplicate = (
+        await session.execute(
+            select(application_model)
+            .where(*duplicate_clauses)
+            .order_by(application_model.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if duplicate is not None:
+        duplicate_email = str(getattr(duplicate, "email", "") or "").strip().lower() == email
+        duplicate_phone = str(getattr(duplicate, "phone", "") or "").strip() == phone
+        if user is not None and getattr(duplicate, "user_id", None) == user.id:
+            code = "partner_application_exists"
+            message = "لديك طلب تسجيل كتاجر قيد المراجعة أو تم اعتماده مسبقًا."
+        elif duplicate_email:
+            code = "partner_application_email_exists"
+            message = "يوجد طلب مرتبط بهذا البريد الإلكتروني مسبقًا."
+        elif duplicate_phone:
+            code = "partner_application_phone_exists"
+            message = "يوجد طلب مرتبط برقم الهاتف هذا مسبقًا."
+        else:
+            code = "partner_application_exists"
+            message = "يوجد طلب تاجر مشابه قيد المراجعة مسبقًا."
+        raise HTTPException(status_code=409, detail={"code": code, "message": message})
+
+    application_user = user
+    if application_user is None:
+        existing_user = (
+            await session.execute(select(User).where(func.lower(User.email) == email))
+        ).scalar_one_or_none()
+        if existing_user is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "partner_application_login_required",
+                    "message": "هذا البريد مسجل مسبقًا. سجل الدخول ثم أرسل طلب الانضمام كتاجر.",
+                },
+            )
+        application_user = await create_user(
+            session,
+            email=email,
+            password=f"Partner-{uuid.uuid4()}-9A",
+            full_name=business_name,
+            phone=phone,
+            city=body.get("city"),
+            role="customer",
+        )
+
+    row = await _create_resource_row(
+        session,
+        "partner_applications",
+        {
+            "user_id": application_user.id,
+            "name": business_name,
+            "email": email,
+            "phone": phone,
+            "status": "pending",
+            "description": description,
+            "business_type": business_type or None,
+        },
+    )
+    await session.commit()
+    return {"data": row}
+
+
+@router.post("/api/partnership/applications", status_code=201)
 async def api_create_partner_application(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
     user_id = body.get("user_id") or body.get("userId")
@@ -3302,13 +4525,173 @@ async def api_approve_partner_application(application_id: uuid.UUID, request: Re
     }
 
 
+def _partner_rate(value: Any, default: int = 85) -> int | float:
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="invalid_commission_rate")
+    if not 0 <= rate <= 100:
+        raise HTTPException(status_code=422, detail="invalid_commission_rate")
+    return int(rate) if rate.is_integer() else rate
+
+
+async def _ensure_partner_account(
+    session: AsyncSession,
+    body: dict[str, Any],
+    staff: User,
+    request: Request,
+) -> tuple[User, Profile, Any, Any, bool]:
+    raw_user_id = body.get("userId") or body.get("user_id") or body.get("partner_id")
+    created = False
+    if raw_user_id:
+        try:
+            user_id = uuid.UUID(str(raw_user_id))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_partner_user")
+        partner_user = await session.get(User, user_id, with_for_update=True)
+        if partner_user is None or partner_user.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="partner_user_not_found")
+    else:
+        email = _first_text(body.get("email")).lower()
+        password = str(body.get("password") or "")
+        full_name = _first_text(body.get("fullName"), body.get("full_name"), body.get("name"))
+        if not email:
+            raise HTTPException(status_code=422, detail="partner_email_required")
+        if not full_name:
+            raise HTTPException(status_code=422, detail="partner_name_required")
+        if not password:
+            raise HTTPException(status_code=422, detail="partner_password_required")
+        partner_user = await create_user(
+            session,
+            email=email,
+            password=password,
+            full_name=full_name,
+            phone=_first_text(body.get("phone")) or None,
+            city=_first_text(body.get("city")) or None,
+            extra_data={
+                key: value
+                for key, value in {
+                    "address": body.get("address"),
+                    "governorate": body.get("governorate"),
+                    "notes": body.get("notes"),
+                }.items()
+                if value not in (None, "")
+            },
+            role="customer",
+        )
+        created = True
+
+    security = await account_security_for(session, partner_user.id, for_update=True)
+    was_inactive = not bool(partner_user.is_active) or security.account_status != "active"
+    partner_user.is_active = True
+    security.account_status = "active"
+    security.disabled_at = None
+    if was_inactive:
+        await bump_security_version(session, partner_user, reason="partner_account_enabled", request=request)
+
+    role = await session.get(UserRole, {"user_id": partner_user.id, "role": "partner"})
+    if role is None:
+        session.add(UserRole(user_id=partner_user.id, role="partner"))
+
+    profile_result = await session.execute(
+        select(Profile).where(Profile.user_id == partner_user.id).with_for_update()
+    )
+    profile = profile_result.scalars().first()
+    if profile is None:
+        profile = Profile(
+            id=partner_user.id,
+            user_id=partner_user.id,
+            email=partner_user.email,
+            full_name=_first_text(body.get("fullName"), body.get("full_name"), body.get("name"), default="تاجر"),
+            phone=_first_text(body.get("phone")) or None,
+            city=_first_text(body.get("city")) or None,
+            extra_data={},
+        )
+        session.add(profile)
+    profile.deleted_at = None
+    profile.email = profile.email or partner_user.email
+    profile.full_name = profile.full_name or _first_text(body.get("fullName"), body.get("full_name"), body.get("name"), default="تاجر")
+    profile.phone = profile.phone or _first_text(body.get("phone")) or None
+    profile.city = profile.city or _first_text(body.get("city")) or None
+    profile_extra = dict(profile.extra_data or {})
+    for key in ("address", "governorate", "notes"):
+        if body.get(key) not in (None, ""):
+            profile_extra[key] = _jsonable(body[key])
+    profile.extra_data = profile_extra
+
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    storefront_result = await session.execute(
+        select(storefront_model)
+        .where(or_(storefront_model.user_id == partner_user.id, storefront_model.partner_id == partner_user.id))
+        .order_by(storefront_model.created_at.asc())
+        .with_for_update()
+    )
+    storefront = storefront_result.scalars().first()
+    if storefront is None:
+        storefront = storefront_model(
+            user_id=partner_user.id,
+            partner_id=partner_user.id,
+            name=_first_text(body.get("storeName"), body.get("store_name"), body.get("fullName"), body.get("name"), profile.full_name, default="متجر التاجر"),
+            email=partner_user.email,
+            phone=profile.phone,
+            status="active",
+            is_active=True,
+        )
+        session.add(storefront)
+    else:
+        storefront.user_id = storefront.user_id or partner_user.id
+        storefront.partner_id = storefront.partner_id or partner_user.id
+        storefront.name = storefront.name or _first_text(body.get("storeName"), body.get("store_name"), profile.full_name, default="متجر التاجر")
+        storefront.email = storefront.email or partner_user.email
+        storefront.phone = storefront.phone or profile.phone
+        storefront.status = "active"
+        storefront.is_active = True
+
+    contract_model = MODEL_BY_TABLE["partner_contracts"]
+    contract_result = await session.execute(
+        select(contract_model)
+        .where(contract_model.partner_id == partner_user.id, contract_model.deleted_at.is_(None))
+        .order_by(contract_model.created_at.asc())
+        .with_for_update()
+    )
+    contract = contract_result.scalars().first()
+    if contract is None:
+        contract = contract_model(partner_id=partner_user.id, status="active", is_active=True, extra_data={})
+        session.add(contract)
+    rate = _partner_rate(body.get("commissionRate", body.get("commission_rate", body.get("rate"))))
+    contract.status = "active"
+    contract.is_active = True
+    contract.extra_data = {
+        **(contract.extra_data or {}),
+        "rate": rate,
+        "commissionRate": rate,
+        **({"notes": _jsonable(body["notes"])} if body.get("notes") not in (None, "") else {}),
+    }
+    await session.flush()
+    return partner_user, profile, storefront, contract, created
+
+
 @router.post("/api/partnership/partners", status_code=201)
 async def api_create_partner_contract(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
-    user_id = uuid.UUID(str(body.get("userId") or body.get("user_id") or body.get("partner_id")))
-    row = await _api_create(session, "partner_contracts", {"partner_id": user_id, "status": "active", "is_active": True, **body}, staff)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="partner_payload_required")
+    partner_user, profile, storefront, contract, created = await _ensure_partner_account(session, body, staff, request)
     await session.commit()
-    return {"data": row}
+    return {
+        "data": {
+            "id": str(partner_user.id),
+            "userId": str(partner_user.id),
+            "partnerId": str(partner_user.id),
+            "created": created,
+            "name": profile.full_name or storefront.name,
+            "email": partner_user.email,
+            "storefront": serialize_record(storefront),
+            "contract": serialize_record(contract),
+        }
+    }
 
 
 @router.patch("/api/partnership/partners/{partner_id}/commission")
@@ -3336,12 +4719,22 @@ async def api_delete_partner_contract(partner_id: uuid.UUID, staff: User = Depen
 
 @router.post("/api/marketing/marketers", status_code=201)
 async def api_create_marketer(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("marketers", request, session, staff)
+    body = _normalize_marketer_body(await request.json(), for_create=True)
+    if await session.get(User, body["user_id"]) is None:
+        raise HTTPException(status_code=404, detail="marketer_user_not_found")
+    row = await _api_create(session, "marketers", body, staff)
+    await session.commit()
+    return {"data": _marketer_payload(row)}
 
 
 @router.patch("/api/marketing/marketers/{marketer_id}")
 async def api_update_marketer(marketer_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("marketers", request, session, staff, marketer_id, "update")
+    body = _normalize_marketer_body(await request.json())
+    if "user_id" in body and await session.get(User, body["user_id"]) is None:
+        raise HTTPException(status_code=404, detail="marketer_user_not_found")
+    row = await _api_update(session, "marketers", marketer_id, body, staff)
+    await session.commit()
+    return {"data": _marketer_payload(row)}
 
 
 @router.delete("/api/marketing/marketers/{marketer_id}")
@@ -3472,10 +4865,57 @@ async def api_resolve_operational_alert(alert_id: uuid.UUID, request: Request, s
     return await _create_update_delete_resource("operational_alerts", request, session, staff, alert_id, "update")
 
 
+def _international_purchase_link_id(row: Any) -> str | None:
+    extra = dict(getattr(row, "extra_data", None) or {}) if not isinstance(row, dict) else row
+    value = _first_text(extra.get("purchase_id"), extra.get("purchaseId"))
+    return value or None
+
+
+async def _international_order_payloads(session: AsyncSession, rows: list[Any]) -> list[dict[str, Any]]:
+    payloads = [serialize_record(row) for row in rows]
+    user_ids = {row.user_id for row in rows if getattr(row, "user_id", None) is not None}
+    profiles_by_user: dict[str, dict[str, Any]] = {}
+    if user_ids:
+        profile_result = await session.execute(
+            select(Profile).where(Profile.user_id.in_(user_ids), Profile.deleted_at.is_(None))
+        )
+        profiles_by_user = {
+            str(profile.user_id): serialize_record(profile)
+            for profile in profile_result.scalars()
+        }
+    for row, payload in zip(rows, payloads):
+        profile = profiles_by_user.get(str(row.user_id)) if getattr(row, "user_id", None) else None
+        payload["profiles"] = profile
+        linked_purchase_id = _international_purchase_link_id(row)
+        if linked_purchase_id:
+            payload["purchase_id"] = linked_purchase_id
+            payload["purchaseId"] = linked_purchase_id
+    return payloads
+
+
 @router.post("/api/admin-shopping/purchases", status_code=201)
 async def api_create_international_purchase(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
-    row = await _api_create(session, "international_purchases", {"user_id": staff.id, "status": body.get("status") or "draft", "amount": body.get("amount") or 0, "description": body.get("notes") or body.get("source_url") or "", **body}, staff)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="purchase_payload_required")
+    source_site = _first_text(body.get("source_site"), body.get("sourceSite"))
+    if not source_site:
+        raise HTTPException(status_code=422, detail="source_site_required")
+    purchase_number = _first_text(
+        body.get("purchase_number"),
+        body.get("purchaseNumber"),
+        default=f"PUR-{uuid.uuid4().hex[:8].upper()}",
+    )
+    payload = {
+        **body,
+        "user_id": staff.id,
+        "status": body.get("status") or "draft",
+        "amount": body.get("amount") or 0,
+        "description": body.get("notes") or body.get("source_url") or source_site,
+        "purchase_number": purchase_number,
+        "source_site": source_site,
+    }
+    row = await _api_create(session, "international_purchases", payload, staff)
     await session.commit()
     return {"data": row}
 
@@ -3488,9 +4928,28 @@ async def api_update_international_purchase_status(purchase_id: uuid.UUID, reque
 @router.get("/api/admin-shopping/international-orders/{order_id}/context")
 async def api_international_order_context(order_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     row = await session.get(MODEL_BY_TABLE["international_orders"], order_id)
-    if row is None:
+    if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="international_order_not_found")
-    return {"data": serialize_record(row)}
+    profile_result = await session.execute(
+        select(Profile)
+        .where(Profile.user_id == row.user_id, Profile.deleted_at.is_(None))
+        .limit(1)
+    )
+    payload = serialize_record(row)
+    linked_purchase_id = _international_purchase_link_id(row)
+    if linked_purchase_id:
+        payload["purchase_id"] = linked_purchase_id
+        payload["purchaseId"] = linked_purchase_id
+    profile = profile_result.scalar_one_or_none()
+    payload["customerProfile"] = serialize_record(profile) if profile is not None else None
+    purchases = await _rows(session, "international_purchases", limit=500)
+    purchase_payloads = [serialize_record(purchase) for purchase in purchases]
+    payload["availablePurchases"] = purchase_payloads
+    payload["linkedPurchase"] = next(
+        (purchase for purchase in purchase_payloads if str(purchase.get("id")) == linked_purchase_id),
+        None,
+    )
+    return {"data": payload}
 
 
 @router.patch("/api/admin-shopping/international-orders/{order_id}/status")
@@ -3501,7 +4960,194 @@ async def api_patch_international_order(order_id: uuid.UUID, request: Request, s
 
 @router.post("/api/admin-shopping/international-orders/{order_id}/pricing")
 async def api_price_international_order(order_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("international_orders", request, session, staff, order_id, "update")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="pricing_payload_required")
+
+    model = MODEL_BY_TABLE["international_orders"]
+    row = await session.get(model, order_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="international_order_not_found")
+    if row.user_id is None:
+        raise HTTPException(status_code=422, detail="international_order_customer_required")
+
+    raw_item_prices = body.get("itemPrices")
+    if raw_item_prices is None:
+        raw_item_prices = body.get("item_prices")
+    if not isinstance(raw_item_prices, list) or not raw_item_prices:
+        raise HTTPException(status_code=422, detail="item_prices_required")
+
+    normalized_item_prices: list[dict[str, Any]] = []
+    items_total = Decimal("0")
+    for raw_item in raw_item_prices:
+        if not isinstance(raw_item, dict):
+            raise HTTPException(status_code=422, detail="invalid_item_price")
+        price = _money_from_payload(raw_item.get("price", raw_item.get("unit_price", raw_item.get("final_price"))))
+        try:
+            quantity = int(raw_item.get("quantity") or 1)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_quantity")
+        if quantity < 1 or quantity > 1000:
+            raise HTTPException(status_code=422, detail="invalid_quantity")
+        normalized_item_prices.append({"price": format(price, "f"), "quantity": quantity})
+        items_total += price * quantity
+
+    shipping_cost = _money_from_payload(body.get("shippingCost", body.get("shipping_cost", 0)))
+    service_fee = _money_from_payload(body.get("serviceFee", body.get("service_fee", 0)))
+    customs_cost = _money_from_payload(body.get("customsCost", body.get("customs_cost", 0)))
+    grand_total = items_total + shipping_cost + service_fee + customs_cost
+    if grand_total <= 0:
+        raise HTTPException(status_code=422, detail="pricing_total_required")
+
+    currency_code = _first_text(
+        body.get("currencyCode"),
+        body.get("currency_code"),
+        (row.extra_data or {}).get("currency_code"),
+        default="YER",
+    ).upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{2,8}", currency_code):
+        raise HTTPException(status_code=422, detail="invalid_currency_code")
+
+    extra = dict(row.extra_data or {})
+    existing_items = extra.get("items")
+    updated_items = existing_items
+    if isinstance(existing_items, list):
+        updated_items = []
+        for index, existing_item in enumerate(existing_items):
+            if not isinstance(existing_item, dict):
+                updated_items.append(existing_item)
+                continue
+            updated_item = dict(existing_item)
+            if index < len(normalized_item_prices):
+                item_price = Decimal(normalized_item_prices[index]["price"])
+                item_quantity = normalized_item_prices[index]["quantity"]
+                item_total = item_price * item_quantity
+                updated_item.update(
+                    {
+                        "quantity": item_quantity,
+                        "unit_price": format(item_price, "f"),
+                        "final_price": format(item_price, "f"),
+                        "subtotal": format(item_total, "f"),
+                        "line_total": format(item_total, "f"),
+                    }
+                )
+            updated_items.append(updated_item)
+
+    pricing_updated_at = datetime.now(timezone.utc)
+    current_status = str(row.status or "").lower()
+    if current_status not in {"confirmed", "processing", "processed", "shipping", "shipped", "delivering", "delivered", "cancelled"}:
+        row.status = "reviewing"
+    row.amount = grand_total
+    extra.update(
+        {
+            "items": _jsonable(updated_items),
+            "item_prices": _jsonable(normalized_item_prices),
+            "itemPrices": _jsonable(normalized_item_prices),
+            "shipping_cost": format(shipping_cost, "f"),
+            "shippingCost": format(shipping_cost, "f"),
+            "service_fee": format(service_fee, "f"),
+            "serviceFee": format(service_fee, "f"),
+            "customs_cost": format(customs_cost, "f"),
+            "customsCost": format(customs_cost, "f"),
+            "currency_code": currency_code,
+            "currencyCode": currency_code,
+            "final_cost": format(grand_total, "f"),
+            "pricing_updated_at": pricing_updated_at.isoformat(),
+            "pricing_updated_by": str(staff.id),
+        }
+    )
+    row.extra_data = extra
+
+    custom_message = _first_text(body.get("message"), body.get("notificationMessage"), body.get("notification_message"))
+    notification_message = custom_message or (
+        f"تم تحديث تسعير طلب الشراء الدولي إلى {format(grand_total, 'f')} {currency_code}. "
+        "يرجى مراجعة الطلب وتأكيده للمتابعة."
+    )
+    if custom_message and f"{format(grand_total, 'f')} {currency_code}" not in custom_message:
+        notification_message = f"{custom_message}\n\nالإجمالي الجديد: {format(grand_total, 'f')} {currency_code}"
+
+    notification_created = False
+    if row.user_id:
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=row.user_id,
+                title="تم تحديث تسعير طلبك الدولي",
+                body=notification_message,
+                notification_type="order_update",
+                category="order",
+                priority="high",
+                action_type="open_order",
+                action_url=f"/my-orders?highlight={order_id}",
+                entity_type="international_orders",
+                entity_id=str(order_id),
+                order_id=order_id,
+                payload={
+                    "orderId": str(order_id),
+                    "status": row.status,
+                    "finalCost": float(grand_total),
+                    "currencyCode": currency_code,
+                },
+                created_by=staff.id,
+                deduplication_key=f"international-order-pricing:{order_id}:{pricing_updated_at.isoformat()}",
+            )
+        )
+        notification_created = True
+
+    event_payload = {
+        "orderId": str(order_id),
+        "status": row.status,
+        "finalCost": float(grand_total),
+        "estimatedCost": float(grand_total),
+        "currencyCode": currency_code,
+    }
+    await _record_and_publish_realtime(
+        session,
+        channel=f"user:{row.user_id}",
+        event="international-order.status_changed",
+        payload=event_payload,
+        dedupe_key=f"international-order.status_changed:{order_id}:{pricing_updated_at.isoformat()}",
+        user_id=row.user_id,
+    )
+
+    notify_by_whatsapp = bool(body.get("notifyByWhatsApp", body.get("notify_by_whatsapp", False)))
+    whatsapp_queued = False
+    whatsapp_phone = _first_text(body.get("customerPhone"), body.get("customer_phone"), (extra.get("phone")))
+    if notify_by_whatsapp:
+        profile_result = await session.execute(
+            select(Profile)
+            .where(Profile.user_id == row.user_id, Profile.deleted_at.is_(None))
+            .limit(1)
+        )
+        profile = profile_result.scalar_one_or_none()
+        whatsapp_phone = _first_text(whatsapp_phone, getattr(profile, "phone", None))
+        if whatsapp_phone:
+            whatsapp_model = MODEL_BY_TABLE["whatsapp_outbox"]
+            session.add(
+                whatsapp_model(
+                    user_id=row.user_id,
+                    title="تحديث تسعير طلبك الدولي",
+                    status="queued",
+                    phone=whatsapp_phone,
+                    message=notification_message,
+                    extra_data={
+                        "order_id": str(order_id),
+                        "category": "order",
+                        "template": "international_order_pricing",
+                        "pricing_updated_at": pricing_updated_at.isoformat(),
+                    },
+                )
+            )
+            whatsapp_queued = True
+
+    await session.commit()
+    return {
+        "data": serialize_record(row),
+        "notification": {
+            "in_app": notification_created,
+            "whatsapp_queued": whatsapp_queued,
+            "whatsapp_phone_available": bool(whatsapp_phone),
+        },
+    }
 
 
 @router.post("/api/admin-shopping/international-orders/{order_id}/payment-status")
@@ -3520,7 +5166,31 @@ async def api_international_order_payment_status(order_id: uuid.UUID, request: R
 
 @router.post("/api/admin-shopping/international-orders/{order_id}/link-purchase")
 async def api_link_international_purchase(order_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("international_orders", request, session, staff, order_id, "update")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="purchase_link_payload_required")
+    purchase_id = _uuid(body.get("purchaseId") or body.get("purchase_id"), "purchaseId")
+    purchase_model = MODEL_BY_TABLE["international_purchases"]
+    purchase = await session.get(purchase_model, purchase_id)
+    if purchase is None or purchase.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="international_purchase_not_found")
+
+    model = MODEL_BY_TABLE["international_orders"]
+    row = await session.get(model, order_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="international_order_not_found")
+    current_purchase_id = _international_purchase_link_id(row)
+    if current_purchase_id and current_purchase_id != str(purchase_id):
+        raise HTTPException(status_code=409, detail="ORDER_ALREADY_LINKED_TO_PURCHASE")
+    extra = dict(row.extra_data or {})
+    extra["purchase_id"] = str(purchase_id)
+    extra["purchaseId"] = str(purchase_id)
+    row.extra_data = extra
+    await session.commit()
+    payload = serialize_record(row)
+    payload["purchase_id"] = str(purchase_id)
+    payload["purchaseId"] = str(purchase_id)
+    return {"data": payload}
 
 
 @router.delete("/api/admin-shopping/international-orders/{order_id}/link-purchase")
@@ -3540,15 +5210,45 @@ async def api_unlink_international_purchase(order_id: uuid.UUID, request: Reques
 @router.post("/api/admin-shopping/order-links")
 async def api_link_local_international_order(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
-    order_id = uuid.UUID(str(body.get("localOrderId") or body.get("local_order_id")))
-    intl_id = str(body.get("internationalOrderId") or body.get("international_order_id"))
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="order_link_payload_required")
+    order_id = _uuid(body.get("localOrderId") or body.get("local_order_id"), "localOrderId")
+    intl_uuid = _uuid(body.get("internationalOrderId") or body.get("international_order_id"), "internationalOrderId")
+    intl_id = str(intl_uuid)
     model = MODEL_BY_TABLE["orders"]
     row = await session.get(model, order_id)
-    if row is None:
+    if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="order_not_found")
-    row.extra_data = {**(row.extra_data or {}), "linked_international_order_id": intl_id}
+    international_model = MODEL_BY_TABLE["international_orders"]
+    international_order = await session.get(international_model, intl_uuid)
+    if international_order is None or international_order.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="international_order_not_found")
+
+    local_extra = dict(row.extra_data or {})
+    existing_local_link = _first_text(
+        local_extra.get("linked_international_order_id"),
+        local_extra.get("linkedInternationalOrderId"),
+    )
+    if existing_local_link and existing_local_link != intl_id:
+        raise HTTPException(status_code=409, detail="LOCAL_ALREADY_LINKED")
+    for linked_row in await _rows(session, "orders", limit=1000):
+        if linked_row.id == row.id:
+            continue
+        linked_extra = dict(linked_row.extra_data or {})
+        linked_id = _first_text(
+            linked_extra.get("linked_international_order_id"),
+            linked_extra.get("linkedInternationalOrderId"),
+        )
+        if linked_id == intl_id:
+            raise HTTPException(status_code=409, detail="INTERNATIONAL_ALREADY_LINKED")
+
+    row.extra_data = {
+        **local_extra,
+        "linked_international_order_id": intl_id,
+        "linkedInternationalOrderId": intl_id,
+    }
     await session.commit()
-    return {"data": serialize_record(row)}
+    return {"data": {"local_order": serialize_record(row), "international_order": serialize_record(international_order)}}
 
 
 @router.delete("/api/admin-shopping/order-links/{order_id}")
@@ -3781,7 +5481,7 @@ async def api_create_international_expense(order_id: uuid.UUID, request: Request
     body = await request.json()
     row = await _api_create(session, "general_expenses", {"amount": body.get("amount") or 0, "type": body.get("category") or "international", "description": body.get("description") or "", "status": "pending", "international_order_id": str(order_id), **body}, staff)
     await session.commit()
-    return {"data": row}
+    return {"data": _general_expense_payload(row)}
 
 
 @router.patch("/api/finance/international-order-expenses/{expense_id}")
@@ -3794,25 +5494,90 @@ async def api_delete_international_expense(expense_id: uuid.UUID, request: Reque
     return await _create_update_delete_resource("general_expenses", request, session, staff, expense_id, "delete")
 
 
-@router.post("/api/admin-data/import/products", status_code=201)
+@router.post("/api/admin-data/import/products")
 async def api_import_products(request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     await require_staff_permission(session, staff.id, roles, "products.import")
     body = await request.json()
-    products = body.get("products") or []
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail={"code": "import_payload_required", "message": "بيانات الاستيراد مطلوبة."})
+    products = body.get("products") or body.get("data") or []
+    if not isinstance(products, list) or not products:
+        raise HTTPException(status_code=422, detail={"code": "import_products_required", "message": "الملف يجب أن يحتوي على قائمة منتجات."})
     product_model = MODEL_BY_TABLE["products"]
     success = 0
     failed = 0
-    for item in products:
-        name = str(item.get("name") or "").strip()
-        existing = await _rows(session, "products", clauses=(product_model.name == name,), limit=1)
-        if existing:
+    errors: list[str] = []
+    for index, item in enumerate(products[:5000], start=1):
+        savepoint = await session.begin_nested()
+        try:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=422, detail="بيانات المنتج غير صحيحة")
+            values = _normalize_catalog_mutation_input(dict(item))
+            for field in ("id", "short_code", "created_at", "updated_at", "deleted_at", "approved_by", "approved_at"):
+                values.pop(field, None)
+            for field in ("is_active", "is_featured", "track_inventory"):
+                if isinstance(values.get(field), str):
+                    values[field] = values[field].strip().lower() not in {"false", "0", "no", "inactive"}
+            for field in ("price", "original_price"):
+                if values.get(field) == "":
+                    values[field] = "0" if field == "price" else None
+            for field in ("stock_quantity", "min_stock_quantity"):
+                if values.get(field) == "":
+                    values.pop(field, None)
+            for field in ("images", "tags"):
+                if isinstance(values.get(field), str):
+                    raw = values[field].strip()
+                    if not raw:
+                        values[field] = []
+                    else:
+                        try:
+                            parsed = json.loads(raw)
+                        except json.JSONDecodeError:
+                            parsed = [raw]
+                        values[field] = parsed if isinstance(parsed, list) else [parsed]
+            for field in ("category_id", "brand_id", "supplier_id", "partner_id"):
+                if values.get(field) in (None, ""):
+                    values[field] = None
+                else:
+                    values[field] = _uuid(values[field], field)
+            values.setdefault("approval_status", "approved")
+            values = normalize_product_mutation_values(values, partial=False)
+            values.setdefault("is_active", True)
+            if str(values.get("approval_status") or "").lower() in {"approved", "active", "published"}:
+                values.setdefault("approved_by", staff.id)
+                values.setdefault("approved_at", datetime.now(timezone.utc))
+            name = str(values["name"]).strip()
+            duplicate_clauses = [func.lower(product_model.name) == name.lower()]
+            if values.get("sku"):
+                duplicate_clauses.append(product_model.sku == values["sku"])
+            existing = await _rows(
+                session,
+                "products",
+                clauses=(or_(*duplicate_clauses),),
+                limit=1,
+            )
+            if existing:
+                raise HTTPException(status_code=409, detail="المنتج موجود مسبقاً بالاسم أو الرمز.")
+            await _create_resource_row(session, "products", values)
+            await savepoint.commit()
+            success += 1
+        except Exception as exc:
+            await savepoint.rollback()
             failed += 1
-            continue
-        await _api_create(session, "products", item, staff)
-        success += 1
+            if isinstance(exc, HTTPException):
+                detail = exc.detail
+                if isinstance(detail, dict):
+                    message = str(detail.get("message") or detail.get("code") or "بيانات غير صحيحة")
+                else:
+                    message = str(detail)
+            else:
+                message = "تعذر حفظ المنتج؛ تحقق من المراجع والقيم المكررة."
+            errors.append(f"السطر {index}: {message}")
     await session.commit()
-    status = 201 if success else 422
-    return JSONResponse(status_code=status, content={"data": {"success": success, "failed": failed}})
+    return JSONResponse(
+        status_code=200,
+        content={"data": {"success": success, "failed": failed, "errors": errors[:200], "truncated": len(products) > 5000}},
+    )
 
 
 @router.post("/api/analytics/events", status_code=201)
@@ -3851,7 +5616,28 @@ async def api_liked_products(user: User = Depends(current_user), session: AsyncS
     model = MODEL_BY_TABLE["product_likes"]
     try:
         result = await session.execute(select(model).where(model.user_id == user.id).order_by(model.created_at.desc()))
-        return {"data": [serialize_record(row) for row in result.scalars()]}
+        likes = list(result.scalars())
+        product_ids = [like.product_id for like in likes if like.product_id]
+        products_by_id: dict[uuid.UUID, dict[str, Any]] = {}
+        if product_ids:
+            product_result = await session.execute(select(Product).where(Product.id.in_(product_ids)))
+            product_rows = await build_public_product_rows(
+                session,
+                list(product_result.scalars()),
+                include_variants=True,
+            )
+            products_by_id = {uuid.UUID(str(row["id"])): row for row in product_rows if row.get("id")}
+        return {
+            "data": [
+                {
+                    **serialize_record(like),
+                    # Match the relation shape the wishlist page consumes while
+                    # keeping saved likes for products that are no longer public.
+                    "products": products_by_id.get(like.product_id),
+                }
+                for like in likes
+            ]
+        }
     except Exception:
         await session.rollback()
         return {"data": []}
@@ -3859,6 +5645,12 @@ async def api_liked_products(user: User = Depends(current_user), session: AsyncS
 
 @router.put("/api/engagement/products/{product_id}/like")
 async def api_set_product_like(product_id: uuid.UUID, request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    product = (
+        await session.execute(
+            select(Product).where(Product.id == product_id, *public_product_clauses(Product))
+        )
+    ).scalar_one_or_none()
+    validate_public_product_or_404(product)
     model = MODEL_BY_TABLE["product_likes"]
     body = await request.json()
     liked = bool(body.get("liked", True))
@@ -3950,7 +5742,36 @@ def _normalize_catalog_mutation_input(body: dict[str, Any]) -> dict[str, Any]:
 async def api_admin_create_product(request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     await require_staff_permission(session, staff.id, roles, "products.create")
     body = await request.json()
-    product_body = _normalize_catalog_mutation_input(dict(body.get("product") or body))
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail={"code": "product_payload_required", "message": "بيانات المنتج مطلوبة."})
+    product_payload = dict(body.get("product") or body)
+    variants_payload = body.get("variants")
+    if variants_payload is None:
+        variants_payload = product_payload.pop("variants", [])
+    else:
+        product_payload.pop("variants", None)
+    if not isinstance(variants_payload, list):
+        raise HTTPException(status_code=422, detail={"code": "invalid_variants", "message": "صيغة خيارات المنتج غير صحيحة."})
+    product_body = _normalize_catalog_mutation_input(product_payload)
+    if product_body.get("partner_id") not in (None, ""):
+        partner_id = _uuid(product_body["partner_id"], "partner_id")
+        partner_user = await session.get(User, partner_id)
+        if partner_user is None or partner_user.deleted_at is not None:
+            raise HTTPException(status_code=422, detail={"code": "invalid_partner", "message": "التاجر المحدد غير موجود أو غير متاح."})
+        partner_role = await session.get(UserRole, {"user_id": partner_id, "role": "partner"})
+        storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+        storefront_result = await session.execute(
+            select(storefront_model.id)
+            .where(
+                or_(storefront_model.user_id == partner_id, storefront_model.partner_id == partner_id),
+                storefront_model.deleted_at.is_(None),
+                storefront_model.is_active.is_(True),
+            )
+            .limit(1)
+        )
+        if partner_role is None and storefront_result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=422, detail={"code": "invalid_partner", "message": "التاجر المحدد غير مفعّل."})
+        product_body["partner_id"] = partner_id
     product_body.setdefault("approval_status", "approved")
     product_body = normalize_product_mutation_values(product_body, partial=False)
     product_body.setdefault("is_active", True)
@@ -3959,7 +5780,9 @@ async def api_admin_create_product(request: Request, staff: User = Depends(requi
         product_body.setdefault("approved_at", datetime.now(timezone.utc))
     product = await _create_resource_row(session, "products", product_body)
     variants = []
-    for variant_body in body.get("variants") or []:
+    for variant_body in variants_payload:
+        if not isinstance(variant_body, dict):
+            raise HTTPException(status_code=422, detail={"code": "invalid_variant", "message": "بيانات أحد خيارات المنتج غير صحيحة."})
         variant = _normalize_catalog_mutation_input(dict(variant_body))
         variant["product_id"] = product["id"]
         variant = normalize_product_mutation_values(variant, partial=True)
@@ -4128,10 +5951,72 @@ async def api_admin_delete_product(product_id: uuid.UUID, staff: User = Depends(
     return {"ok": True, "removed_assets": removed_assets, "data": serialize_record(row)}
 
 
-def _normalize_admin_body(table: str, body: dict[str, Any], actor: User | None = None) -> dict[str, Any]:
+def _normalize_admin_body(
+    table: str,
+    body: dict[str, Any],
+    actor: User | None = None,
+    *,
+    for_create: bool = False,
+) -> dict[str, Any]:
     values = dict(body)
-    if table == "couriers" and "full_name" in values and "name" not in values:
-        values["name"] = values["full_name"]
+    if table in {"suppliers", "local_merchants"}:
+        # Supplier/merchant forms are shared by the web dashboard and the
+        # Flutter dashboard. Keep both naming conventions in one backend
+        # contract and persist fields that are not physical columns in the
+        # resource's JSON extra_data through _create_resource_row/_api_update.
+        aliases = {
+            "business_name": "name",
+            "nameEn": "name_en",
+            "whatsappNumber": "whatsapp_number",
+            "supplierType": "supplier_type",
+            "isActive": "is_active",
+            "logoUrl": "logo_url",
+        }
+        for source, target in aliases.items():
+            if source in values and target not in values:
+                values[target] = values.pop(source)
+        if for_create:
+            name = str(values.get("name") or "").strip()
+            if len(name) < 2:
+                raise HTTPException(status_code=422, detail="supplier_name_required")
+            values["name"] = name
+            values.setdefault("supplier_type", "merchant" if table == "local_merchants" else "supplier")
+            values.setdefault("status", "active" if values.get("is_active", True) else "inactive")
+        elif "is_active" in values and "status" not in values:
+            values["status"] = "active" if values["is_active"] else "inactive"
+        supplier_type = values.get("supplier_type")
+        if supplier_type is not None:
+            supplier_type = str(supplier_type).strip().lower()
+            if supplier_type not in {"supplier", "merchant", "both"}:
+                raise HTTPException(status_code=422, detail="invalid_supplier_type")
+            values["supplier_type"] = supplier_type
+        images = values.get("images")
+        if isinstance(images, str):
+            values["images"] = [images.strip()] if images.strip() else []
+        elif images is not None:
+            values["images"] = [str(item).strip() for item in images if str(item).strip()] if isinstance(images, list) else []
+    if table == "couriers":
+        aliases = {
+            "full_name": "name",
+            "isActive": "is_active",
+            "vehicleType": "vehicle_type",
+            "coverageArea": "coverage_area",
+        }
+        for source, target in aliases.items():
+            if source in values and target not in values:
+                values[target] = values.pop(source)
+        if for_create or "name" in values:
+            name = str(values.get("name") or "").strip()
+            if len(name) < 2:
+                raise HTTPException(status_code=422, detail="courier_name_required")
+            values["name"] = name
+        if for_create:
+            values.setdefault(
+                "status",
+                "active" if values.get("is_active", True) else "inactive",
+            )
+        elif "is_active" in values and "status" not in values:
+            values["status"] = "active" if values["is_active"] else "inactive"
     if table == "shipping_carriers":
         if "base_cost" in values and "fee" not in values:
             values["fee"] = values["base_cost"]
@@ -4148,6 +6033,14 @@ def _normalize_admin_body(table: str, body: dict[str, Any], actor: User | None =
         if "form_name" in values and "type" not in values:
             values["type"] = values["form_name"]
         values.setdefault("status", "active")
+    if table == "banners":
+        if "link_url" in values and "url" not in values:
+            values["url"] = values["link_url"]
+        if for_create or "is_active" in values:
+            active = values.get("is_active", True)
+            if isinstance(active, str):
+                active = active.strip().lower() not in {"false", "0", "no", "inactive"}
+            values.setdefault("status", "active" if active else "inactive")
     if table == "shipping_zones":
         if "governorate" in values and "name" not in values:
             values["name"] = values["governorate"]
@@ -4156,10 +6049,48 @@ def _normalize_admin_body(table: str, body: dict[str, Any], actor: User | None =
         if "content" in values and "body" not in values:
             values["body"] = values["content"]
         values.setdefault("status", "draft")
-    if table in {"static_pages", "custom_elements"}:
+    if table == "static_pages":
         if "content" in values and "body" not in values:
             values["body"] = values["content"]
-        values.setdefault("status", "draft")
+        if "is_published" in values and "is_active" not in values:
+            values["is_active"] = values["is_published"]
+        if for_create or "is_published" in values or "is_active" in values:
+            active = values.get("is_active", False)
+            if isinstance(active, str):
+                active = active.strip().lower() not in {"false", "0", "no", "draft", "inactive"}
+            values.setdefault("status", "active" if active else "draft")
+    if table == "page_sections":
+        if "section_name" in values and "title" not in values:
+            values["title"] = values["section_name"]
+        if "content" in values and "body" not in values:
+            values["body"] = values["content"]
+        if "is_visible" in values and "is_active" not in values:
+            values["is_active"] = values["is_visible"]
+        if for_create or "is_visible" in values or "is_active" in values:
+            active = values.get("is_active", True)
+            if isinstance(active, str):
+                active = active.strip().lower() not in {"false", "0", "no", "inactive"}
+            values.setdefault("status", "active" if active else "inactive")
+    if table == "custom_elements":
+        title = str(values.get("title") or values.get("name") or "").strip()
+        if title and "name" not in values:
+            values["name"] = title
+        elif for_create and "name" not in values:
+            values["name"] = "custom_element"
+        element_type = str(values.get("element_type") or values.get("type") or "").strip()
+        if element_type and "type" not in values:
+            values["type"] = element_type
+        elif for_create and "type" not in values:
+            values["type"] = "custom_html"
+        if "content" in values and "body" not in values:
+            values["body"] = values["content"]
+        if "is_visible" in values and "is_active" not in values:
+            values["is_active"] = values["is_visible"]
+        if for_create or "is_visible" in values or "is_active" in values:
+            active = values.get("is_active", True)
+            if isinstance(active, str):
+                active = active.strip().lower() not in {"false", "0", "no", "inactive"}
+            values.setdefault("status", "active" if active else "inactive")
     if table == "coupons":
         if "discount_value" in values and "amount" not in values:
             values["amount"] = values["discount_value"]
@@ -4187,7 +6118,7 @@ def _normalize_admin_body(table: str, body: dict[str, Any], actor: User | None =
 
 
 async def _api_create(session: AsyncSession, table: str, body: dict[str, Any], actor: User | None = None) -> dict[str, Any]:
-    return await _create_resource_row(session, table, _normalize_admin_body(table, body, actor))
+    return await _create_resource_row(session, table, _normalize_admin_body(table, body, actor, for_create=True))
 
 
 async def _api_update(session: AsyncSession, table: str, record_id: uuid.UUID, body: dict[str, Any], actor: User | None = None) -> dict[str, Any]:
@@ -4445,6 +6376,35 @@ async def api_content_patch_theme_setting(
     return {"data": await ThemeAdminService().save(session, actor=staff, roles=roles, body=await request.json(), setting_key=setting_key, publish=True)}
 
 
+@router.get("/api/content/theme/history")
+async def api_content_theme_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return the saved theme versions used by the design-control history tab."""
+    ThemeAdminService.require_access(roles)
+    model = MODEL_BY_TABLE["theme_settings"]
+    rows = await _rows(session, "theme_settings", clauses=(model.status == "history",), limit=limit)
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        extra = dict(row.extra_data or {})
+        changed_at = getattr(row, "updated_at", None) or getattr(row, "created_at", None)
+        history.append(
+            {
+                "id": str(row.id),
+                "setting_key": str(extra.get("setting_key") or "default"),
+                "old_value": _jsonable(extra.get("old_value")),
+                "new_value": _jsonable(extra.get("new_value")),
+                "changed_by": str(extra.get("changed_by") or extra.get("updated_by") or ""),
+                "changed_at": changed_at.isoformat() if changed_at else None,
+                "description": str(extra.get("description") or ""),
+            }
+        )
+    return {"data": history}
+
+
 @router.post("/api/content/theme/history", status_code=201)
 async def api_content_create_theme_history(request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     ThemeAdminService.require_access(roles)
@@ -4477,6 +6437,45 @@ async def api_content_revert_theme_history(history_id: uuid.UUID, staff: User = 
         row.extra_data = {"key": str(key), "value": _jsonable(extra.get("old_value", {}))}
     await session.commit()
     return {"data": serialize_record(history)}
+
+
+@router.get("/api/content/theme/templates")
+async def api_content_theme_templates(
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    """List persisted design templates without mixing them with live settings."""
+    ThemeAdminService.require_access(roles)
+    model = MODEL_BY_TABLE["theme_settings"]
+    rows = await _rows(
+        session,
+        "theme_settings",
+        clauses=(or_(model.status == "template", model.name.like("template:%")),),
+        limit=100,
+    )
+    templates: list[dict[str, Any]] = []
+    for row in rows:
+        record = serialize_record(row)
+        extra = dict(row.extra_data or {})
+        settings = extra.get("settings") if isinstance(extra.get("settings"), dict) else extra
+        raw_name = str(extra.get("name") or record.get("name") or "")
+        templates.append(
+            {
+                "id": str(row.id),
+                "name": raw_name.removeprefix("template:") or "قالب تصميم",
+                "name_en": extra.get("name_en"),
+                "description": extra.get("description") or record.get("description"),
+                "preview_image": extra.get("preview_image") or extra.get("previewImage"),
+                "settings": _jsonable(settings),
+                "is_active": bool(record.get("is_active") is not False),
+                "is_default": bool(extra.get("is_default") or extra.get("isDefault")),
+                "sort_order": int(extra.get("sort_order") or record.get("sort_order") or 0),
+                "created_at": record.get("created_at"),
+            }
+        )
+    templates.sort(key=lambda item: (item["sort_order"], item["name"]))
+    return {"data": templates}
 
 
 @router.post("/api/content/theme/templates/{template_id}/apply")
@@ -4533,8 +6532,62 @@ async def api_content_restore_page(page_id: uuid.UUID, request: Request, staff: 
     return {"data": serialize_record(row)}
 
 
+@router.get("/api/content/blog/{slug}")
+async def api_content_blog_article(slug: str, session: AsyncSession = Depends(get_session)):
+    articles = [_blog_article_payload(row) for row in await _rows(session, "site_content", limit=500)]
+    article = next((row for row in articles if row.get("slug") == slug and row.get("is_published") is True), None)
+    if article is None:
+        raise HTTPException(status_code=404, detail="article_not_found")
+    return {"data": article}
+
+
+@router.patch("/api/content/site/{content_key}")
+async def api_content_update_site(
+    content_key: str,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Update one editable site-content block by its stable key."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="site_content_payload_required")
+
+    key = str(content_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=422, detail="site_content_key_required")
+
+    model = MODEL_BY_TABLE["site_content"]
+    rows = await _rows(session, "site_content", clauses=(model.name == key,), limit=1)
+    row = rows[0] if rows else model(name=key, status="active")
+    if not rows:
+        session.add(row)
+
+    extra = dict(getattr(row, "extra_data", None) or {})
+    for field, value in body.items():
+        if field in {"key", "name"}:
+            continue
+        if field in {"content", "body"}:
+            row.body = _jsonable(value)
+        elif field == "title":
+            row.title = _jsonable(value)
+        elif field in {"image_url", "imageUrl"}:
+            extra["image_url"] = _jsonable(value)
+        elif field in {"metadata", "meta"}:
+            extra["metadata"] = _jsonable(value)
+        elif field == "status":
+            row.status = str(value or "active")
+        else:
+            extra[field] = _jsonable(value)
+
+    row.status = str(getattr(row, "status", None) or "active")
+    row.extra_data = extra
+    await session.commit()
+    return {"data": _site_content_payload(row)}
+
+
 @router.get("/api/content/{section_key}")
-async def api_content_section(section_key: str, page: str | None = None, key: str | None = None, admin: bool = False, user: User | None = Depends(public_optional_user), session: AsyncSession = Depends(get_session)):
+async def api_content_section(section_key: str, page: str | None = None, key: str | None = None, category: str | None = None, admin: bool = False, user: User | None = Depends(public_optional_user), session: AsyncSession = Depends(get_session)):
     table = CONTENT_TABLES.get(section_key)
     if table is None:
         raise HTTPException(status_code=404, detail="content_section_not_found")
@@ -4545,6 +6598,13 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
         if not set(role_rows.scalars()).intersection({"admin", "manager", "staff", "employee"}):
             raise HTTPException(status_code=403, detail="insufficient_permissions")
     rows = await _resource_data(session, table)
+    if section_key == "blog":
+        rows = [_blog_article_payload(row) for row in await _rows(session, "site_content", limit=500)]
+        if not admin:
+            rows = [row for row in rows if row.get("is_published") is True]
+        if category and category != "all":
+            rows = [row for row in rows if row.get("category") == category]
+        return {"data": rows}
     if not admin:
         rows = _public_content_rows(rows)
         if section_key == "theme":
@@ -4555,6 +6615,8 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
             ]
     if page:
         rows = [row for row in rows if row.get("page") == page or (row.get("extra_data") or {}).get("page") == page]
+    if section_key == "sections":
+        rows = sorted(rows, key=lambda row: (int(row.get("sort_order") or 0), str(row.get("section_name") or row.get("title") or "")))
     if key:
         rows = [row for row in rows if row.get("name") == key or row.get("form_key") == key or (row.get("extra_data") or {}).get("form_key") == key]
         if section_key == "forms":
@@ -4568,6 +6630,13 @@ async def api_content_create_section(section_key: str, request: Request, staff: 
     if table is None:
         raise HTTPException(status_code=404, detail="content_section_not_found")
     body = await request.json()
+    if section_key == "blog":
+        values, extra = _normalize_blog_body(body, for_create=True)
+        row = MODEL_BY_TABLE["site_content"](**values, extra_data=extra)
+        session.add(row)
+        await session.commit()
+        return {"data": _blog_article_payload(row)}
+    body = _normalize_admin_body(table, body, staff, for_create=True)
     if table == "form_settings":
         FormSettingsPersistenceService.validate(body)
         body = {**body, "name": str(body.get("form_key") or body.get("formKey") or body.get("name")), "status": "active"}
@@ -4599,10 +6668,20 @@ async def api_content_update_section(section_key: str, record_id: str, request: 
             ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="record_not_found")
-    body = await request.json()
+    body = _normalize_admin_body(table, await request.json(), staff, for_create=False)
+    if section_key == "blog":
+        values, extra = _normalize_blog_body(body, existing=row)
+        for key, value in values.items():
+            setattr(row, key, value)
+        row.extra_data = extra
+        await session.commit()
+        return {"data": _blog_article_payload(row)}
     if table == "form_settings":
         FormSettingsPersistenceService.validate(body, form_key=getattr(row, "name", None))
-        body = {**body, "name": getattr(row, "name", None) or str(body.get("form_key") or body.get("formKey") or record_id), "status": "active"}
+        active = body.get("is_active", getattr(row, "is_active", True))
+        if isinstance(active, str):
+            active = active.strip().lower() not in {"false", "0", "no", "inactive"}
+        body = {**body, "name": getattr(row, "name", None) or str(body.get("form_key") or body.get("formKey") or record_id), "status": "active" if active else "inactive"}
     extra = dict(getattr(row, "extra_data", {}) or {})
     for key, value in body.items():
         if key in model.__table__.c and key not in {"id", "created_at"}:
@@ -4620,7 +6699,9 @@ async def api_content_delete_section(section_key: str, record_id: uuid.UUID, sta
     table = CONTENT_TABLES.get(section_key)
     if table is None:
         raise HTTPException(status_code=404, detail="content_section_not_found")
-    result = await ResourceRepository(session, table, staff.id, roles).delete({"id": str(record_id)})
+    result = await ResourceRepository(session, table, staff.id, roles).delete({
+        "filters": [{"column": "id", "operator": "eq", "value": str(record_id)}],
+    })
     await session.commit()
     return {"ok": True, "data": result}
 
@@ -4647,6 +6728,11 @@ async def create_admin_section(section_key: str, request: Request, admin: User =
         _add_audit_log(session, admin.id, f"admin.{table}.create", f"Created {table} record")
         await session.commit()
         return row_data
+    if table in {"suppliers", "local_merchants"}:
+        row_data = await _api_create(session, table, body, admin)
+        _add_audit_log(session, admin.id, f"admin.{table}.create", f"Created {table} record")
+        await session.commit()
+        return row_data
     model = MODEL_BY_TABLE[table]
     values = {key: value for key, value in body.items() if key in model.__table__.c and key not in {"id", "created_at", "updated_at", "deleted_at", "extra_data"}}
     extra = {key: value for key, value in body.items() if key not in model.__table__.c}
@@ -4665,6 +6751,11 @@ async def update_admin_section(section_key: str, record_id: uuid.UUID, request: 
     ResourceRepository(session, table, admin.id, roles).ensure_access("update")
     if table == "categories":
         row_data = await update_category_record(session, record_id, await request.json())
+        _add_audit_log(session, admin.id, f"admin.{table}.update", f"Updated {table} record {record_id}")
+        await session.commit()
+        return row_data
+    if table in {"suppliers", "local_merchants"}:
+        row_data = await _api_update(session, table, record_id, await request.json(), admin)
         _add_audit_log(session, admin.id, f"admin.{table}.update", f"Updated {table} record {record_id}")
         await session.commit()
         return row_data
@@ -4970,13 +7061,17 @@ async def api_list_order_payments(
     session: AsyncSession = Depends(get_session),
 ):
     require_finance_actor(roles)
-    payment_model = MODEL_BY_TABLE["order_payments"]
-    result = await session.execute(
-        select(payment_model)
-        .where(payment_model.order_id == order_id, payment_model.deleted_at.is_(None))
-        .order_by(payment_model.created_at.desc())
-    )
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    payment_rows = []
+    for table_name in ("order_payments", "payments"):
+        payment_model = MODEL_BY_TABLE[table_name]
+        result = await session.execute(
+            select(payment_model)
+            .where(payment_model.order_id == order_id, payment_model.deleted_at.is_(None))
+            .order_by(payment_model.created_at.desc())
+        )
+        payment_rows.extend(result.scalars().all())
+    payment_rows.sort(key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return {"data": [serialize_record(row) for row in payment_rows]}
 
 
 @router.post("/api/payments/orders/{order_id}", status_code=201)
@@ -5142,7 +7237,44 @@ async def api_update_employee_payment_status(record_id: uuid.UUID, request: Requ
 
 @router.post("/api/finance/expenses", status_code=201)
 async def api_create_expense(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("general_expenses", request, session, staff)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="expense_payload_required")
+
+    raw_amount = body.get("amount")
+    try:
+        amount = Decimal(str(raw_amount).strip())
+    except (ArithmeticError, TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="expense_amount_invalid")
+    if not amount.is_finite() or amount <= 0:
+        raise HTTPException(status_code=422, detail="expense_amount_invalid")
+
+    description = str(body.get("description") or "").strip()
+    if not description:
+        raise HTTPException(status_code=422, detail="expense_description_required")
+
+    category = str(
+        body.get("expense_category") or body.get("category") or body.get("type") or "other"
+    ).strip()[:64] or "other"
+    payload = {
+        "type": category,
+        "amount": amount,
+        "description": description,
+        "status": "pending",
+        "expense_category": category,
+        "currency_code": str(body.get("currency_code") or "YER").strip().upper()[:12],
+        "expense_date": str(body.get("expense_date") or datetime.now(timezone.utc).isoformat()),
+        "vendor_name": str(body.get("vendor_name") or "").strip() or None,
+        "vendor_phone": str(body.get("vendor_phone") or "").strip() or None,
+        "notes": str(body.get("notes") or "").strip() or None,
+        "receipt_url": str(body.get("receipt_url") or "").strip() or None,
+        "is_recurring": bool(body.get("is_recurring", False)),
+        "recurring_period": str(body.get("recurring_period") or "").strip() or None,
+        "voucher_number": str(body.get("voucher_number") or f"EXP-{uuid.uuid4().hex[:10].upper()}"),
+    }
+    row = await _api_create(session, "general_expenses", payload, staff)
+    await session.commit()
+    return {"data": _general_expense_payload(row)}
 
 
 @router.post("/api/finance/cash-transactions", status_code=201)
@@ -5152,7 +7284,39 @@ async def api_create_cash_transaction(request: Request, staff: User = Depends(re
 
 @router.post("/api/finance/vouchers", status_code=201)
 async def api_create_financial_voucher(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("financial_vouchers", request, session, staff)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="invalid_voucher_payload")
+    raw_type = str(body.get("voucher_type") or body.get("type") or "").strip().lower()
+    if raw_type not in {"receipt", "payment"}:
+        raise HTTPException(status_code=422, detail="invalid_voucher_type")
+    try:
+        amount = Decimal(str(body.get("amount")))
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise HTTPException(status_code=422, detail="voucher_amount_invalid") from exc
+    if amount <= 0:
+        raise HTTPException(status_code=422, detail="voucher_amount_must_be_positive")
+    beneficiary_name = str(body.get("beneficiary_name") or body.get("beneficiaryName") or "").strip()
+    if not beneficiary_name:
+        raise HTTPException(status_code=422, detail="voucher_beneficiary_required")
+    payment_method = str(body.get("payment_method") or body.get("paymentMethod") or "cash").strip().lower()
+    if not payment_method:
+        raise HTTPException(status_code=422, detail="voucher_payment_method_required")
+    payload = {
+        **body,
+        "voucher_type": raw_type,
+        "type": raw_type,
+        "amount": amount,
+        "currency_code": str(body.get("currency_code") or "YER").strip().upper(),
+        "beneficiary_name": beneficiary_name,
+        "payment_method": payment_method,
+        "issued_date": body.get("issued_date") or datetime.now(timezone.utc).isoformat(),
+        "voucher_number": body.get("voucher_number") or f"{'RV' if raw_type == 'receipt' else 'PV'}-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}",
+        "status": str(body.get("status") or "pending").strip().lower(),
+    }
+    row = await _api_create(session, "financial_vouchers", payload, staff)
+    await session.commit()
+    return {"data": _financial_voucher_payload(row)}
 
 
 @router.post("/api/dashboard/risk-alerts", status_code=201)
@@ -6126,6 +8290,18 @@ async def validate_coupon(request: Request, user: User = Depends(current_user), 
     if coupon is None or (coupon.expires_at and coupon.expires_at < datetime.now(timezone.utc)):
         raise HTTPException(status_code=404, detail="coupon_invalid")
     return {**serialize_record(coupon), "valid": True, "discountAmount": str(money(coupon.amount or 0))}
+
+
+@router.post("/loyalty/initialize", status_code=201)
+async def initialize_loyalty(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    model = MODEL_BY_TABLE["user_loyalty"]
+    result = await session.execute(select(model).where(model.user_id == user.id).limit(1))
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = model(user_id=user.id, status="active", balance=Decimal("0.00"), extra_data={"joined": True})
+        session.add(row)
+        await session.commit()
+    return {"data": serialize_record(row)}
 
 
 @router.get("/loyalty/me")

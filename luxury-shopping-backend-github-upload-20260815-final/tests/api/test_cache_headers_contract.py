@@ -119,6 +119,16 @@ def test_private_customer_and_admin_paths_are_no_store():
         assert response.headers["expires"] == "0"
 
 
+def test_theme_reads_are_no_store_so_published_changes_are_immediate():
+    for path in ["/content/theme", "/api/content/theme", "/settings/theme", "/api/settings/theme"]:
+        response = Response()
+
+        _apply_cache_headers(_request(path), response)
+
+        assert response.headers["cache-control"] == "no-store", path
+        assert response.headers["pragma"] == "no-cache", path
+
+
 def test_mutations_are_no_store_even_on_public_paths():
     response = Response()
 
