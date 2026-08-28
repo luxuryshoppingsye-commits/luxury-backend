@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -27,7 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from ..config import get_settings
-from ..database import engine
+from ..database import SessionFactory, engine
 from ..models import MODEL_BY_TABLE
 from ..models.domain import FileAsset, User
 from ..repositories.resources import serialize_record
@@ -55,6 +56,9 @@ BACKUP_STATUSES = frozenset(
         "deleting",
     }
 )
+
+logger = logging.getLogger("luxury.secure_backup")
+_BACKGROUND_BACKUP_TASKS: set[asyncio.Task[Any]] = set()
 
 
 @dataclass(frozen=True)
@@ -477,11 +481,24 @@ class BackupEncryptionService:
                     candidate = base64.urlsafe_b64encode(hashlib.sha256(candidate).digest())
                 self.key_file.parent.mkdir(parents=True, exist_ok=True)
                 self.key_file.write_bytes(candidate)
-            elif settings.app_env != "test":
-                raise RuntimeError("backup_encryption_key_missing")
             else:
-                self.key_file.parent.mkdir(parents=True, exist_ok=True)
-                self.key_file.write_bytes(Fernet.generate_key())
+                # Older Render services may not yet have the generated
+                # BACKUP_ENCRYPTION_KEY variable. Derive a stable Fernet key
+                # from the already-required JWT secret so a restart does not
+                # make a new bundle undecryptable. A dedicated backup key is
+                # still preferred whenever it is configured.
+                secret = str(settings.jwt_secret or "").strip()
+                if settings.app_env in {"staging", "production"} and len(secret) >= 32:
+                    candidate = base64.urlsafe_b64encode(
+                        hashlib.sha256(f"luxury-backup-v1:{secret}".encode("utf-8")).digest()
+                    )
+                    self.key_file.parent.mkdir(parents=True, exist_ok=True)
+                    self.key_file.write_bytes(candidate)
+                elif settings.app_env != "test":
+                    raise RuntimeError("backup_encryption_key_missing")
+                else:
+                    self.key_file.parent.mkdir(parents=True, exist_ok=True)
+                    self.key_file.write_bytes(Fernet.generate_key())
             try:
                 self.key_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
@@ -920,7 +937,15 @@ class BackupCoordinator:
             retention_days=self.settings.backup_retention_days,
         )
 
-    async def _set_status(self, session: AsyncSession, row: Any, status: str, **extra: Any) -> None:
+    async def _set_status(
+        self,
+        session: AsyncSession,
+        row: Any,
+        status: str,
+        *,
+        persist: bool = False,
+        **extra: Any,
+    ) -> None:
         if status not in BACKUP_STATUSES:
             raise RuntimeError("invalid_backup_status")
         row.status = status
@@ -932,10 +957,12 @@ class BackupCoordinator:
         ]
         row.extra_data = payload
         await session.flush()
+        if persist:
+            await session.commit()
 
-    async def create_backup(self, session: AsyncSession, *, actor: User, selected_tables: list[str] | None = None) -> dict[str, Any]:
+    def _new_backup_row(self, actor: User, selected_tables: list[str] | None = None) -> Any:
         model = MODEL_BY_TABLE["backup_records"]
-        row = model(
+        return model(
             user_id=actor.id,
             status="requested",
             description="encrypted full backup bundle",
@@ -951,9 +978,74 @@ class BackupCoordinator:
                 },
             },
         )
+
+    async def queue_backup(
+        self,
+        session: AsyncSession,
+        *,
+        actor: User,
+        selected_tables: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a backup request and run the expensive work outside HTTP.
+
+        ``pg_dump``, file collection, encryption and restore verification can
+        take longer than a browser request or a Render proxy timeout.  The
+        request row is committed before the task starts, so the admin page can
+        poll one durable status record instead of treating an in-flight backup
+        as a failed request.
+        """
+        row = self._new_backup_row(actor, selected_tables)
         session.add(row)
-        await session.flush()
-        await self._set_status(session, row, "acquiring_lock")
+        await self._set_status(session, row, "requested")
+        await session.commit()
+        task = asyncio.create_task(self._run_queued_backup(str(row.id), str(actor.id), selected_tables or []))
+        _BACKGROUND_BACKUP_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_BACKUP_TASKS.discard)
+        return self._response(row)
+
+    async def _run_queued_backup(self, backup_id: str, actor_id: str, selected_tables: list[str]) -> None:
+        try:
+            async with SessionFactory() as worker_session:
+                model = MODEL_BY_TABLE["backup_records"]
+                row = await worker_session.get(model, uuid.UUID(backup_id))
+                actor = await worker_session.get(User, uuid.UUID(actor_id))
+                if row is None or actor is None:
+                    logger.error("queued backup lost its row or actor: %s", backup_id)
+                    return
+                await self.create_backup(
+                    worker_session,
+                    actor=actor,
+                    selected_tables=selected_tables,
+                    existing_row=row,
+                    persist_progress=True,
+                )
+                await worker_session.commit()
+        except Exception:
+            # The row is normally marked failed by create_backup.  Keep the
+            # task exception from becoming an unhandled asyncio warning when a
+            # process is shutting down during a long-running backup.
+            logger.exception("queued backup worker failed: %s", backup_id)
+
+    async def create_backup(
+        self,
+        session: AsyncSession,
+        *,
+        actor: User,
+        selected_tables: list[str] | None = None,
+        existing_row: Any | None = None,
+        persist_progress: bool = False,
+    ) -> dict[str, Any]:
+        model = MODEL_BY_TABLE["backup_records"]
+        row = existing_row or self._new_backup_row(actor, selected_tables)
+        if existing_row is None:
+            session.add(row)
+            await session.flush()
+
+        async def set_status(status: str, **extra: Any) -> None:
+            await self._set_status(session, row, status, persist=persist_progress, **extra)
+
+        if existing_row is None:
+            await set_status("acquiring_lock")
 
         lock_conn: AsyncConnection | None = None
         acquired = False
@@ -968,25 +1060,23 @@ class BackupCoordinator:
             lock_conn = await engine.connect()
             acquired = bool((await lock_conn.execute(text("select pg_try_advisory_lock(:key)"), {"key": BACKUP_LOCK_KEY})).scalar())
             if not acquired:
-                await self._set_status(session, row, "failed", error_code="backup_already_running")
+                await set_status("failed", error_code="backup_already_running")
                 await session.flush()
                 raise HTTPException(status_code=409, detail={"code": "backup_already_running"})
 
             await self._assert_tool_compatibility(session)
-            await self._set_status(session, row, "dumping_database", pg_dump_version=self.tools.pg_dump_version, pg_restore_version=self.tools.pg_restore_version)
+            await set_status("dumping_database", pg_dump_version=self.tools.pg_dump_version, pg_restore_version=self.tools.pg_restore_version)
             files_dir.mkdir(parents=True, exist_ok=True)
             dump_result = await asyncio.to_thread(
                 PostgreSQLDumpService(target=self.target, tools=self.tools, timeout_seconds=self.settings.backup_command_timeout_seconds).run_dump,
                 dump_path,
             )
-            await self._set_status(session, row, "collecting_files")
+            await set_status("collecting_files")
             file_manifest = await FileSnapshotService(
                 upload_root=self.settings.resolved_upload_dir,
                 storage=FileStorage(),
             ).collect(session, files_dir)
-            await self._set_status(
-                session,
-                row,
+            await set_status(
                 "building_manifest",
                 missing_file_count=file_manifest.get("missing_file_count", 0),
                 file_snapshot_complete=file_manifest.get("complete", True),
@@ -997,11 +1087,9 @@ class BackupCoordinator:
                 for item in files_dir.rglob("*"):
                     if item.is_file():
                         archive.add(item, arcname=item.relative_to(files_dir).as_posix())
-            await self._set_status(session, row, "encrypting")
+            await set_status("encrypting")
             encryption_result = await asyncio.to_thread(self.encryption.encrypt_file, plaintext_bundle, encrypted_path)
-            await self._set_status(
-                session,
-                row,
+            await set_status(
                 "verifying_local_bundle",
                 **encryption_result,
                 encrypted_bundle_key=encrypted_name,
@@ -1011,26 +1099,24 @@ class BackupCoordinator:
             )
             if not encrypted_path.is_file() or encrypted_path.stat().st_size <= 0:
                 raise RuntimeError("encrypted_bundle_missing")
-            await self._set_status(session, row, "uploading_offsite")
+            await set_status("uploading_offsite")
             offsite_result = await asyncio.to_thread(self.offsite.upload_and_verify, encrypted_path)
-            await self._set_status(session, row, "verifying_offsite_copy", **offsite_result)
+            await set_status("verifying_offsite_copy", **offsite_result)
             restore_result: dict[str, Any] = {}
             if self.settings.backup_require_restore_verification:
-                await self._set_status(session, row, "restoring_test_database")
+                await set_status("restoring_test_database")
                 restore_result = await BackupRestoreVerificationService(
                     target=self.target,
                     tools=self.tools,
                     timeout_seconds=self.settings.backup_command_timeout_seconds,
                 ).verify(encrypted_path, self.encryption)
-                await self._set_status(session, row, "verifying_restored_files", **restore_result)
+                await set_status("verifying_restored_files", **restore_result)
             # The database enforces that a ready backup already has a
             # non-empty bundle path. Set it before the constrained status
             # transition, otherwise the transition is rejected even after
             # dump, encryption, offsite copy, and restore verification pass.
             row.path = str(encrypted_path)
-            await self._set_status(
-                session,
-                row,
+            await set_status(
                 "ready",
                 encrypted_bundle_key=encrypted_name,
                 encrypted_bundle_sha256=encryption_result["encrypted_sha256"],
@@ -1046,7 +1132,7 @@ class BackupCoordinator:
         except HTTPException:
             raise
         except Exception as exc:
-            await self._set_status(session, row, "failed", error_code=str(exc).splitlines()[0][:200])
+            await set_status("failed", error_code=str(exc).splitlines()[0][:200])
             row.path = str(encrypted_path) if encrypted_path.exists() else ""
             return self._response(row)
         finally:

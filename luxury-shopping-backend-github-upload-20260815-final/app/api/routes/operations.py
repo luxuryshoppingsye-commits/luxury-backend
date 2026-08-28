@@ -1697,10 +1697,38 @@ def _blog_article_payload(value: Any) -> dict[str, Any]:
     }
 
 
-def _normalize_blog_body(body: Any, *, existing: Any = None, for_create: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+async def _blog_source_rows(session: AsyncSession) -> list[Any]:
+    """Read the canonical blog table and the legacy site-content table.
+
+    Older deployments wrote articles to ``site_content`` while the resource
+    schema exposes ``blog_articles``. Reading both keeps existing content
+    visible and lets new writes use one durable table.
+    """
+    rows: list[Any] = []
+    seen_keys: set[str] = set()
+    for table in ("blog_articles", "site_content"):
+        for row in await _rows(session, table, limit=500):
+            payload = _blog_article_payload(row)
+            key = str(payload.get("slug") or payload.get("id") or "")
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            rows.append(row)
+    return rows
+
+
+def _normalize_blog_body(
+    body: Any,
+    *,
+    existing: Any = None,
+    for_create: bool = False,
+    table: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="blog_payload_required")
-    model = MODEL_BY_TABLE["site_content"]
+    table = table or (str(existing.__table__.name) if existing is not None else "blog_articles")
+    model = MODEL_BY_TABLE[table]
     values: dict[str, Any] = {}
     extra = dict(getattr(existing, "extra_data", None) or {}) if existing is not None else {}
     for key, value in body.items():
@@ -1714,6 +1742,11 @@ def _normalize_blog_body(body: Any, *, existing: Any = None, for_create: bool = 
         if len(title) < 2:
             raise HTTPException(status_code=422, detail="blog_title_required")
         values["title"] = title
+        if "name" in model.__table__.c:
+            values["name"] = title
+    slug = _first_text(body.get("slug"), body.get("name"), title)
+    if slug and "slug" in model.__table__.c:
+        values["slug"] = "-".join(slug.split())[:500]
     content = body.get("content") if "content" in body else body.get("body")
     if content is not None:
         values["body"] = str(content)
@@ -1722,6 +1755,8 @@ def _normalize_blog_body(body: Any, *, existing: Any = None, for_create: bool = 
         raise HTTPException(status_code=422, detail="blog_content_required")
     if "cover_image" in body:
         extra["cover_image"] = _jsonable(body.get("cover_image"))
+        if "image_url" in model.__table__.c:
+            values["image_url"] = _jsonable(body.get("cover_image"))
 
     current_item = _blog_article_payload(existing) if existing is not None else {}
     if "is_published" in body:
@@ -1733,6 +1768,8 @@ def _normalize_blog_body(body: Any, *, existing: Any = None, for_create: bool = 
     else:
         published = _blog_bool(current_item.get("is_published"), default=False)
     values["status"] = "published" if published else "draft"
+    if "is_active" in model.__table__.c:
+        values["is_active"] = published
     extra["is_published"] = published
     if "published_at" in body:
         extra["published_at"] = _jsonable(body.get("published_at"))
@@ -2202,7 +2239,11 @@ async def api_dashboard_system_health(staff: User = Depends(require_staff), sess
         "active_marketers": await _count(session, "marketers", marketer_model.status.in_(("active", "approved"))),
         "pending_commissions": float(await _sum_amount(session, "marketer_commissions", MODEL_BY_TABLE["marketer_commissions"].status.in_(("pending", "unpaid")))),
         "pending_international": await _count(session, "international_orders", MODEL_BY_TABLE["international_orders"].status.in_(("pending", "new", "reviewing"))),
-        "unlinked": await _count(session, "international_orders", MODEL_BY_TABLE["international_orders"].status.in_(("new", "pending"))),
+        # Do not infer a missing link from workflow status. A processed
+        # international order can still be unlinked, while a pending one can
+        # already be linked. Use the same bidirectional relation resolver as
+        # the order-linking screen so dashboard alerts and the screen agree.
+        "unlinked": await _unlinked_international_count(session),
         "out_of_stock": inventory_counts["out_of_stock"],
         "low_stock": inventory_counts["low_stock"],
         "blocked_actions": await _count(session, "security_events", security_model.status.in_(("blocked", "rejected"))),
@@ -2257,7 +2298,7 @@ async def api_dashboard_smart_alerts(staff: User = Depends(require_staff), sessi
         "balance_issues": await _count(session, "orders", order_model.status == "delivered", order_model.payment_status != "paid"),
         "pending_commissions": float(await _sum_amount(session, "marketer_commissions", MODEL_BY_TABLE["marketer_commissions"].status.in_(("pending", "unpaid")))),
         "pending_settlements": float(await _sum_amount(session, "partner_settlements", MODEL_BY_TABLE["partner_settlements"].status.in_(("pending", "unpaid")))),
-        "unlinked_international": await _count(session, "international_orders", MODEL_BY_TABLE["international_orders"].status.in_(("new", "pending"))),
+        "unlinked_international": await _unlinked_international_count(session),
         "stuck_orders": stuck_orders,
     }}
 
@@ -2901,10 +2942,42 @@ def _order_link_value(row: Any, keys: tuple[str, ...]) -> str | None:
     return _first_text(*(extra.get(key) for key in keys)) or None
 
 
+def _linked_international_ids(
+    international_rows: list[Any],
+    local_rows: list[Any],
+) -> set[str]:
+    """Resolve both directions of the persisted one-to-one link contract."""
+    local_ids = {str(row.id) for row in local_rows}
+    linked_ids: set[str] = set()
+    for local_row in local_rows:
+        international_id = _order_link_value(local_row, ORDER_LINK_INTERNATIONAL_KEYS)
+        if international_id:
+            linked_ids.add(international_id)
+    for international_row in international_rows:
+        local_id = _order_link_value(international_row, ORDER_LINK_LOCAL_KEYS)
+        if local_id and local_id in local_ids:
+            linked_ids.add(str(international_row.id))
+    return linked_ids
+
+
+async def _unlinked_international_count(session: AsyncSession) -> int:
+    international_rows = await _rows(session, "international_orders", limit=1000)
+    local_rows = await _rows(session, "orders", limit=2000)
+    linked_ids = _linked_international_ids(international_rows, local_rows)
+    terminal_statuses = {"cancelled", "canceled", "returned", "refunded"}
+    return sum(
+        1
+        for row in international_rows
+        if str(row.status or "").strip().lower() not in terminal_statuses
+        and str(row.id) not in linked_ids
+    )
+
+
 @router.get("/api/admin-shopping/order-links/international")
 async def api_admin_order_links(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     international_rows = await _rows(session, "international_orders", limit=500)
     local_rows = await _rows(session, "orders", limit=1000)
+    linked_ids = _linked_international_ids(international_rows, local_rows)
     linked_by_international: dict[str, dict[str, Any]] = {}
     for local_row in local_rows:
         international_id = _order_link_value(local_row, ORDER_LINK_INTERNATIONAL_KEYS)
@@ -2923,7 +2996,14 @@ async def api_admin_order_links(staff: User = Depends(require_staff), session: A
         linked_local = linked_by_international.get(str(payload.get("id")))
         payload["linked_order_id"] = linked_local.get("id") if linked_local else None
         payload["linked_local_order_id"] = linked_local.get("id") if linked_local else None
-    return {"data": international_payloads}
+    return {
+        "data": international_payloads,
+        "meta": {
+            "total": len(international_payloads),
+            "linked": len(linked_ids.intersection({str(row.id) for row in international_rows})),
+            "unlinked": len(international_payloads) - len(linked_ids.intersection({str(row.id) for row in international_rows})),
+        },
+    }
 
 
 @router.get("/api/loyalty/tiers")
@@ -6879,7 +6959,7 @@ async def api_content_restore_page(page_id: uuid.UUID, request: Request, staff: 
 
 @router.get("/api/content/blog/{slug}")
 async def api_content_blog_article(slug: str, session: AsyncSession = Depends(get_session)):
-    articles = [_blog_article_payload(row) for row in await _rows(session, "site_content", limit=500)]
+    articles = [_blog_article_payload(row) for row in await _blog_source_rows(session)]
     article = next((row for row in articles if row.get("slug") == slug and row.get("is_published") is True), None)
     if article is None:
         raise HTTPException(status_code=404, detail="article_not_found")
@@ -6946,7 +7026,7 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
             await _ensure_home_page_sections(session)
     rows = await _resource_data(session, table)
     if section_key == "blog":
-        rows = [_blog_article_payload(row) for row in await _rows(session, "site_content", limit=500)]
+        rows = [_blog_article_payload(row) for row in await _blog_source_rows(session)]
         if not admin:
             rows = [row for row in rows if row.get("is_published") is True]
         if category and category != "all":
@@ -6978,8 +7058,8 @@ async def api_content_create_section(section_key: str, request: Request, staff: 
         raise HTTPException(status_code=404, detail="content_section_not_found")
     body = await request.json()
     if section_key == "blog":
-        values, extra = _normalize_blog_body(body, for_create=True)
-        row = MODEL_BY_TABLE["site_content"](**values, extra_data=extra)
+        values, extra = _normalize_blog_body(body, for_create=True, table="blog_articles")
+        row = MODEL_BY_TABLE["blog_articles"](**values, extra_data=extra)
         session.add(row)
         await session.commit()
         return {"data": _blog_article_payload(row)}
@@ -6997,6 +7077,22 @@ async def api_content_update_section(section_key: str, record_id: str, request: 
     table = CONTENT_TABLES.get(section_key)
     if table is None:
         raise HTTPException(status_code=404, detail="content_section_not_found")
+    if section_key == "blog":
+        try:
+            parsed_id = uuid.UUID(str(record_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_uuid:record_id")
+        row = await session.get(MODEL_BY_TABLE["blog_articles"], parsed_id)
+        if row is None:
+            row = await session.get(MODEL_BY_TABLE["site_content"], parsed_id)
+        if row is None or row.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="record_not_found")
+        values, extra = _normalize_blog_body(await request.json(), existing=row, table=row.__table__.name)
+        for key, value in values.items():
+            setattr(row, key, value)
+        row.extra_data = extra
+        await session.commit()
+        return {"data": _blog_article_payload(row)}
     model = MODEL_BY_TABLE[table]
     row = None
     try:
@@ -7016,13 +7112,6 @@ async def api_content_update_section(section_key: str, record_id: str, request: 
     if row is None:
         raise HTTPException(status_code=404, detail="record_not_found")
     body = _normalize_admin_body(table, await request.json(), staff, for_create=False)
-    if section_key == "blog":
-        values, extra = _normalize_blog_body(body, existing=row)
-        for key, value in values.items():
-            setattr(row, key, value)
-        row.extra_data = extra
-        await session.commit()
-        return {"data": _blog_article_payload(row)}
     if table == "form_settings":
         FormSettingsPersistenceService.validate(body, form_key=getattr(row, "name", None))
         active = body.get("is_active", getattr(row, "is_active", True))
@@ -7046,6 +7135,15 @@ async def api_content_delete_section(section_key: str, record_id: uuid.UUID, sta
     table = CONTENT_TABLES.get(section_key)
     if table is None:
         raise HTTPException(status_code=404, detail="content_section_not_found")
+    if section_key == "blog":
+        row = await session.get(MODEL_BY_TABLE["blog_articles"], record_id)
+        if row is None:
+            row = await session.get(MODEL_BY_TABLE["site_content"], record_id)
+        if row is None or row.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="record_not_found")
+        row.deleted_at = datetime.now(timezone.utc)
+        await session.commit()
+        return {"ok": True, "data": _blog_article_payload(row)}
     result = await ResourceRepository(session, table, staff.id, roles).delete({
         "filters": [{"column": "id", "operator": "eq", "value": str(record_id)}],
     })
@@ -7829,7 +7927,12 @@ async def api_export_admin_dataset(dataset: str, staff: User = Depends(require_s
 async def api_reject_or_create_backup(request: Request, staff: User = Depends(require_admin), session: AsyncSession = Depends(get_session)):
     body = await request.json()
     tables = [str(item) for item in body.get("tables") or []]
-    row = await BackupCoordinator().create_backup(session, actor=staff, selected_tables=tables)
+    coordinator = BackupCoordinator()
+    row = (
+        await coordinator.create_backup(session, actor=staff, selected_tables=tables)
+        if get_settings().app_env == "test"
+        else await coordinator.queue_backup(session, actor=staff, selected_tables=tables)
+    )
     await session.commit()
     return {"data": {**row, "url": row.get("download_url")}}
 
@@ -9220,7 +9323,12 @@ async def function_proxy(function_name: str, request: Request, user: User | None
     if function_name == "database-backup":
         if user is None or not set(await roles_for(session, user.id)).intersection({"admin", "manager"}):
             raise HTTPException(status_code=403, detail="admin_required")
-        payload = await BackupCoordinator().create_backup(session, actor=user, selected_tables=list((body or {}).get("tables") or []))
+        coordinator = BackupCoordinator()
+        payload = (
+            await coordinator.create_backup(session, actor=user, selected_tables=list((body or {}).get("tables") or []))
+            if get_settings().app_env == "test"
+            else await coordinator.queue_backup(session, actor=user, selected_tables=list((body or {}).get("tables") or []))
+        )
         await session.commit()
         return {"data": payload}
     result = await execute_function(function_name, body, user, session, request)
@@ -9249,7 +9357,12 @@ async def create_backup(request: Request, staff: User = Depends(require_admin), 
     except Exception:
         body = {}
     selected_tables = list((body or {}).get("tables") or [])
-    row = await BackupCoordinator().create_backup(session, actor=staff, selected_tables=selected_tables)
+    coordinator = BackupCoordinator()
+    row = (
+        await coordinator.create_backup(session, actor=staff, selected_tables=selected_tables)
+        if get_settings().app_env == "test"
+        else await coordinator.queue_backup(session, actor=staff, selected_tables=selected_tables)
+    )
     _add_audit_log(session, staff.id, "admin.backups.create", "Requested encrypted backup bundle")
     await session.commit()
     return {**row, "data": row}
@@ -9264,6 +9377,16 @@ async def backups(staff: User = Depends(require_admin), session: AsyncSession = 
 async def latest_backup(staff: User = Depends(require_admin), session: AsyncSession = Depends(get_session)):
     rows = await BackupCoordinator().list_backups(session)
     return {"data": rows[0] if rows else None}
+
+
+@router.get("/backups/{backup_id}")
+async def backup_status(backup_id: uuid.UUID, staff: User = Depends(require_admin), session: AsyncSession = Depends(get_session)):
+    """Return one durable backup job status for dashboard polling."""
+    model = MODEL_BY_TABLE["backup_records"]
+    row = await session.get(model, backup_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="backup_not_found")
+    return {"data": BackupCoordinator._response(row)}
 
 
 @router.get("/backups/{backup_id}/verify")
