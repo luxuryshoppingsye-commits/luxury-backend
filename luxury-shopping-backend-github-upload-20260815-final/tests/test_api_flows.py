@@ -341,16 +341,15 @@ async def test_postgresql_api_end_to_end() -> None:
         assert email_process.status_code == 410
         assert email_process.json()["detail"] == "manual_worker_invocation_disabled"
 
-        merchant_email = f"merchant-{suffix}@example.com"
-        merchant_password = "Merchant123"
+        # Merchant onboarding is submitted by an authenticated customer. This
+        # keeps the legacy route aligned with the production account model.
+        merchant_email = customer_email
+        merchant_password = customer_password
         merchant_register = await client.post(
             "/auth/register-merchant",
+            headers=customer_headers,
             json={
-                "email": merchant_email,
-                "password": merchant_password,
-                "ownerName": "Merchant Owner",
                 "storeName": f"Store {suffix}",
-                "phone": "+967722222222",
                 "logoUrl": "/uploads/site-assets/test-logo.png",
                 "commercialRegisterUrl": "/uploads/partner-documents/register.pdf",
                 "storeInsideImageUrl": "/uploads/partner-documents/inside.png",

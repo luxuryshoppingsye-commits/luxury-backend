@@ -10,13 +10,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
-from backend.app.api.routes import auth as auth_routes
-from backend.app.config import get_settings
-from backend.app.database import SessionFactory
-from backend.app.main import app
-from backend.app.models import MODEL_BY_TABLE
-from backend.app.models.domain import AccountSecurity, PasswordResetToken, PhoneOtpToken, Profile, RefreshToken, User, UserRole
-from backend.app.security.passwords import hash_password
+from app.api.routes import auth as auth_routes
+from app.config import get_settings
+from app.database import SessionFactory
+from app.main import app
+from app.models import MODEL_BY_TABLE
+from app.models.domain import AccountSecurity, PasswordResetToken, PhoneOtpToken, Profile, RefreshToken, User, UserRole
+from app.security.passwords import hash_password
 
 
 pytestmark = pytest.mark.asyncio
@@ -29,8 +29,8 @@ def _assert_safe_database() -> None:
         pytest.fail("Refusing account/session tests outside APP_ENV=test", pytrace=False)
     if not settings.allow_test_fixtures:
         pytest.fail("Refusing account/session tests when ALLOW_TEST_FIXTURES is not true", pytrace=False)
-    if settings.database_name != "luxury_full_cross_platform_e2e_test":
-        pytest.fail("Refusing account/session tests outside luxury_full_cross_platform_e2e_test", pytrace=False)
+    if not settings.database_is_test:
+        pytest.fail("Refusing account/session tests outside a trusted test database", pytrace=False)
     if parsed.hostname != "127.0.0.1" or parsed.port != 55433:
         pytest.fail("Refusing account/session tests outside 127.0.0.1:55433", pytrace=False)
     if settings.database_name == "luxury_official_recovery":
@@ -109,7 +109,13 @@ async def test_email_verification_gates_new_customer_and_invalidates_old_links()
         email = f"{run_id}@example.com"
         register = await client.post(
             "/auth/register-customer",
-            json={"email": email, "password": "ValidPass123", "fullName": "New Customer"},
+            json={
+                "email": email,
+                "password": "ValidPass123",
+                "fullName": "New Customer",
+                "phone": "777123456",
+                "city": "Sanaa",
+            },
         )
         assert register.status_code == 201, register.text
         body = register.json()
@@ -167,6 +173,7 @@ async def test_registration_captcha_is_enforced_server_side_with_test_provider(
             fixtures_enabled=True,
             registration_rate_limit=200,
             app_public_url="http://testserver",
+            frontend_public_url="http://testserver",
             smtp_host="",
             smtp_from_email="",
         ),
@@ -175,7 +182,13 @@ async def test_registration_captcha_is_enforced_server_side_with_test_provider(
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         missing = await client.post(
             "/auth/register-customer",
-            json={"email": f"{run_id}-missing@example.com", "password": "ValidPass123", "fullName": "Captcha Missing"},
+            json={
+                "email": f"{run_id}-missing@example.com",
+                "password": "ValidPass123",
+                "fullName": "Captcha Missing",
+                "phone": "777123456",
+                "city": "Sanaa",
+            },
         )
         assert missing.status_code == 400
         assert missing.json()["detail"] == "captcha_required"
@@ -186,6 +199,8 @@ async def test_registration_captcha_is_enforced_server_side_with_test_provider(
                 "email": f"{run_id}-ok@example.com",
                 "password": "ValidPass123",
                 "fullName": "Captcha OK",
+                "phone": "777123457",
+                "city": "Sanaa",
                 "captchaToken": "test-captcha-ok",
             },
         )
@@ -420,7 +435,13 @@ async def test_concurrent_duplicate_customer_registration_creates_one_user_and_r
         async def submit() -> int:
             response = await client.post(
                 "/auth/register-customer",
-                json={"email": email, "password": "ValidPass123", "fullName": "Duplicate Customer"},
+                json={
+                    "email": email,
+                    "password": "ValidPass123",
+                    "fullName": "Duplicate Customer",
+                    "phone": "777123456",
+                    "city": "Sanaa",
+                },
             )
             return response.status_code
 
@@ -438,17 +459,23 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
     _assert_safe_database()
     run_id = f"merchant-{uuid.uuid4().hex[:8]}"
     admin, admin_password = await _seed_user(run_id, role="admin")
+    merchant, merchant_password = await _seed_user(run_id, role="customer")
+    async with SessionFactory() as session:
+        profile = await session.get(Profile, merchant.id)
+        assert profile is not None
+        profile.phone = "777123457"
+        profile.city = "Sanaa"
+        await session.commit()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        merchant_email = f"{run_id}@merchant-example.com"
+        merchant_email = merchant.email
+        merchant_headers = (await _login(client, merchant_email, merchant_password))["header"]
         pending = await client.post(
             "/auth/register-merchant",
+            headers={"Authorization": merchant_headers},
             json={
-                "email": merchant_email,
-                "password": "ValidPass123",
                 "ownerName": "Merchant Owner",
                 "storeName": "Pending Store",
-                "phone": "+967777123457",
             },
         )
         assert pending.status_code == 201, pending.text
@@ -482,12 +509,18 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
         assert merchant_login.status_code == 200, merchant_login.text
         assert "partner" in merchant_login.json()["roles"]
 
-        rejected_email = f"{run_id}-reject@merchant-example.com"
+        rejected, rejected_password = await _seed_user(f"{run_id}-reject", role="customer")
+        async with SessionFactory() as session:
+            rejected_profile = await session.get(Profile, rejected.id)
+            assert rejected_profile is not None
+            rejected_profile.phone = "777123458"
+            rejected_profile.city = "Sanaa"
+            await session.commit()
+        rejected_email = rejected.email
         rejected = await client.post(
             "/auth/register-merchant",
+            headers={"Authorization": (await _login(client, rejected_email, rejected_password))["header"]},
             json={
-                "email": rejected_email,
-                "password": "ValidPass123",
                 "ownerName": "Rejected Owner",
                 "storeName": "Rejected Store",
             },

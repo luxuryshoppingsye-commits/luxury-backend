@@ -27,8 +27,8 @@ def _assert_safe_database() -> None:
         pytest.fail("Refusing report/admin tests outside APP_ENV=test", pytrace=False)
     if not settings.allow_test_fixtures:
         pytest.fail("Refusing report/admin tests when ALLOW_TEST_FIXTURES is not true", pytrace=False)
-    if settings.database_name != "luxury_full_cross_platform_e2e_test":
-        pytest.fail("Refusing report/admin tests outside luxury_full_cross_platform_e2e_test", pytrace=False)
+    if not settings.database_is_test:
+        pytest.fail("Refusing report/admin tests outside a trusted test database", pytrace=False)
     if parsed.hostname != "127.0.0.1" or parsed.port != 55433:
         pytest.fail("Refusing report/admin tests outside 127.0.0.1:55433", pytrace=False)
     if settings.database_name == "luxury_official_recovery":
@@ -189,6 +189,22 @@ async def test_support_workflow_and_operational_day_scope() -> None:
     admin, admin_password = await _seed_user("admin", run_id)
     await _seed_paid_order(run_id, customer.id, status="pending", paid=None)
     target_day = date.today().isoformat()
+    # The cloned QA database may contain an operational day for today. Close
+    # that fixture first so this contract tests the open/duplicate/close flow
+    # deterministically without touching a real environment.
+    async with SessionFactory() as session:
+        day_model = MODEL_BY_TABLE["operational_days"]
+        existing_day = (
+            await session.execute(
+                select(day_model).where(
+                    day_model.deleted_at.is_(None),
+                    day_model.extra_data["date"].astext == target_day,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_day is not None:
+            existing_day.status = "closed"
+            await session.commit()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         customer_headers = await _login(client, customer, customer_password)
@@ -210,7 +226,8 @@ async def test_support_workflow_and_operational_day_scope() -> None:
     assert opened_day.json()["data"]["date"] == target_day
     assert opened_day.json()["data"]["status"] == "open"
     assert duplicate_open.status_code == 409
-    assert close_tomorrow.status_code == 200
+    # Closing is blocked while a pending order exists for the day.
+    assert close_tomorrow.status_code == 409
 
 
 async def test_theme_bootstrap_sync_loyalty_and_forms_contracts() -> None:
@@ -227,6 +244,8 @@ async def test_theme_bootstrap_sync_loyalty_and_forms_contracts() -> None:
             stock_quantity=2,
             is_active=True,
             approval_status="approved",
+            image_url="/uploads/products/0039c8877ec3f5759d10cb9b.webp",
+            images=["/uploads/products/0039c8877ec3f5759d10cb9b.webp"],
         )
         pending_product = Product(
             name=f"{run_id} pending catalog product",

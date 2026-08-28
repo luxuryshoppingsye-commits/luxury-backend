@@ -7511,6 +7511,44 @@ async def api_export_products(staff: User = Depends(require_staff), session: Asy
     return {"data": [serialize_record(row) for row in await _rows(session, "products", limit=5000)]}
 
 
+ADMIN_EXPORT_DATASETS = {
+    "orders": "orders",
+    "customers": "profiles",
+    "categories": "categories",
+    "brands": "brands",
+    "partners": "user_roles",
+}
+
+
+@router.get("/api/admin-data/export/{dataset}")
+async def api_export_admin_dataset(dataset: str, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    """Export the datasets exposed by the admin data screen.
+
+    The frontend has always advertised these exports, but the backend only
+    implemented the products route. Keep the response shape stable and use
+    the same server-side serializers as the admin screens.
+    """
+    table = ADMIN_EXPORT_DATASETS.get(str(dataset or "").strip().lower())
+    if table is None:
+        raise HTTPException(status_code=404, detail="admin_export_dataset_not_found")
+    if table == "orders":
+        rows = await _rows(session, table, limit=5000)
+        return {"data": await _serialize_orders_with_financials(session, rows)}
+    if table == "profiles":
+        result = await session.execute(
+            select(Profile)
+            .join(UserRole, UserRole.user_id == Profile.user_id)
+            .where(Profile.deleted_at.is_(None), UserRole.role == "customer")
+            .order_by(Profile.created_at.desc())
+            .limit(5000)
+        )
+        return {"data": [serialize_record(row) for row in result.scalars()]}
+    if table == "user_roles":
+        rows = await _rows(session, table, limit=5000)
+        return {"data": [serialize_record(row) for row in rows if str(getattr(row, "role", "") or "").lower() == "partner"]}
+    return {"data": [serialize_record(row) for row in await _rows(session, table, limit=5000)]}
+
+
 @router.post("/api/admin-data/backup", status_code=201)
 async def api_reject_or_create_backup(request: Request, staff: User = Depends(require_admin), session: AsyncSession = Depends(get_session)):
     body = await request.json()

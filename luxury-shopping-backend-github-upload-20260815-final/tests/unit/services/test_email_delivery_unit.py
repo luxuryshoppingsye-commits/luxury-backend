@@ -95,6 +95,9 @@ def test_resend_payload_contains_arabic_content_logo_and_action_link(monkeypatch
     assert "استعادة كلمة المرور" in payload["subject"]
     assert "رفاهية التسوق" in payload["html"]
     assert "logo-OdLYDlxV.png" in payload["html"]
+    assert 'width="24" height="24"' in payload["html"]
+    assert 'color:#58a6ff;text-decoration:underline' in payload["html"]
+    assert 'padding:11px 24px' not in payload["html"]
     assert "????" not in payload["html"]
 
 
@@ -143,6 +146,46 @@ def test_smtp_strips_google_app_password_spaces_and_uses_branded_html(monkeypatc
     assert "https://luxuryshoppings.com/assets/logo-OdLYDlxV.png" in html
     assert "تجربة تسوق تليق بك" in html
     assert "letter-spacing:normal" in html
+    assert 'width="24" height="24"' in html
+    assert 'color:#58a6ff;text-decoration:underline' in html
+    assert 'padding:11px 24px' not in html
+
+
+def test_verification_code_is_not_duplicated_in_branded_html(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        email_provider="resend",
+        resend_api_key="resend_test_key",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="no-reply@luxuryshoppings.com",
+        smtp_host="",
+        smtp_port=587,
+        smtp_username="",
+        smtp_password="",
+        smtp_from_email="",
+    )
+    captured = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"id": "email_test_id"}
+
+    def fake_post(url, *, headers, json, timeout):
+        captured["html"] = json["html"]
+        return Response()
+
+    monkeypatch.setattr(outbox_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(outbox_service.httpx, "post", fake_post)
+
+    outbox_service._send_email_sync(
+        "customer@example.com",
+        "رمز التحقق",
+        "رمز التحقق هو: 17155284",
+    )
+
+    assert captured["html"].count("17155284") == 1
 
 
 @pytest.mark.asyncio

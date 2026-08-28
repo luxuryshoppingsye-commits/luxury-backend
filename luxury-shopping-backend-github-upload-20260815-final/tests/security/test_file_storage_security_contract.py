@@ -20,10 +20,10 @@ from backend.app.security.passwords import hash_password
 pytestmark = pytest.mark.asyncio
 
 PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
-    b"\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe"
-    b"\x02\xfeA\xe2!\xbc\x00\x00\x00\x00IEND\xaeB`\x82"
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\xd7c\xf8"
+    b"\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00"
+    b"IEND\xaeB`\x82"
 )
 INFECTED_PNG = PNG_BYTES + b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!"
 
@@ -35,8 +35,8 @@ def _assert_safe_database() -> None:
         pytest.fail("Refusing file storage tests outside APP_ENV=test", pytrace=False)
     if not settings.allow_test_fixtures:
         pytest.fail("Refusing file storage tests when ALLOW_TEST_FIXTURES is not true", pytrace=False)
-    if settings.database_name != "luxury_full_cross_platform_e2e_test":
-        pytest.fail("Refusing file storage tests outside luxury_full_cross_platform_e2e_test", pytrace=False)
+    if not settings.database_is_test:
+        pytest.fail("Refusing file storage tests outside a trusted test database", pytrace=False)
     if parsed.hostname != "127.0.0.1" or parsed.port != 55433:
         pytest.fail("Refusing file storage tests outside 127.0.0.1:55433", pytrace=False)
     if settings.database_name == "luxury_official_recovery":

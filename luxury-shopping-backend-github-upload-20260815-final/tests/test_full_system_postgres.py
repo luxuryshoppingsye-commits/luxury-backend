@@ -526,14 +526,13 @@ async def test_full_role_flow_writes_api_results_to_postgres() -> None:
         )
         assert ticket_message.status_code == 201, ticket_message.text
 
+        merchant_email = f"e2e-customer-{suffix}@example.com"
+        merchant_password = "Customer123"
         merchant = await client.post(
             "/auth/register-merchant",
+            headers=customer_headers,
             json={
-                "email": f"e2e-merchant-{suffix}@example.com",
-                "password": "Merchant123",
-                "ownerName": "E2E Merchant",
                 "storeName": f"E2E Store {suffix}",
-                "phone": "+967733000333",
                 "logoUrl": uploaded_url,
                 "commercialRegisterUrl": "/uploads/partner-documents/e2e-register.pdf",
                 "storeInsideImageUrl": "/uploads/partner-documents/e2e-inside.png",
@@ -542,10 +541,10 @@ async def test_full_role_flow_writes_api_results_to_postgres() -> None:
         )
         assert merchant.status_code == 201, merchant.text
         applications = await client.get("/admin/partner-applications", headers=admin_headers)
-        app_row = next(row for row in applications.json() if row.get("email") == f"e2e-merchant-{suffix}@example.com")
+        app_row = next(row for row in applications.json() if row.get("email") == merchant_email)
         approved = await client.post("/functions/approve_partner_application", headers=admin_headers, json={"application_id": app_row["id"]})
         assert approved.status_code == 200, approved.text
-        merchant_auth = await _login(client, f"e2e-merchant-{suffix}@example.com", "Merchant123")
+        merchant_auth = await _login(client, merchant_email, merchant_password)
         merchant_headers = _headers(merchant_auth["access_token"])
         partner_product = await client.post(
             "/manage/products",
@@ -653,7 +652,7 @@ async def test_full_role_flow_writes_api_results_to_postgres() -> None:
         assert db_alternate_address is not None and db_alternate_address.deleted_at is not None
         assert await session.get(ticket_model, uuid.UUID(ticket_id)) is not None
         assert int((await session.execute(select(func.count()).select_from(ticket_message_model).where(ticket_message_model.ticket_id == uuid.UUID(ticket_id)))).scalar_one()) >= 2
-        assert int((await session.execute(select(func.count()).select_from(storefront_model).where(storefront_model.email == f"e2e-merchant-{suffix}@example.com"))).scalar_one()) == 1
+        assert int((await session.execute(select(func.count()).select_from(storefront_model).where(storefront_model.email == merchant_email))).scalar_one()) == 1
         assert int((await session.execute(select(func.count()).select_from(courier_location_model).where(courier_location_model.user_id == delivery_id))).scalar_one()) >= 1
         assert int((await session.execute(select(func.count()).select_from(marketer_code_model).where(marketer_code_model.user_id == marketer_id))).scalar_one()) == 1
         assert int((await session.execute(select(func.count()).select_from(export_model).where(export_model.user_id == admin_id))).scalar_one()) >= 1

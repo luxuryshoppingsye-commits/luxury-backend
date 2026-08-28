@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -26,7 +27,7 @@ from backend.app.services.catalog_policy import public_product_clauses
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
 ARTIFACT_DIR = Path("artifacts/permission-query-live-verification")
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = os.getenv("LIVE_API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 def _write_json(name: str, payload: Any) -> None:

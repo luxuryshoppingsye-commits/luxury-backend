@@ -5,13 +5,14 @@ import sys
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 try:
     from backend.app.config import get_settings
-    from backend.app.database import engine
+    from backend.app.database import SessionFactory, engine
 except ModuleNotFoundError:
     import importlib
     import sys
@@ -29,7 +30,7 @@ except ModuleNotFoundError:
     sys.modules.setdefault("backend.app.main", app_main)
 
     from app.config import get_settings
-    from app.database import engine
+    from app.database import SessionFactory, engine
 
 
 _LIVE_BACKEND_TEST_PATHS = (
@@ -66,5 +67,12 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 
 @pytest_asyncio.fixture(autouse=True)
 async def dispose_database_pool_between_tests():
+    # Rate-limit counters are intentionally shared by real requests, but
+    # must not leak from one isolated test into the next test in the same
+    # database group. Keep each test's in-request sequence intact.
+    async with SessionFactory() as session:
+        await session.execute(text("delete from security_events where type = 'api_rate_limit'"))
+        await session.execute(text("delete from login_attempts where detail is not null"))
+        await session.commit()
     yield
     await engine.dispose()

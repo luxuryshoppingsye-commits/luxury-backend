@@ -65,7 +65,6 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
     suffix = uuid.uuid4().hex[:10]
     admin_email = f"merchant-e2e-admin-{suffix}@example.com"
     customer_email = f"merchant-e2e-customer-{suffix}@example.com"
-    merchant_email = f"merchant-e2e-{suffix}@example.com"
     admin_id, admin_password = await _seed_user(admin_email, "admin", "Merchant E2E Admin")
     customer_id, customer_password = await _seed_user(customer_email, "customer", "Merchant E2E Customer")
     await _activate_user(customer_id)
@@ -84,37 +83,38 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
         logo_url = logo.json()["imageUrl"]
         assert logo_url.endswith(".webp")
 
+        customer_auth = await _login(client, customer_email, customer_password)
+        customer_headers = _headers(customer_auth["access_token"])
+        # The storefront submits the public partnership application endpoint.
+        # The old /auth/register-merchant route is an authenticated legacy
+        # mutation and is intentionally not used by the customer UI.
         registration = await client.post(
-            "/auth/register-merchant",
+            "/api/partnership/apply",
+            headers=customer_headers,
             json={
-                "email": merchant_email,
-                "password": "Merchant123",
-                "ownerName": "Merchant E2E Owner",
-                "storeName": f"Merchant E2E Store {suffix}",
+                "email": customer_email,
+                "businessName": f"Merchant E2E Store {suffix}",
+                "businessType": "retail",
                 "phone": "+967733000333",
-                "logoUrl": logo_url,
-                "commercialRegisterUrl": "/uploads/partner-documents/e2e-register.pdf",
-                "storeInsideImageUrl": "/uploads/partner-documents/e2e-inside.png",
-                "storeOutsideImageUrl": "/uploads/partner-documents/e2e-outside.png",
-                "captchaToken": "test-captcha-ok",
+                "description": "Merchant E2E Owner",
             },
         )
         assert registration.status_code == 201, registration.text
-        application_id = registration.json().get("application", {}).get("id") or registration.json().get("applicationId")
+        application_id = registration.json()["data"]["id"]
         if not application_id:
             applications = await client.get("/admin/partner-applications", headers=admin_headers)
             assert applications.status_code == 200, applications.text
-            application_id = next(row["id"] for row in applications.json() if row.get("email") == merchant_email)
+            application_id = next(row["id"] for row in applications.json() if row.get("email") == customer_email)
         approval = await client.post(
             "/functions/approve_partner_application",
             headers=admin_headers,
             json={"application_id": application_id},
         )
         assert approval.status_code == 200, approval.text
-        merchant_user_id = uuid.UUID(registration.json()["user"]["id"])
+        merchant_user_id = customer_id
         await _activate_user(merchant_user_id)
 
-        merchant_auth = await _login(client, merchant_email, "Merchant123")
+        merchant_auth = await _login(client, customer_email, customer_password)
         assert "partner" in merchant_auth["roles"]
         merchant_headers = _headers(merchant_auth["access_token"])
 

@@ -35,8 +35,8 @@ def _assert_safe_database() -> None:
         pytest.fail("Refusing payment/refund tests outside APP_ENV=test", pytrace=False)
     if not settings.allow_test_fixtures:
         pytest.fail("Refusing payment/refund tests when ALLOW_TEST_FIXTURES is not true", pytrace=False)
-    if settings.database_name != "luxury_full_cross_platform_e2e_test":
-        pytest.fail("Refusing payment/refund tests outside luxury_full_cross_platform_e2e_test", pytrace=False)
+    if not settings.database_is_test:
+        pytest.fail("Refusing payment/refund tests outside a trusted test database", pytrace=False)
     if parsed.hostname != "127.0.0.1" or parsed.port != 55433:
         pytest.fail("Refusing payment/refund tests outside 127.0.0.1:55433", pytrace=False)
     if settings.database_name == "luxury_official_recovery":

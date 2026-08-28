@@ -10,12 +10,12 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from starlette.requests import Request
 
-from backend.app.config import Settings, get_settings
-from backend.app.database import SessionFactory
-from backend.app.main import app
-from backend.app.models.domain import AccountSecurity, Profile, User, UserRole
-from backend.app.security.passwords import hash_password
-from backend.app.services.api_protection import (
+from app.config import Settings, get_settings
+from app.database import SessionFactory
+from app.main import app
+from app.models.domain import AccountSecurity, Profile, User, UserRole
+from app.security.passwords import hash_password
+from app.services.api_protection import (
     REQUEST_ID_HEADER,
     capabilities_for_roles,
     policy_registry_snapshot,
@@ -33,8 +33,8 @@ def _assert_safe_database() -> None:
         pytest.fail("Refusing API protection tests outside APP_ENV=test", pytrace=False)
     if not settings.allow_test_fixtures:
         pytest.fail("Refusing API protection tests when ALLOW_TEST_FIXTURES is not true", pytrace=False)
-    if settings.database_name != "luxury_full_cross_platform_e2e_test":
-        pytest.fail("Refusing API protection tests outside luxury_full_cross_platform_e2e_test", pytrace=False)
+    if not settings.database_is_test:
+        pytest.fail("Refusing API protection tests outside a trusted test database", pytrace=False)
     if parsed.hostname != "127.0.0.1" or parsed.port != 55433:
         pytest.fail("Refusing API protection tests outside 127.0.0.1:55433", pytrace=False)
     if settings.database_name == "luxury_official_recovery":
@@ -67,6 +67,16 @@ def test_production_cors_rejects_wildcard_and_local_origins() -> None:
         "APP_ENV": "production",
         "ALLOW_TEST_FIXTURES": False,
         "JWT_SECRET": "unit-test-jwt-secret-512512512512512512",
+        "API_BASE_URL": "https://api.luxuryshoppings.com",
+        "APP_PUBLIC_URL": "https://api.luxuryshoppings.com",
+        "WS_BASE_URL": "wss://api.luxuryshoppings.com",
+        "FRONTEND_PUBLIC_URL": "https://luxuryshoppings.com",
+        "STORAGE_PROVIDER": "r2",
+        "R2_ENDPOINT_URL": "https://r2.example.com",
+        "R2_BUCKET": "luxury-assets",
+        "R2_ACCESS_KEY_ID": "test-access-key",
+        "R2_SECRET_ACCESS_KEY": "test-secret-key",
+        "R2_PUBLIC_BASE_URL": "https://assets.example.com",
         "BACKUP_OFFSITE_PROVIDER": "s3",
         "BACKUP_S3_BUCKET": "luxury-prod-backups",
     }
@@ -74,8 +84,8 @@ def test_production_cors_rejects_wildcard_and_local_origins() -> None:
         Settings(**base, CORS_ORIGINS="*")
     with pytest.raises(ValidationError, match="localhost or emulator"):
         Settings(**base, CORS_ORIGINS="http://127.0.0.1:5190")
-    settings = Settings(**base, CORS_ORIGINS="https://shop.example.com")
-    assert settings.allowed_origins == ["https://shop.example.com"]
+    settings = Settings(**base, CORS_ORIGINS="https://luxuryshoppings.com,https://www.luxuryshoppings.com")
+    assert settings.allowed_origins == ["https://luxuryshoppings.com", "https://www.luxuryshoppings.com"]
 
 
 def test_production_default_backup_provider_does_not_block_web_startup() -> None:
@@ -84,12 +94,24 @@ def test_production_default_backup_provider_does_not_block_web_startup() -> None
         "APP_ENV": "production",
         "ALLOW_TEST_FIXTURES": False,
         "JWT_SECRET": "unit-test-jwt-secret-512512512512512512",
-        "CORS_ORIGINS": "https://shop.example.com",
+        "API_BASE_URL": "https://api.luxuryshoppings.com",
+        "APP_PUBLIC_URL": "https://api.luxuryshoppings.com",
+        "WS_BASE_URL": "wss://api.luxuryshoppings.com",
+        "FRONTEND_PUBLIC_URL": "https://luxuryshoppings.com",
+        "STORAGE_PROVIDER": "r2",
+        "R2_ENDPOINT_URL": "https://r2.example.com",
+        "R2_BUCKET": "luxury-assets",
+        "R2_ACCESS_KEY_ID": "test-access-key",
+        "R2_SECRET_ACCESS_KEY": "test-secret-key",
+        "R2_PUBLIC_BASE_URL": "https://assets.example.com",
+        "CORS_ORIGINS": "https://luxuryshoppings.com,https://www.luxuryshoppings.com",
     }
     settings = Settings(**base)
-    assert settings.backup_offsite_provider == "disabled"
+    # Production filesystem backup settings are promoted to the configured
+    # S3-compatible R2 target so backups survive ephemeral Render storage.
+    assert settings.backup_offsite_provider == "s3"
     explicit_filesystem = Settings(**base, BACKUP_OFFSITE_PROVIDER="filesystem")
-    assert explicit_filesystem.backup_offsite_provider == "disabled"
+    assert explicit_filesystem.backup_offsite_provider == "s3"
 
 
 def test_route_policy_registry_classifies_registered_routes() -> None:

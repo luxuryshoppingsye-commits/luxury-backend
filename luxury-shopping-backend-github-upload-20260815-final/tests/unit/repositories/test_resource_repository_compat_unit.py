@@ -35,13 +35,14 @@ def test_blog_article_legacy_boolean_filter_uses_canonical_column() -> None:
     assert "extra_data" not in str(clause)
 
 
-def test_extra_data_boolean_filter_compares_json_text_value() -> None:
+def test_product_review_approval_filter_uses_canonical_column() -> None:
     clause = _repository("product_reviews")._filter_clause(
         {"column": "is_approved", "operator": "eq", "value": True}
     )
 
-    assert "extra_data" in str(clause)
-    assert clause.right.value == "true"
+    assert "product_reviews.is_approved" in str(clause)
+    assert "extra_data" not in str(clause)
+    assert str(clause.right).lower() == "true"
 
 
 def test_static_page_serialization_returns_legacy_content_aliases() -> None:

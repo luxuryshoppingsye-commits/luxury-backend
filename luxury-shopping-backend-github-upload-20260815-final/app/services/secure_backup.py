@@ -389,9 +389,21 @@ class FileSnapshotService:
             if source != self.upload_root and self.upload_root not in source.parents:
                 raise RuntimeError("unsafe_file_asset_path")
             if provider == "cloudflare_r2":
-                self._download_r2_file(storage_key=storage_key, target=target)
+                try:
+                    self._download_r2_file(storage_key=storage_key, target=target)
+                except Exception as exc:
+                    raise RuntimeError(f"file_missing:{row['id']}") from exc
             elif source.is_file():
                 shutil.copy2(source, target)
+            elif self.storage is not None and str(getattr(self.storage.settings, "storage_provider", "")).strip().lower() == "r2":
+                # Render's local filesystem is ephemeral. Older file_assets
+                # rows may still say local_uploads even though the object was
+                # migrated to R2, so recover those rows from the durable
+                # object store before declaring the backup incomplete.
+                try:
+                    self._download_r2_file(storage_key=storage_key, target=target)
+                except Exception as exc:
+                    raise RuntimeError(f"file_missing:{row['id']}") from exc
             else:
                 raise RuntimeError(f"file_missing:{row['id']}")
             if not target.is_file():
@@ -471,6 +483,26 @@ class BackupEncryptionService:
         destination.write_bytes(plaintext)
 
 
+def resolve_backup_offsite_provider(settings: Any) -> str:
+    """Choose durable offsite storage for an operational deployment.
+
+    The Render blueprint historically set ``filesystem`` while configuring
+    Cloudflare R2 for uploads. A filesystem copy is not durable on Render;
+    when the existing R2 credentials are complete, use the S3-compatible R2
+    endpoint automatically so older environment configurations remain safe.
+    """
+    provider = str(getattr(settings, "backup_offsite_provider", "filesystem") or "filesystem").strip().lower()
+    if provider != "filesystem" or str(getattr(settings, "app_env", "")).strip().lower() not in {"staging", "production"}:
+        return provider
+    r2_values = (
+        getattr(settings, "r2_endpoint_url", ""),
+        getattr(settings, "r2_bucket", ""),
+        getattr(settings, "r2_access_key_id", ""),
+        getattr(settings, "r2_secret_access_key", ""),
+    )
+    return "s3" if all(str(value or "").strip() for value in r2_values) else provider
+
+
 class OffsiteBackupService:
     def __init__(self, offsite_dir: Path, *, provider: str = "filesystem", settings: Any | None = None) -> None:
         self.offsite_dir = offsite_dir.resolve()
@@ -498,8 +530,14 @@ class OffsiteBackupService:
             "offsite_size": target.stat().st_size,
         }
 
+    def _s3_setting(self, backup_name: str, r2_name: str, default: str = "") -> str:
+        value = getattr(self.settings, backup_name, None)
+        if value in (None, ""):
+            value = getattr(self.settings, r2_name, default)
+        return str(value or default).strip()
+
     def _upload_and_verify_s3(self, encrypted_bundle: Path) -> dict[str, Any]:
-        bucket = str(self.settings.backup_s3_bucket or "").strip()
+        bucket = self._s3_setting("backup_s3_bucket", "r2_bucket")
         if not bucket:
             raise RuntimeError("backup_s3_bucket_missing")
         try:
@@ -507,20 +545,25 @@ class OffsiteBackupService:
         except ImportError as exc:
             raise RuntimeError("backup_s3_client_missing") from exc
 
-        prefix = str(self.settings.backup_s3_prefix or "luxury-secure-backups").strip().strip("/")
+        prefix = self._s3_setting("backup_s3_prefix", "", "luxury-secure-backups").strip("/")
         object_key = f"{prefix}/{encrypted_bundle.name}" if prefix else encrypted_bundle.name
         local_sha = _sha256(encrypted_bundle)
         kwargs: dict[str, Any] = {}
-        if self.settings.backup_s3_endpoint_url:
-            kwargs["endpoint_url"] = self.settings.backup_s3_endpoint_url
-        if self.settings.backup_s3_region:
-            kwargs["region_name"] = self.settings.backup_s3_region
-        if self.settings.backup_s3_access_key_id:
-            kwargs["aws_access_key_id"] = self.settings.backup_s3_access_key_id
-        if self.settings.backup_s3_secret_access_key:
-            kwargs["aws_secret_access_key"] = self.settings.backup_s3_secret_access_key
-        if self.settings.backup_s3_session_token:
-            kwargs["aws_session_token"] = self.settings.backup_s3_session_token
+        endpoint = self._s3_setting("backup_s3_endpoint_url", "r2_endpoint_url")
+        region = self._s3_setting("backup_s3_region", "r2_region", "auto")
+        access_key = self._s3_setting("backup_s3_access_key_id", "r2_access_key_id")
+        secret_key = self._s3_setting("backup_s3_secret_access_key", "r2_secret_access_key")
+        session_token = self._s3_setting("backup_s3_session_token", "")
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
+        if region:
+            kwargs["region_name"] = region
+        if access_key:
+            kwargs["aws_access_key_id"] = access_key
+        if secret_key:
+            kwargs["aws_secret_access_key"] = secret_key
+        if session_token:
+            kwargs["aws_session_token"] = session_token
         client = boto3.client("s3", **kwargs)
         metadata = {"sha256": local_sha, "encrypted": "true", "format": "luxury-secure-backup-v1"}
         client.upload_file(
@@ -530,7 +573,6 @@ class OffsiteBackupService:
             ExtraArgs={
                 "Metadata": metadata,
                 "ContentType": "application/octet-stream",
-                "ServerSideEncryption": "AES256",
             },
         )
         head = client.head_object(Bucket=bucket, Key=object_key)
@@ -560,7 +602,7 @@ class OffsiteBackupService:
             raise RuntimeError("backup_offsite_key_missing")
         destination.parent.mkdir(parents=True, exist_ok=True)
         if self.provider == "s3":
-            bucket = str(self.settings.backup_s3_bucket or "").strip()
+            bucket = self._s3_setting("backup_s3_bucket", "r2_bucket")
             if not bucket:
                 raise RuntimeError("backup_s3_bucket_missing")
             try:
@@ -568,16 +610,21 @@ class OffsiteBackupService:
             except ImportError as exc:
                 raise RuntimeError("backup_s3_client_missing") from exc
             kwargs: dict[str, Any] = {}
-            if self.settings.backup_s3_endpoint_url:
-                kwargs["endpoint_url"] = self.settings.backup_s3_endpoint_url
-            if self.settings.backup_s3_region:
-                kwargs["region_name"] = self.settings.backup_s3_region
-            if self.settings.backup_s3_access_key_id:
-                kwargs["aws_access_key_id"] = self.settings.backup_s3_access_key_id
-            if self.settings.backup_s3_secret_access_key:
-                kwargs["aws_secret_access_key"] = self.settings.backup_s3_secret_access_key
-            if self.settings.backup_s3_session_token:
-                kwargs["aws_session_token"] = self.settings.backup_s3_session_token
+            endpoint = self._s3_setting("backup_s3_endpoint_url", "r2_endpoint_url")
+            region = self._s3_setting("backup_s3_region", "r2_region", "auto")
+            access_key = self._s3_setting("backup_s3_access_key_id", "r2_access_key_id")
+            secret_key = self._s3_setting("backup_s3_secret_access_key", "r2_secret_access_key")
+            session_token = self._s3_setting("backup_s3_session_token", "")
+            if endpoint:
+                kwargs["endpoint_url"] = endpoint
+            if region:
+                kwargs["region_name"] = region
+            if access_key:
+                kwargs["aws_access_key_id"] = access_key
+            if secret_key:
+                kwargs["aws_secret_access_key"] = secret_key
+            if session_token:
+                kwargs["aws_session_token"] = session_token
             boto3.client("s3", **kwargs).download_file(bucket, key, str(destination))
         elif self.provider == "filesystem":
             source = (self.offsite_dir / key).resolve()
@@ -835,9 +882,10 @@ class BackupCoordinator:
         self.target = PostgreSQLTarget.from_url(self.settings.database_url)
         self.tools = PostgreSQLToolResolver(configured_bin_dir=self.settings.backup_pg_bin_dir).resolve()
         self.encryption = BackupEncryptionService(self.settings.resolved_backup_encryption_key_file)
+        offsite_provider = resolve_backup_offsite_provider(self.settings)
         self.offsite = OffsiteBackupService(
             self.settings.resolved_backup_offsite_dir,
-            provider=self.settings.backup_offsite_provider,
+            provider=offsite_provider,
             settings=self.settings,
         )
         self.retention = BackupRetentionService(

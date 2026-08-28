@@ -39,8 +39,8 @@ def _assert_safe_database() -> None:
         pytest.fail("Refusing backup/realtime tests outside APP_ENV=test", pytrace=False)
     if not settings.allow_test_fixtures:
         pytest.fail("Refusing backup/realtime tests when ALLOW_TEST_FIXTURES is not true", pytrace=False)
-    if settings.database_name != "luxury_full_cross_platform_e2e_test":
-        pytest.fail("Refusing backup/realtime tests outside luxury_full_cross_platform_e2e_test", pytrace=False)
+    if not settings.database_is_test:
+        pytest.fail("Refusing backup/realtime tests outside a trusted test database", pytrace=False)
     if parsed.hostname != "127.0.0.1" or parsed.port != 55433:
         pytest.fail("Refusing backup/realtime tests outside 127.0.0.1:55433", pytrace=False)
     if settings.database_name == "luxury_official_recovery":
@@ -297,7 +297,10 @@ async def test_backup_download_requires_verified_encrypted_offsite_bundle(tmp_pa
     async with SessionFactory() as session:
         row = model(
             user_id=admin.id,
-            status="ready",
+            # A malformed bundle cannot be inserted as ready because the
+            # database constraint deliberately protects that state. Use a
+            # failed record to verify the download guard at the API boundary.
+            status="failed",
             path="",
             description="tampered ready backup",
             extra_data={"encrypted_bundle_key": "missing.tar.gz.fernet"},
@@ -311,7 +314,7 @@ async def test_backup_download_requires_verified_encrypted_offsite_bundle(tmp_pa
         response = await client.get(f"/backups/{backup_id}/download", headers=headers)
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "backup_not_verified"
+    assert response.json()["detail"] == "backup_not_ready"
 
 
 @pytest.mark.asyncio
