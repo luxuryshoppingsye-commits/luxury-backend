@@ -2878,19 +2878,38 @@ async def api_admin_local_requests(staff: User = Depends(require_staff), session
     }}
 
 
+ORDER_LINK_INTERNATIONAL_KEYS = (
+    "linked_international_order_id",
+    "linkedInternationalOrderId",
+)
+ORDER_LINK_LOCAL_KEYS = (
+    "linked_local_order_id",
+    "linkedLocalOrderId",
+)
+
+
+def _order_link_value(row: Any, keys: tuple[str, ...]) -> str | None:
+    extra = dict(getattr(row, "extra_data", None) or {}) if not isinstance(row, dict) else row
+    return _first_text(*(extra.get(key) for key in keys)) or None
+
+
 @router.get("/api/admin-shopping/order-links/international")
 async def api_admin_order_links(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     international_rows = await _rows(session, "international_orders", limit=500)
     local_rows = await _rows(session, "orders", limit=1000)
     linked_by_international: dict[str, dict[str, Any]] = {}
     for local_row in local_rows:
-        local_extra = dict(local_row.extra_data or {})
-        international_id = _first_text(
-            local_extra.get("linked_international_order_id"),
-            local_extra.get("linkedInternationalOrderId"),
-        )
+        international_id = _order_link_value(local_row, ORDER_LINK_INTERNATIONAL_KEYS)
         if international_id:
             linked_by_international.setdefault(international_id, serialize_record(local_row))
+    local_by_id = {str(row.id): row for row in local_rows}
+    for international_row in international_rows:
+        local_id = _order_link_value(international_row, ORDER_LINK_LOCAL_KEYS)
+        if local_id and local_id in local_by_id:
+            linked_by_international.setdefault(
+                str(international_row.id),
+                serialize_record(local_by_id[local_id]),
+            )
     international_payloads = await _international_order_payloads(session, international_rows)
     for payload in international_payloads:
         linked_local = linked_by_international.get(str(payload.get("id")))
@@ -3993,6 +4012,22 @@ async def api_analytics_events(staff: User = Depends(require_staff), session: As
 @router.patch("/api/loyalty/admin/tiers/{tier_id}")
 async def api_loyalty_admin_update_tier(tier_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return await _create_update_delete_resource("loyalty_tiers", request, session, staff, tier_id, "update")
+
+
+@router.post("/api/loyalty/admin/tiers", status_code=201)
+async def api_loyalty_admin_create_tier(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    body = await request.json()
+    if not isinstance(body, dict) or len(str(body.get("name") or "").strip()) < 2:
+        raise HTTPException(status_code=422, detail="loyalty_tier_name_required")
+    body = {
+        **body,
+        "name": str(body.get("name") or "").strip(),
+        "status": "active",
+        "is_active": True,
+    }
+    row = await _api_create(session, "loyalty_tiers", body, staff)
+    await session.commit()
+    return {"data": row}
 
 
 @router.patch("/api/loyalty/admin/settings")
@@ -5336,20 +5371,16 @@ async def api_link_local_international_order(request: Request, staff: User = Dep
         raise HTTPException(status_code=404, detail="international_order_not_found")
 
     local_extra = dict(row.extra_data or {})
-    existing_local_link = _first_text(
-        local_extra.get("linked_international_order_id"),
-        local_extra.get("linkedInternationalOrderId"),
-    )
+    existing_local_link = _order_link_value(row, ORDER_LINK_INTERNATIONAL_KEYS)
     if existing_local_link and existing_local_link != intl_id:
         raise HTTPException(status_code=409, detail="LOCAL_ALREADY_LINKED")
+    existing_intl_link = _order_link_value(international_order, ORDER_LINK_LOCAL_KEYS)
+    if existing_intl_link and existing_intl_link != str(order_id):
+        raise HTTPException(status_code=409, detail="INTERNATIONAL_ALREADY_LINKED")
     for linked_row in await _rows(session, "orders", limit=1000):
         if linked_row.id == row.id:
             continue
-        linked_extra = dict(linked_row.extra_data or {})
-        linked_id = _first_text(
-            linked_extra.get("linked_international_order_id"),
-            linked_extra.get("linkedInternationalOrderId"),
-        )
+        linked_id = _order_link_value(linked_row, ORDER_LINK_INTERNATIONAL_KEYS)
         if linked_id == intl_id:
             raise HTTPException(status_code=409, detail="INTERNATIONAL_ALREADY_LINKED")
 
@@ -5358,8 +5389,18 @@ async def api_link_local_international_order(request: Request, staff: User = Dep
         "linked_international_order_id": intl_id,
         "linkedInternationalOrderId": intl_id,
     }
+    international_extra = dict(international_order.extra_data or {})
+    international_order.extra_data = {
+        **international_extra,
+        "linked_local_order_id": str(order_id),
+        "linkedLocalOrderId": str(order_id),
+    }
     await session.commit()
-    return {"data": {"local_order": serialize_record(row), "international_order": serialize_record(international_order)}}
+    local_payload = serialize_record(row)
+    international_payload = serialize_record(international_order)
+    local_payload["linked_international_order_id"] = intl_id
+    international_payload["linked_local_order_id"] = str(order_id)
+    return {"data": {"local_order": local_payload, "international_order": international_payload}}
 
 
 @router.delete("/api/admin-shopping/order-links/{order_id}")
@@ -5369,11 +5410,20 @@ async def api_unlink_local_international_order(order_id: uuid.UUID, staff: User 
     if row is None:
         raise HTTPException(status_code=404, detail="order_not_found")
     extra = dict(row.extra_data or {})
+    linked_international_id = _order_link_value(row, ORDER_LINK_INTERNATIONAL_KEYS)
     extra.pop("linked_international_order_id", None)
     extra.pop("linkedInternationalOrderId", None)
     row.extra_data = extra
+    international_rows = await _rows(session, "international_orders", limit=1000)
+    for international_order in international_rows:
+        reverse_local_id = _order_link_value(international_order, ORDER_LINK_LOCAL_KEYS)
+        if (linked_international_id and str(international_order.id) == linked_international_id) or reverse_local_id == str(order_id):
+            international_extra = dict(international_order.extra_data or {})
+            international_extra.pop("linked_local_order_id", None)
+            international_extra.pop("linkedLocalOrderId", None)
+            international_order.extra_data = international_extra
     await session.commit()
-    return {"data": serialize_record(row)}
+    return {"data": {"local_order": serialize_record(row)}}
 
 
 @router.patch("/api/admin-shopping/local-requests/{request_id}")
@@ -6724,6 +6774,8 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
         role_rows = await session.execute(select(UserRole.role).where(UserRole.user_id == user.id))
         if not set(role_rows.scalars()).intersection({"admin", "manager", "staff", "employee"}):
             raise HTTPException(status_code=403, detail="insufficient_permissions")
+        if section_key == "sections" and (page or "home") == "home":
+            await _ensure_home_page_sections(session)
     rows = await _resource_data(session, table)
     if section_key == "blog":
         rows = [_blog_article_payload(row) for row in await _rows(session, "site_content", limit=500)]
@@ -7518,6 +7570,60 @@ ADMIN_EXPORT_DATASETS = {
     "brands": "brands",
     "partners": "user_roles",
 }
+
+
+# These are the real sections rendered by the public home page.  They are
+# persisted only when an administrator opens the sections control, so an
+# empty page_sections table does not make the design screen appear broken.
+# Existing rows are preserved and only missing system keys are added.
+DEFAULT_HOME_PAGE_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("hero", "البانر الرئيسي"),
+    ("flash_deals", "العروض السريعة"),
+    ("featured_products", "المنتجات المميزة"),
+    ("trust_guarantees", "ضمانات التسوق"),
+    ("international", "التسوق الدولي"),
+    ("local_shopping", "التسوق المحلي"),
+    ("partners", "شركاؤنا"),
+    ("loyalty_partner", "برنامج الولاء"),
+    ("store_reviews", "آراء العملاء"),
+    ("services", "خدماتنا"),
+)
+
+
+async def _ensure_home_page_sections(session: AsyncSession) -> None:
+    """Materialize missing home-page controls without creating demo content."""
+    model = MODEL_BY_TABLE["page_sections"]
+    rows = await _rows(session, "page_sections", limit=500)
+    existing_keys = {
+        str((row.extra_data or {}).get("section_key") or "").strip()
+        for row in rows
+        if str((row.extra_data or {}).get("page") or "").strip() == "home"
+    }
+    missing = [item for item in DEFAULT_HOME_PAGE_SECTIONS if item[0] not in existing_keys]
+    if not missing:
+        return
+    current_max = max(
+        [int(getattr(row, "sort_order", 0) or 0) for row in rows if str((row.extra_data or {}).get("page") or "").strip() == "home"]
+        or [0]
+    )
+    for offset, (section_key, section_name) in enumerate(missing, start=1):
+        session.add(
+            model(
+                title=section_name,
+                status="active",
+                sort_order=current_max + offset,
+                is_active=True,
+                extra_data={
+                    "page": "home",
+                    "section_key": section_key,
+                    "section_name": section_name,
+                    "is_visible": True,
+                    "settings": {},
+                    "source": "system_default",
+                },
+            )
+        )
+    await session.commit()
 
 
 @router.get("/api/admin-data/export/{dataset}")

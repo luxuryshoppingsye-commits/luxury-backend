@@ -114,6 +114,32 @@ def test_production_default_backup_provider_does_not_block_web_startup() -> None
     assert explicit_filesystem.backup_offsite_provider == "s3"
 
 
+def test_production_s3_backup_provider_reuses_r2_credentials_when_dedicated_values_are_omitted() -> None:
+    base = {
+        "DATABASE_URL": "postgresql://user@db.example.com:5432/luxury_operational",
+        "APP_ENV": "production",
+        "ALLOW_TEST_FIXTURES": False,
+        "JWT_SECRET": "unit-test-jwt-secret-512512512512512512",
+        "API_BASE_URL": "https://api.luxuryshoppings.com",
+        "APP_PUBLIC_URL": "https://api.luxuryshoppings.com",
+        "WS_BASE_URL": "wss://api.luxuryshoppings.com",
+        "FRONTEND_PUBLIC_URL": "https://luxuryshoppings.com",
+        "STORAGE_PROVIDER": "r2",
+        "R2_ENDPOINT_URL": "https://r2.example.com",
+        "R2_BUCKET": "luxury-assets",
+        "R2_ACCESS_KEY_ID": "test-access-key",
+        "R2_SECRET_ACCESS_KEY": "test-secret-key",
+        "R2_REGION": "auto",
+        "R2_PUBLIC_BASE_URL": "https://assets.example.com",
+        "BACKUP_OFFSITE_PROVIDER": "s3",
+        "CORS_ORIGINS": "https://luxuryshoppings.com,https://www.luxuryshoppings.com",
+    }
+    settings = Settings(**base)
+    assert settings.backup_s3_bucket == "luxury-assets"
+    assert settings.backup_s3_endpoint_url == "https://r2.example.com"
+    assert settings.backup_s3_access_key_id == "test-access-key"
+
+
 def test_route_policy_registry_classifies_registered_routes() -> None:
     _assert_safe_database()
     coverage = route_policy_coverage(app)

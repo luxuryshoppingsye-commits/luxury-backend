@@ -385,8 +385,19 @@ class Settings(BaseSettings):
                 self.backup_s3_secret_access_key = self.backup_s3_secret_access_key or self.r2_secret_access_key
             else:
                 self.backup_offsite_provider = "disabled"
-        if self.backup_offsite_provider == "s3" and not self.backup_s3_bucket:
-            raise ValueError("BACKUP_S3_BUCKET is required when BACKUP_OFFSITE_PROVIDER=s3")
+        if self.backup_offsite_provider == "s3":
+            # Render uses the same Cloudflare R2 account for public assets and
+            # encrypted backup objects unless dedicated BACKUP_S3_* values
+            # are supplied. Hydrate the optional S3 settings before
+            # validation so the production blueprint cannot start with a
+            # configured provider but an unusable client.
+            self.backup_s3_endpoint_url = self.backup_s3_endpoint_url or self.r2_endpoint_url
+            self.backup_s3_bucket = self.backup_s3_bucket or self.r2_bucket
+            self.backup_s3_region = self.backup_s3_region or self.r2_region
+            self.backup_s3_access_key_id = self.backup_s3_access_key_id or self.r2_access_key_id
+            self.backup_s3_secret_access_key = self.backup_s3_secret_access_key or self.r2_secret_access_key
+            if not self.backup_s3_bucket:
+                raise ValueError("BACKUP_S3_BUCKET is required when BACKUP_OFFSITE_PROVIDER=s3")
         if self.app_env == "production":
             render_public_url = self.render_public_url.rstrip("/")
             render_parts = urlsplit(render_public_url)
