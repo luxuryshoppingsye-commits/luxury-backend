@@ -6910,11 +6910,45 @@ async def api_content_apply_theme_template(template_id: uuid.UUID, staff: User =
     template = await session.get(model, template_id)
     if template is None:
         raise HTTPException(status_code=404, detail="template_not_found")
+    template_extra = dict(template.extra_data or {})
+    template_settings = template_extra.get("settings") if isinstance(template_extra.get("settings"), dict) else template_extra
+    if isinstance(template_settings, dict) and isinstance(template_settings.get("settings"), dict):
+        template_settings = template_settings["settings"]
+    setting_keys = {
+        "colors": "colors",
+        "typography": "typography",
+        "layout": "layout",
+        "components": "cards",
+        "cards": "cards",
+        "buttons": "buttons",
+        "inputs": "inputs",
+        "animations": "animations",
+        "hero": "hero",
+    }
+    updates = {
+        setting_keys[key]: value
+        for key, value in (template_settings.items() if isinstance(template_settings, dict) else [])
+        if key in setting_keys and value is not None
+    }
+    if not updates:
+        raise HTTPException(status_code=422, detail="template_has_no_theme_settings")
+    theme_service = ThemeAdminService()
+    for setting_key, value in updates.items():
+        # Apply each setting through the same audited publish path used by the
+        # design panel, so this endpoint cannot leave the public site unchanged.
+        await theme_service.save(
+            session,
+            actor=staff,
+            roles=roles,
+            body={"value": _jsonable(value)},
+            setting_key=setting_key,
+            publish=True,
+        )
     rows = await _rows(session, "theme_settings", clauses=(model.name == "active_template",), limit=1)
     row = rows[0] if rows else model(name="active_template", status="active", is_active=True, extra_data={})
     if not rows:
         session.add(row)
-    row.extra_data = {"template_id": str(template_id), "settings": _jsonable(template.extra_data or {})}
+    row.extra_data = {"template_id": str(template_id), "settings": _jsonable(updates), "applied_at": _now().isoformat(), "updated_by": str(staff.id)}
     await session.commit()
     return {"data": serialize_record(row)}
 
