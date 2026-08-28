@@ -1813,6 +1813,22 @@ async def _serialize_orders_with_financials(session: AsyncSession, orders: list[
         return payloads
 
     order_ids = [order.id for order in orders]
+    # The admin order-linking screen uses this endpoint to compare a local
+    # order with an international request.  Returning only the order header
+    # leaves legacy/production rows looking like "0 products" and makes a
+    # safe manual match impossible.  Load the immutable order-line snapshot
+    # in the same response instead of making the renderer guess from totals.
+    item_result = await session.execute(
+        select(OrderItem)
+        .where(OrderItem.order_id.in_(order_ids))
+        .order_by(OrderItem.created_at)
+    )
+    items_by_order: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for item in item_result.scalars():
+        items_by_order.setdefault(item.order_id, []).append(serialize_record(item))
+    for order, payload in zip(orders, payloads):
+        payload["items"] = items_by_order.get(order.id, [])
+
     recognized_statuses = ("confirmed", "approved", "paid", "completed")
     paid_by_order: dict[uuid.UUID, Decimal] = {order.id: Decimal("0.00") for order in orders}
     for table_name in ("order_payments", "payments"):
