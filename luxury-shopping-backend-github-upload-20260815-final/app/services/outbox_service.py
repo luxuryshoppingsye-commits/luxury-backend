@@ -223,6 +223,20 @@ async def _allowed_by_preferences(session: AsyncSession, row: Any, channel: str)
     return True, None
 
 
+def _email_message_html(message: str) -> str:
+    """Escape message content and turn ordinary HTTPS links into safe anchors."""
+    escaped_message = escape(str(message or ""))
+    linked_message = re.sub(
+        r"(https?://[^\s<]+)",
+        lambda match: (
+            f'<a href="{match.group(1)}" style="color:#58a6ff;text-decoration:underline;'
+            f'word-break:break-all">{match.group(1)}</a>'
+        ),
+        escaped_message,
+    )
+    return linked_message.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
 def _send_email_sync(
     recipient: str,
     subject: str,
@@ -243,19 +257,36 @@ def _send_email_sync(
     email.set_content(str(message or ""))
     logo_url = BRAND_LOGO_URL
     safe_subject = escape(str(subject or "رفاهية التسوق"))
-    safe_message = escape(str(message or "")).replace("\n", "<br>")
+    raw_message = str(message or "")
     action_url = str(extra.get("verification_url") or extra.get("reset_url") or "").strip()
     action_label = str(extra.get("action_label") or "فتح الرابط").strip()
+    verification_code_match = re.search(r"(?:هو|is)\s*[:：]\s*([0-9]{4,10})", raw_message, flags=re.IGNORECASE)
+    verification_code = verification_code_match.group(1) if verification_code_match else ""
+    display_message = raw_message
+    if verification_code:
+        display_message = re.sub(
+            rf"((?:هو|is)\s*[:：]\s*){re.escape(verification_code)}",
+            r"\1",
+            display_message,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    safe_message = _email_message_html(display_message)
+    verification_code_html = (
+        f'<div style="margin:20px 0 4px;text-align:center">'
+        f'<div style="color:#8b949e;font-size:11px;line-height:1.5">رمز التفعيل</div>'
+        f'<div dir="ltr" style="margin-top:4px;color:#f0f2f5;font-size:24px;font-weight:700;letter-spacing:3px;line-height:1.3">{escape(verification_code)}</div></div>'
+        if verification_code
+        else ""
+    )
     action_html = ""
     if action_url and action_url.startswith(("https://", "http://")):
         action_html = (
-            f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:28px 0 12px"><tr><td align="center">'
-            f'<a href="{escape(action_url, quote=True)}" '
-            'style="display:inline-block;background:#b88618;color:#fff;text-decoration:none;'
-            'padding:15px 30px;border-radius:12px;font-weight:700;font-size:16px;line-height:1.5">'
-            f"{escape(action_label)}</a></td></tr></table>"
-            f'<p style="font-size:12px;color:#78808f;word-break:break-word;text-align:center;line-height:1.8;margin:0">'
-            f"إذا ما فتح الزر، انسخ الرابط التالي:<br><span dir=\"ltr\">{escape(action_url)}</span></p>"
+            f'<div style="margin:20px 0 0;padding-top:14px;border-top:1px solid #34373c">'
+            f'<p style="font-size:12px;color:#8b949e;line-height:1.7;margin:0 0 4px">{escape(action_label)}:</p>'
+            f'<p dir="ltr" style="font-size:12px;word-break:break-all;line-height:1.8;margin:0">'
+            f'<a href="{escape(action_url, quote=True)}" style="color:#58a6ff;text-decoration:underline;word-break:break-all">'
+            f'{escape(action_url)}</a></p></div>'
         )
     plain_message = str(message or "رفاهية التسوق")
     if action_url and action_url.startswith(("https://", "http://")):
@@ -265,14 +296,14 @@ def _send_email_sync(
         f"""<!doctype html>
 <html lang=\"ar\" dir=\"rtl\">
 <head><meta charset=\"utf-8\"><meta name=\"x-apple-disable-message-reformatting\"><meta name=\"format-detection\" content=\"telephone=no\"></head>
-<body dir=\"rtl\" style=\"margin:0;padding:0;background:#f4efe7;color:#172033;font-family:Tahoma,Arial,sans-serif;line-height:1.8\">
-<div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">رسالة من رفاهية التسوق</div>
-<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4efe7;padding:34px 12px\"><tr><td align=\"center\">
-<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:620px;background:#ffffff;border:1px solid #eadfce;border-radius:24px;overflow:hidden\">
-<tr><td style=\"height:5px;background:#c89a2b;font-size:0;line-height:0\">&nbsp;</td></tr>
-<tr><td style=\"background:#182235;padding:28px 24px;text-align:center\"><img src=\"{escape(logo_url, quote=True)}\" alt=\"رفاهية التسوق\" width=\"190\" style=\"display:block;margin:0 auto;max-width:190px;height:auto\"><p style=\"margin:12px 0 0;color:#e8c76b;font-size:12px;line-height:1.5;letter-spacing:normal\">تجربة تسوق تليق بك</p></td></tr>
-<tr><td style=\"padding:36px 30px 30px;text-align:right;direction:rtl\"><p style=\"margin:0 0 10px;color:#a87810;font-size:14px;font-weight:700;line-height:1.6\">رفاهية التسوق</p><h1 style=\"margin:0 0 18px;color:#182235;font-size:25px;line-height:1.35;font-weight:700\">{safe_subject}</h1><p style=\"margin:0;color:#4f5a6b;font-size:16px;line-height:1.9\">{safe_message}</p>{action_html}</td></tr>
-<tr><td style=\"padding:19px 30px;background:#fbf8f2;border-top:1px solid #f0e7da;color:#78808f;text-align:center;font-size:12px;line-height:1.8\">هذه رسالة آلية من رفاهية التسوق.<br>إذا لم تطلب هذه الرسالة، يمكنك تجاهلها بأمان.</td></tr>
+<body dir=\"rtl\" style=\"margin:0;padding:0;background:#202124;color:#f0f2f5;font-family:Arial,Tahoma,sans-serif;line-height:1.6\">
+<div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">تجربة تسوق تليق بك من رفاهية التسوق</div>
+<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#202124;padding:24px 12px\"><tr><td align=\"center\">
+<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:420px;background:#202124\">
+<tr><td style=\"padding:8px 18px 18px;text-align:center;background:#202124\"><img src=\"{escape(logo_url, quote=True)}\" alt=\"رفاهية التسوق\" width=\"24\" height=\"24\" style=\"display:block;margin:0 auto 8px;width:24px;height:24px;object-fit:contain\"><p style=\"margin:0;color:#f0f2f5;font-size:11px;line-height:1.5;letter-spacing:normal\">رفاهية التسوق</p></td></tr>
+<tr><td style=\"padding:0 0 16px;text-align:center;direction:rtl\"><h1 style=\"margin:0;color:#f0f2f5;font-size:21px;line-height:1.35;font-weight:700\">{safe_subject}</h1></td></tr>
+<tr><td style=\"border:1px solid #34373c;border-radius:7px;padding:18px 16px;background:#202124;text-align:right;direction:rtl\"><p style=\"margin:0;color:#f0f2f5;font-size:15px;line-height:1.9\">{safe_message}</p>{verification_code_html}{action_html}</td></tr>
+<tr><td style=\"padding:18px 10px 4px;color:#8b949e;text-align:center;font-size:11px;line-height:1.8\">هذه رسالة آلية من رفاهية التسوق.<br>إذا لم تطلب هذه الرسالة، يمكنك تجاهلها بأمان.</td></tr>
 </table></td></tr></table></body></html>""",
         subtype="html",
     )
