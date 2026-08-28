@@ -379,6 +379,20 @@ class FileSnapshotService:
         ).mappings().all()
         destination.mkdir(parents=True, exist_ok=True)
         files: list[dict[str, Any]] = []
+        missing_files: list[dict[str, Any]] = []
+
+        def record_missing(row: Any, *, reason: str) -> None:
+            """Keep the backup usable while making an unavailable asset explicit."""
+            missing_files.append(
+                {
+                    "file_id": row["id"],
+                    "storage_key": str(row["storage_key"]),
+                    "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"],
+                    "reason": reason,
+                }
+            )
+
         for row in rows:
             storage_key = str(row["storage_key"]).replace("\\", "/").lstrip("/")
             archive_path = f"files/{storage_key}"
@@ -391,8 +405,10 @@ class FileSnapshotService:
             if provider == "cloudflare_r2":
                 try:
                     self._download_r2_file(storage_key=storage_key, target=target)
-                except Exception as exc:
-                    raise RuntimeError(f"file_missing:{row['id']}") from exc
+                except Exception:
+                    target.unlink(missing_ok=True)
+                    record_missing(row, reason="r2_file_missing")
+                    continue
             elif source.is_file():
                 shutil.copy2(source, target)
             elif self.storage is not None and str(getattr(self.storage.settings, "storage_provider", "")).strip().lower() == "r2":
@@ -402,12 +418,16 @@ class FileSnapshotService:
                 # object store before declaring the backup incomplete.
                 try:
                     self._download_r2_file(storage_key=storage_key, target=target)
-                except Exception as exc:
-                    raise RuntimeError(f"file_missing:{row['id']}") from exc
+                except Exception:
+                    target.unlink(missing_ok=True)
+                    record_missing(row, reason="r2_file_missing")
+                    continue
             else:
-                raise RuntimeError(f"file_missing:{row['id']}")
+                record_missing(row, reason="local_file_missing")
+                continue
             if not target.is_file():
-                raise RuntimeError(f"file_missing:{row['id']}")
+                record_missing(row, reason="file_not_created")
+                continue
             expected_size = row.get("size_bytes")
             if expected_size is not None and target.stat().st_size != int(expected_size):
                 raise RuntimeError(f"file_size_mismatch:{row['id']}")
@@ -429,7 +449,13 @@ class FileSnapshotService:
                     "scan_status": row["scan_status"],
                 }
             )
-        return {"file_count": len(files), "files": files}
+        return {
+            "file_count": len(files),
+            "files": files,
+            "missing_file_count": len(missing_files),
+            "missing_files": missing_files,
+            "complete": not missing_files,
+        }
 
 
 class BackupEncryptionService:
@@ -958,7 +984,13 @@ class BackupCoordinator:
                 upload_root=self.settings.resolved_upload_dir,
                 storage=FileStorage(),
             ).collect(session, files_dir)
-            await self._set_status(session, row, "building_manifest")
+            await self._set_status(
+                session,
+                row,
+                "building_manifest",
+                missing_file_count=file_manifest.get("missing_file_count", 0),
+                file_snapshot_complete=file_manifest.get("complete", True),
+            )
             manifest = self._build_manifest(row, dump_result, file_manifest)
             self._write_bundle_metadata(files_dir, manifest)
             with tarfile.open(plaintext_bundle, "w:gz") as archive:
@@ -1006,6 +1038,8 @@ class BackupCoordinator:
                 size_bytes=encryption_result["encrypted_size"],
                 verification_status="verified",
                 restore_verification_status=restore_result.get("restore_verification_status", "not_required"),
+                missing_file_count=file_manifest.get("missing_file_count", 0),
+                file_snapshot_complete=file_manifest.get("complete", True),
             )
             await self.retention.apply(session)
             return self._response(row)
@@ -1079,6 +1113,8 @@ class BackupCoordinator:
                 "ready_has_verified_restore": extra.get("restore_verification_status") in {"verified", "not_required"},
                 "offsite_status": extra.get("offsite_status"),
                 "verification_status": extra.get("verification_status"),
+                "missing_file_count": int(extra.get("missing_file_count") or 0),
+                "file_snapshot_complete": extra.get("file_snapshot_complete", True),
             }
         )
         return data

@@ -2506,7 +2506,15 @@ async def api_admin_profiles_lookup(
 
 @router.get("/api/admin/contact-messages")
 async def api_admin_contact_messages(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "contact_messages", limit=500)]}
+    data = []
+    for row in await _rows(session, "contact_messages", limit=500):
+        payload = serialize_record(row)
+        # The contact_messages table stores the lifecycle in status. Expose
+        # the UI-friendly read flag as well so replies/read actions survive a
+        # reload without relying on a non-existent database column.
+        payload["is_read"] = str(getattr(row, "status", "new") or "new").lower() != "new"
+        data.append(payload)
+    return {"data": data}
 
 
 @router.get("/api/partnership/partners")
@@ -4794,6 +4802,7 @@ async def _ensure_partner_account(
         storefront.phone = storefront.phone or profile.phone
         storefront.status = "active"
         storefront.is_active = True
+        storefront.deleted_at = None
 
     contract_model = MODEL_BY_TABLE["partner_contracts"]
     contract_result = await session.execute(
@@ -4854,13 +4863,110 @@ async def api_update_partner_commission(partner_id: uuid.UUID, request: Request,
 
 
 @router.delete("/api/partnership/partners/{partner_id}")
-async def api_delete_partner_contract(partner_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    model = MODEL_BY_TABLE["partner_contracts"]
-    rows = await _rows(session, "partner_contracts", clauses=(model.partner_id == partner_id,), limit=10)
-    for row in rows:
-        await session.delete(row)
+async def api_delete_partner_contract(
+    partner_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Remove a merchant from active listings without leaving a ghost row.
+
+    The old handler deleted only the contract, while the admin list is backed
+    by partner_storefronts.  Soft-deleting both records makes the result
+    durable after a refresh and keeps an auditable history.  Product removal
+    is opt-in and uses the same image-asset cleanup as the normal product
+    deletion endpoint.
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="partner_delete_payload_required")
+    delete_products = body.get("deactivateProducts", body.get("deactivate_products", False))
+    if not isinstance(delete_products, bool):
+        raise HTTPException(status_code=422, detail="deactivate_products_must_be_boolean")
+
+    now = datetime.now(timezone.utc)
+    removed_storefronts = 0
+    removed_contracts = 0
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    storefront_rows = await _rows(
+        session,
+        "partner_storefronts",
+        clauses=(or_(storefront_model.partner_id == partner_id, storefront_model.user_id == partner_id),),
+        limit=50,
+    )
+    for storefront in storefront_rows:
+        storefront.deleted_at = now
+        storefront.is_active = False
+        storefront.status = "inactive"
+        removed_storefronts += 1
+
+    contract_model = MODEL_BY_TABLE["partner_contracts"]
+    contract_rows = await _rows(session, "partner_contracts", clauses=(contract_model.partner_id == partner_id,), limit=50)
+    for contract in contract_rows:
+        contract.deleted_at = now
+        contract.is_active = False
+        contract.status = "inactive"
+        removed_contracts += 1
+
+    local_merchant_model = MODEL_BY_TABLE.get("local_merchants")
+    removed_local_merchants = 0
+    if local_merchant_model is not None:
+        local_rows = await _rows(session, "local_merchants", clauses=(local_merchant_model.user_id == partner_id,), limit=50)
+        for merchant in local_rows:
+            merchant.deleted_at = now
+            merchant.is_active = False
+            merchant.status = "inactive"
+            removed_local_merchants += 1
+
+    removed_products = 0
+    removed_variants = 0
+    removed_assets = 0
+    if delete_products:
+        product_rows = list(
+            (
+                await session.execute(
+                    select(Product)
+                    .where(Product.partner_id == partner_id, Product.deleted_at.is_(None))
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        for product in product_rows:
+            variants = list(
+                (
+                    await session.execute(
+                        select(ProductVariant)
+                        .where(ProductVariant.product_id == product.id, ProductVariant.deleted_at.is_(None))
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            removed_assets += await _delete_product_file_assets(
+                session,
+                product=product,
+                variants=variants,
+                actor=staff,
+            )
+            product.is_active = False
+            product.is_featured = False
+            product.approval_status = "inactive"
+            product.deleted_at = now
+            removed_products += 1
+            for variant in variants:
+                variant.is_active = False
+                variant.deleted_at = now
+                removed_variants += 1
+
     await session.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "removed_storefronts": removed_storefronts,
+        "removed_contracts": removed_contracts,
+        "removed_local_merchants": removed_local_merchants,
+        "removed_products": removed_products,
+        "removed_variants": removed_variants,
+        "removed_assets": removed_assets,
+    }
 
 
 @router.post("/api/marketing/marketers", status_code=201)
@@ -5386,6 +5492,7 @@ async def api_link_local_international_order(request: Request, staff: User = Dep
 
     row.extra_data = {
         **local_extra,
+        "order_linking_candidate": True,
         "linked_international_order_id": intl_id,
         "linkedInternationalOrderId": intl_id,
     }
@@ -6652,6 +6759,67 @@ async def api_content_theme_templates(
             }
         )
     templates.sort(key=lambda item: (item["sort_order"], item["name"]))
+    if not templates:
+        # Keep the admin design panel usable on a fresh database. These are
+        # read-only built-ins; applying one still persists the selected theme
+        # through the normal authenticated update path.
+        templates = [
+            {
+                "id": "builtin-luxury-light",
+                "name": "الفخامة الهادئة",
+                "name_en": "Quiet Luxury",
+                "description": "واجهة فاتحة راقية تبرز المنتجات والعروض بوضوح وتوازن.",
+                "preview_image": None,
+                "settings": {
+                    "colors": {"primary": "43 85% 50%", "background": "0 0% 100%", "foreground": "220 14% 10%", "card": "0 0% 100%", "gold": "43 85% 50%", "goldLight": "45 88% 66%", "goldDark": "43 82% 32%"},
+                    "typography": {"fontFamily": "Cairo", "headingSize": "1.5", "bodySize": "1"},
+                    "layout": {"containerWidth": "1400px", "sectionPadding": "6rem", "borderRadius": "0.75rem"},
+                    "components": {"cardRadius": "1rem", "cardShadow": "elegant", "cardHover": True},
+                    "animations": {"enabled": True, "duration": "0.3s", "type": "fade"},
+                },
+                "is_active": True,
+                "is_default": True,
+                "sort_order": 1,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "id": "builtin-midnight-luxury",
+                "name": "ليالي الرفاهية",
+                "name_en": "Midnight Luxury",
+                "description": "ثيم داكن سينمائي يمنح المتجر حضوراً فاخراً مع تباين مريح.",
+                "preview_image": None,
+                "settings": {
+                    "colors": {"primary": "43 85% 50%", "background": "220 14% 8%", "foreground": "0 0% 96%", "card": "220 13% 13%", "gold": "43 85% 50%", "goldLight": "45 88% 66%", "goldDark": "43 82% 32%"},
+                    "typography": {"fontFamily": "Cairo", "headingSize": "1.55", "bodySize": "1"},
+                    "layout": {"containerWidth": "1400px", "sectionPadding": "6rem", "borderRadius": "0.75rem"},
+                    "components": {"cardRadius": "1rem", "cardShadow": "dramatic", "cardHover": True},
+                    "animations": {"enabled": True, "duration": "0.35s", "type": "fade"},
+                },
+                "is_active": True,
+                "is_default": False,
+                "sort_order": 2,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "id": "builtin-ramadan-gold",
+                "name": "رمضان الذهبي",
+                "name_en": "Ramadan Gold",
+                "description": "ثيم موسمي دافئ للمناسبات، مع لمسة ذهبية ورسالة ترحيبية واضحة.",
+                "preview_image": None,
+                "settings": {
+                    "colors": {"primary": "43 85% 50%", "background": "270 25% 10%", "foreground": "0 0% 96%", "card": "270 20% 16%", "gold": "43 85% 50%", "goldLight": "45 88% 66%", "goldDark": "43 82% 32%"},
+                    "typography": {"fontFamily": "Cairo", "headingSize": "1.5", "bodySize": "1"},
+                    "layout": {"containerWidth": "1400px", "sectionPadding": "6rem", "borderRadius": "1rem"},
+                    "components": {"cardRadius": "1rem", "cardShadow": "elegant", "cardHover": True},
+                    "animations": {"enabled": True, "duration": "0.4s", "type": "spring"},
+                    "seasonal": {"event": "ramadan", "greeting": "رمضان كريم"},
+                },
+                "is_active": True,
+                "is_default": False,
+                "sort_order": 3,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        ]
     return {"data": templates}
 
 
@@ -7314,7 +7482,9 @@ async def api_read_contact_message(record_id: uuid.UUID, staff: User = Depends(r
         raise HTTPException(status_code=404, detail="message_not_found")
     row.status = "read"
     await session.commit()
-    return {"data": serialize_record(row)}
+    payload = serialize_record(row)
+    payload["is_read"] = True
+    return {"data": payload}
 
 
 @router.delete("/api/admin/contact-messages/{record_id}")
