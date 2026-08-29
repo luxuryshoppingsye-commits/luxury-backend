@@ -680,10 +680,11 @@ class AdminCustomerAccessService:
         else:
             _require_roles(roles, AUTHORIZED_CUSTOMER_LIMITED_ROLES, "customer_access_denied")
         limit = min(max(int(limit), 1), 500)
+        customer_user_ids = select(UserRole.user_id).where(UserRole.role == "customer")
         result = await session.execute(
             select(User, Profile)
             .outerjoin(Profile, Profile.user_id == User.id)
-            .where(User.deleted_at.is_(None))
+            .where(User.deleted_at.is_(None), User.id.in_(customer_user_ids))
             .order_by(User.created_at.desc())
             .limit(limit)
         )
@@ -703,6 +704,12 @@ class AdminCustomerAccessService:
                     "phone": profile.phone if profile else None,
                     "city": profile.city if profile else None,
                 },
+                # Keep the flat fields consumed by the accounting statement
+                # selector while retaining the nested profile contract used
+                # by the customer-management screen.
+                "full_name": profile.full_name if profile else None,
+                "phone": profile.phone if profile else None,
+                "city": profile.city if profile else None,
             }
             if full:
                 profile_extra = dict(profile.extra_data or {}) if profile else {}

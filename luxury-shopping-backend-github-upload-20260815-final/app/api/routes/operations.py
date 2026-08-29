@@ -112,6 +112,7 @@ from ...services.report_admin_services import (
     SupportWorkflowService,
     SyncCursorService,
     ThemeAdminService,
+    _date_range,
 )
 from ...services.r2_migration import R2MigrationService
 from ...services.secure_backup import BackupCoordinator
@@ -499,6 +500,19 @@ async def _count(session: AsyncSession, table: str, *clauses: Any) -> int:
     return int((await session.execute(statement)).scalar_one())
 
 
+async def _customer_count(session: AsyncSession, *clauses: Any) -> int:
+    """Count active customer accounts without including staff/partner users."""
+    statement = (
+        select(func.count(func.distinct(User.id)))
+        .select_from(User)
+        .join(UserRole, UserRole.user_id == User.id)
+        .where(User.deleted_at.is_(None), UserRole.role == "customer")
+    )
+    if clauses:
+        statement = statement.where(*clauses)
+    return int((await session.execute(statement)).scalar_one())
+
+
 async def _sum_amount(session: AsyncSession, table: str, *clauses: Any, column: str = "amount") -> Decimal:
     model = MODEL_BY_TABLE.get(table)
     if model is None or column not in model.__table__.c:
@@ -858,7 +872,17 @@ async def _public_page_sections_uncached(page: str, session: AsyncSession) -> di
         clauses.append(columns.page == page)
     elif "page_key" in columns:
         clauses.append(columns.page_key == page)
-    return {"data": [serialize_record(row) for row in await _public_rows(session, "page_sections", clauses=clauses)]}
+    # The storefront needs to distinguish "no page configuration exists"
+    # from "the administrator intentionally hid every section".  The old
+    # generic public-row filter removed hidden sections before the client could
+    # make that distinction, so visibility/order controls appeared ineffective.
+    statement = select(model).where(*clauses)
+    if "deleted_at" in columns:
+        statement = statement.where(columns.deleted_at.is_(None))
+    if "sort_order" in columns:
+        statement = statement.order_by(columns.sort_order)
+    result = await session.execute(statement.limit(500))
+    return {"data": [serialize_record(row) for row in result.scalars()]}
 
 
 @router.get("/content/pages/{slug}")
@@ -872,7 +896,12 @@ async def public_static_page(slug: str, session: AsyncSession = Depends(get_sess
 async def _public_static_page_uncached(slug: str, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["static_pages"]
     columns = model.__table__.c
-    result = await session.execute(select(model).where(columns.slug == slug).limit(1))
+    clauses = [columns.slug == slug]
+    if "is_active" in columns:
+        clauses.append(columns.is_active.is_(True))
+    if "status" in columns:
+        clauses.append(columns.status.in_(("active", "published")))
+    result = await session.execute(select(model).where(*clauses).limit(1))
     row = result.scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="page_not_found")
@@ -1252,9 +1281,18 @@ async def list_partner_product_options(
     session: AsyncSession = Depends(get_session),
 ):
     table = _partner_option_table(option)
-    model = MODEL_BY_TABLE[table]
-    rows = await _rows(session, table, clauses=(_partner_option_clause(model, user.id),), limit=500)
-    return {"data": [serialize_record(row) for row in rows]}
+    rows = await _rows(session, table, limit=500)
+    # Global catalog options are available to every merchant. A merchant may
+    # also see options it owns, but never options created by another merchant.
+    visible_rows = []
+    for row in rows:
+        if getattr(row, "is_active", True) is False:
+            continue
+        extra_data = getattr(row, "extra_data", None) or {}
+        owner_id = extra_data.get("partner_id") if isinstance(extra_data, dict) else None
+        if owner_id in (None, "", str(user.id)):
+            visible_rows.append(row)
+    return {"data": [serialize_record(row) for row in visible_rows]}
 
 
 @router.post("/partner/product-options/{option}", status_code=201)
@@ -2177,7 +2215,7 @@ async def api_dashboard_live_kpis(staff: User = Depends(require_staff), session:
     week_orders = await _count(session, "orders", order_model.created_at >= week)
     month_orders = await _count(session, "orders", order_model.created_at >= month)
     active_products = await _count(session, "products", MODEL_BY_TABLE["products"].is_active.is_(True))
-    new_customers = await _count(session, "users", user_model.created_at >= week)
+    new_customers = await _customer_count(session, user_model.created_at >= week)
     month_order_count = max(month_orders, 1)
     target = Decimal("50000000")
     return {"data": {
@@ -3738,20 +3776,43 @@ async def api_marketers(staff: User = Depends(require_staff), session: AsyncSess
     return {"data": [_marketer_payload(row) for row in await _rows(session, "marketers", limit=500)]}
 
 
+def _marketer_commission_payload(value: Any, marketers_by_user: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    item = serialize_record(value)
+    extra = dict(getattr(value, "extra_data", {}) or {})
+    marketer = marketers_by_user.get(str(item.get("user_id") or ""))
+    return {
+        **item,
+        "marketer_id": marketer.get("id") if marketer else item.get("user_id"),
+        "order_amount": float(extra.get("order_amount") or 0),
+        "commission_rate": float(extra.get("commission_rate") or 0),
+        "commission_amount": float(item.get("amount") or 0),
+        "paid_at": extra.get("paid_at"),
+        "marketer": {
+            "name": marketer.get("name") or "مسوق",
+            "phone": marketer.get("phone"),
+            "email": marketer.get("email"),
+        } if marketer else None,
+    }
+
+
 @router.get("/api/marketing/commissions")
-async def api_marketer_commissions(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    data = []
-    for row in await _rows(session, "marketer_commissions", limit=500):
-        item = serialize_record(row)
-        extra = item.get("extra_data") or {}
-        data.append({
-            **item,
-            "marketer_id": item.get("user_id"),
-            "order_amount": float(extra.get("order_amount") or item.get("amount") or 0),
-            "commission_rate": float(extra.get("commission_rate") or 0),
-            "commission_amount": float(item.get("amount") or 0),
-            "paid_at": extra.get("paid_at"),
-        })
+async def api_marketer_commissions(
+    marketer_id: uuid.UUID | None = Query(None, alias="marketerId"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    marketer_model = MODEL_BY_TABLE["marketers"]
+    marketers_by_user = {
+        str(marketer.user_id): _marketer_payload(marketer)
+        for marketer in list((await session.execute(select(marketer_model).where(marketer_model.deleted_at.is_(None)))).scalars())
+    }
+    clauses = ()
+    if marketer_id is not None:
+        marketer = await session.get(marketer_model, marketer_id)
+        if marketer is None or marketer.deleted_at is not None:
+            return {"data": []}
+        clauses = (MODEL_BY_TABLE["marketer_commissions"].user_id == marketer.user_id,)
+    data = [_marketer_commission_payload(row, marketers_by_user) for row in await _rows(session, "marketer_commissions", clauses=clauses, limit=500)]
     return {"data": data}
 
 
@@ -3763,13 +3824,141 @@ async def api_finance_orders(staff: User = Depends(require_staff), session: Asyn
 
 @router.get("/api/finance/partner-settlements")
 @router.get("/api/finance/partner-settlements/pending")
-async def api_partner_settlements(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "partner_settlements", limit=500)]}
+async def api_partner_settlements(
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return raw settlements for reports and partner groups for the payment form.
+
+    The accounting payment screen settles all outstanding rows for one partner
+    at a time.  Returning the raw rows from the ``/pending`` endpoint made the
+    partner selector empty because that screen consumes the grouped camelCase
+    contract.  Keep the reporting endpoint backward-compatible and make the
+    pending endpoint deterministic, filtered, and safe to settle in one action.
+    """
+    is_pending = request.url.path.rstrip("/").endswith("/pending")
+    settlement_model = MODEL_BY_TABLE["partner_settlements"]
+    clauses = (
+        (settlement_model.status.in_(("pending", "unpaid")),)
+        if is_pending
+        else ()
+    )
+    rows = await _rows(session, "partner_settlements", clauses=clauses, limit=500)
+    serialized = [serialize_record(row) for row in rows]
+    if not is_pending:
+        return {"data": serialized}
+
+    # Resolve a display name even for old settlements that predate the stored
+    # partner_name extra field.  partner_id is normally the partner user id,
+    # but legacy data can point at a storefront/profile record.
+    partner_names: dict[str, str] = {}
+    for table in ("partner_storefronts", "partner_profiles", "partner_applications"):
+        for partner_row in await _rows(session, table, limit=1000):
+            partner_item = serialize_record(partner_row)
+            name = _first_text(
+                partner_item.get("name"),
+                partner_item.get("full_name"),
+                partner_item.get("store_name"),
+                partner_item.get("email"),
+                default="شريك",
+            )
+            for key in (partner_item.get("id"), partner_item.get("user_id"), partner_item.get("partner_id")):
+                if key:
+                    partner_names.setdefault(str(key), name)
+
+    def number(*values: Any) -> float:
+        for value in values:
+            try:
+                if value is not None and str(value).strip() != "":
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for row, item in zip(rows, serialized):
+        extra = dict(getattr(row, "extra_data", {}) or {})
+        partner_id = _first_text(
+            item.get("partner_id"),
+            extra.get("partner_id"),
+            default="",
+        )
+        if not partner_id:
+            continue
+        order_amount = number(
+            item.get("order_amount"),
+            extra.get("order_amount"),
+            item.get("total_sales"),
+        )
+        commission_amount = number(
+            item.get("commission_amount"),
+            extra.get("commission_amount"),
+            item.get("commission"),
+        )
+        partner_amount = number(
+            item.get("partner_amount"),
+            extra.get("partner_amount"),
+            item.get("amount"),
+        )
+        commission_rate = number(item.get("commission_rate"), extra.get("commission_rate"))
+        partner_share_rate = number(
+            item.get("partner_share_rate"),
+            extra.get("partner_share_rate"),
+            100 - commission_rate if commission_rate else 0,
+        )
+        aggregate = grouped.setdefault(
+            partner_id,
+            {
+                "partnerId": partner_id,
+                "partnerName": _first_text(
+                    item.get("partner_name"),
+                    extra.get("partner_name"),
+                    partner_names.get(partner_id),
+                    default="شريك",
+                ),
+                "totalSales": 0.0,
+                "commission": 0.0,
+                "commissionRate": commission_rate,
+                "partnerShareAmount": 0.0,
+                "partnerShareRate": partner_share_rate,
+                "settlementIds": [],
+            },
+        )
+        aggregate["totalSales"] += order_amount
+        aggregate["commission"] += commission_amount
+        aggregate["partnerShareAmount"] += partner_amount
+        aggregate["settlementIds"].append(str(row.id))
+
+        # Prefer a calculated rate when multiple rows have different rates,
+        # while preserving the explicit configured rate for zero-value rows.
+        if aggregate["totalSales"] > 0:
+            aggregate["partnerShareRate"] = round(
+                aggregate["partnerShareAmount"] / aggregate["totalSales"] * 100,
+                4,
+            )
+            aggregate["commissionRate"] = round(
+                aggregate["commission"] / aggregate["totalSales"] * 100,
+                4,
+            )
+
+    return {"data": list(grouped.values())}
 
 
 @router.get("/api/finance/marketer-commissions/pending")
 async def api_pending_marketer_commissions(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "marketer_commissions", limit=500)]}
+    marketer_model = MODEL_BY_TABLE["marketers"]
+    marketers_by_user = {
+        str(marketer.user_id): _marketer_payload(marketer)
+        for marketer in list((await session.execute(select(marketer_model).where(marketer_model.deleted_at.is_(None)))).scalars())
+    }
+    rows = await _rows(
+        session,
+        "marketer_commissions",
+        clauses=(MODEL_BY_TABLE["marketer_commissions"].status.in_(("pending", "earned", "approved", "unpaid")),),
+        limit=500,
+    )
+    return {"data": [_marketer_commission_payload(row, marketers_by_user) for row in rows]}
 
 
 @router.get("/api/finance/summary")
@@ -3781,8 +3970,24 @@ async def api_finance_summary(
 ):
     revenue = await RevenueRecognitionService.summary(session, start=date_from, end=date_to)
     expense_tables = ("general_expenses", "employee_payments", "partner_payments", "marketer_payments")
+    expense_start, expense_end = _date_range(date_from, date_to)
+
+    def expense_date_clauses(table: str) -> tuple[Any, ...]:
+        model = MODEL_BY_TABLE[table]
+        return tuple(
+            clause
+            for clause in (
+                model.created_at >= expense_start if expense_start else None,
+                model.created_at <= expense_end if expense_end else None,
+            )
+            if clause is not None
+        )
+
     total_expenses = sum(
-        (await _sum_amount(session, table) for table in expense_tables),
+        (
+            await _sum_amount(session, table, *expense_date_clauses(table))
+            for table in expense_tables
+        ),
         Decimal("0"),
     )
     month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -3852,12 +4057,46 @@ async def api_finance_today_stats(staff: User = Depends(require_staff), session:
 
 @router.get("/api/finance/marketer-payments")
 async def api_marketer_payments(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "marketer_payments", limit=500)]}
+    rows = await _rows(session, "marketer_payments", limit=500)
+    marketer_model = MODEL_BY_TABLE["marketers"]
+    marketer_rows = list((await session.execute(select(marketer_model).where(marketer_model.deleted_at.is_(None)))).scalars())
+    marketer_by_key = {
+        key: _marketer_payload(marketer)
+        for marketer in marketer_rows
+        for key in (str(marketer.id), str(marketer.user_id))
+        if getattr(marketer, "id", None) or getattr(marketer, "user_id", None)
+    }
+    data = []
+    for row in rows:
+        item = serialize_record(row)
+        extra = dict(item.get("extra_data") or {})
+        for field in ("currency_code", "payment_date", "payment_method", "period_from", "period_to", "description", "commissions_paid", "voucher_number"):
+            if item.get(field) in (None, "") and field in extra:
+                item[field] = extra[field]
+        marketer = marketer_by_key.get(str(item.get("user_id") or ""))
+        if marketer is not None:
+            item["marketer_id"] = marketer.get("id")
+            item["marketer"] = {
+                "name": marketer.get("name") or "مسوق",
+                "phone": marketer.get("phone"),
+                "email": marketer.get("email"),
+            }
+        data.append(item)
+    return {"data": data}
 
 
 @router.get("/api/finance/partner-payments")
 async def api_partner_payments(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "partner_payments", limit=500)]}
+    rows = await _rows(session, "partner_payments", limit=500)
+    data = []
+    for row in rows:
+        item = serialize_record(row)
+        extra = dict(item.get("extra_data") or {})
+        for field in ("partner_name", "currency_code", "payment_date", "payment_method", "description", "orders_settled", "voucher_number"):
+            if item.get(field) in (None, "") and field in extra:
+                item[field] = extra[field]
+        data.append(item)
+    return {"data": data}
 
 
 @router.get("/api/finance/reports")
@@ -3913,13 +4152,27 @@ async def api_dashboard_kpis(staff: User = Depends(require_staff), session: Asyn
     month_revenue = Decimal(month_revenue_data["net_revenue"])
     today_orders = await _count(session, "orders", order_model.created_at >= today)
     inventory_counts = _canonical_inventory_stock_counts(await _canonical_inventory_payloads(session))
+    expense_tables = ("general_expenses", "employee_payments", "partner_payments", "marketer_payments")
+    monthly_expenses = sum(
+        (
+            await _sum_amount(session, table, MODEL_BY_TABLE[table].created_at >= month)
+            for table in expense_tables
+        ),
+        Decimal("0"),
+    )
+    gross_month_revenue = Decimal(month_revenue_data["gross_revenue"])
+    collection_rate = (
+        float((Decimal(month_revenue_data["paid_amount"]) / gross_month_revenue) * 100)
+        if gross_month_revenue > 0
+        else 0.0
+    )
     return {"data": {
         "revenue": {"today": float(today_revenue), "yesterday": float(yesterday_revenue), "thisMonth": float(month_revenue), "lastMonth": 0, "trend": float(today_revenue - yesterday_revenue)},
         "orders": {"today": today_orders, "pending": await _count(session, "orders", order_model.status.in_(("pending", "new"))), "processing": await _count(session, "orders", order_model.status == "processing"), "completed": await _count(session, "orders", order_model.status.in_(("delivered", "completed"))), "trend": 0},
-        "customers": {"total": await _count(session, "users"), "new_today": await _count(session, "users", user_model.created_at >= today), "new_this_month": await _count(session, "users", user_model.created_at >= month), "trend": 0},
+        "customers": {"total": await _customer_count(session), "new_today": await _customer_count(session, user_model.created_at >= today), "new_this_month": await _customer_count(session, user_model.created_at >= month), "trend": 0},
         "products": {"total": await _count(session, "products"), "low_stock": inventory_counts["low_stock"], "out_of_stock": inventory_counts["out_of_stock"], "pending_approval": await _count(session, "products", product_model.approval_status.in_(("pending", "reviewing")))},
-        "payments": {"pending_amount": float(await _sum_amount(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing")))), "pending_count": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))), "collected_today": float(await _sum_amount(session, "order_payments", MODEL_BY_TABLE["order_payments"].created_at >= today)), "collection_rate": 0},
-        "expenses": {"today": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= today)), "thisMonth": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= month)), "general": float(await _sum_amount(session, "general_expenses")), "employees": float(await _sum_amount(session, "employee_payments")), "partners": float(await _sum_amount(session, "partner_payments")), "marketers": float(await _sum_amount(session, "marketer_payments")), "netProfit": float(month_revenue)},
+        "payments": {"pending_amount": float(await _sum_amount(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing")))), "pending_count": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))), "collected_today": float(await _sum_amount(session, "order_payments", MODEL_BY_TABLE["order_payments"].created_at >= today)), "collection_rate": round(collection_rate, 2)},
+        "expenses": {"today": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= today)), "thisMonth": float(monthly_expenses), "general": float(await _sum_amount(session, "general_expenses")), "employees": float(await _sum_amount(session, "employee_payments")), "partners": float(await _sum_amount(session, "partner_payments")), "marketers": float(await _sum_amount(session, "marketer_payments")), "netProfit": float(month_revenue - monthly_expenses)},
         "partners": {"total": await _count(session, "partner_storefronts"), "active": await _count(session, "partner_storefronts", MODEL_BY_TABLE["partner_storefronts"].status.in_(("active", "approved"))), "pending_settlements": await _count(session, "partner_settlements", MODEL_BY_TABLE["partner_settlements"].status.in_(("pending", "unpaid")))},
     }}
 
@@ -5077,16 +5330,52 @@ async def api_delete_marketer(marketer_id: uuid.UUID, request: Request, staff: U
 @router.post("/api/marketing/commissions/pay")
 async def api_pay_marketer_commission(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
-    raw_id = body.get("commission_id") or body.get("commissionId") or ((body.get("ids") or [None])[0])
-    commission_id = uuid.UUID(str(raw_id))
+    raw_ids = body.get("ids") or body.get("commission_ids") or body.get("commissionIds")
+    if not raw_ids:
+        raw_id = body.get("commission_id") or body.get("commissionId")
+        raw_ids = [raw_id] if raw_id else []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=422, detail="commission_ids_required")
+    commission_ids = [_uuid(value, "commission_id") for value in raw_ids]
     model = MODEL_BY_TABLE["marketer_commissions"]
-    commission = await session.get(model, commission_id)
-    if commission is None:
+    commissions = list(
+        (
+            await session.execute(
+                select(model)
+                .where(model.id.in_(commission_ids), model.deleted_at.is_(None))
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    if not commissions:
         raise HTTPException(status_code=404, detail="commission_not_found")
-    commission.status = "paid"
-    row = await _api_create(session, "marketer_payments", {"user_id": commission.user_id, "amount": commission.amount or 0, "status": "paid", "notes": body.get("notes") or ""}, staff)
+    if len(commissions) != len(set(commission_ids)):
+        raise HTTPException(status_code=404, detail="commission_not_found")
+    payable_statuses = {"pending", "earned", "approved", "unpaid"}
+    if any(str(commission.status or "").lower() not in payable_statuses for commission in commissions):
+        raise HTTPException(status_code=409, detail="commission_already_paid")
+    grouped: dict[uuid.UUID, list[Any]] = {}
+    for commission in commissions:
+        commission.status = "paid"
+        grouped.setdefault(commission.user_id, []).append(commission)
+    rows = []
+    for user_id, user_commissions in grouped.items():
+        rows.append(
+            await _api_create(
+                session,
+                "marketer_payments",
+                {
+                    "user_id": user_id,
+                    "amount": sum((money(item.amount or 0) for item in user_commissions), money(0)),
+                    "status": "paid",
+                    "notes": body.get("notes") or "",
+                    "commissions_paid": [str(item.id) for item in user_commissions],
+                },
+                staff,
+            )
+        )
     await session.commit()
-    return {"data": row}
+    return {"data": rows, "count": len(commissions)}
 
 
 @router.post("/api/operations/refunds", status_code=201)
@@ -5724,8 +6013,27 @@ async def api_create_marketer_payment(request: Request, staff: User = Depends(re
     require_finance_actor(roles)
     body = await request.json()
     _validate_payment_record_body(body)
-    user_id = body.get("user_id") or body.get("marketer_id") or staff.id
-    row = await _api_create(session, "marketer_payments", {"user_id": uuid.UUID(str(user_id)), "amount": body.get("amount") or 0, "status": body.get("status") or "pending", "notes": body.get("notes") or "", **body}, staff)
+    user_id: uuid.UUID | None = None
+    raw_marketer_id = body.get("marketer_id") or body.get("marketerId")
+    if raw_marketer_id:
+        marketer_model = MODEL_BY_TABLE["marketers"]
+        marketer = await session.get(marketer_model, _uuid(raw_marketer_id, "marketer_id"))
+        if marketer is not None:
+            user_id = marketer.user_id
+    if user_id is None:
+        raw_user_id = body.get("user_id") or body.get("userId")
+        if raw_user_id:
+            user_id = _uuid(raw_user_id, "user_id")
+    if user_id is None:
+        raise HTTPException(status_code=422, detail="marketer_user_required")
+    if await session.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="marketer_user_not_found")
+    row = await _api_create(
+        session,
+        "marketer_payments",
+        {"user_id": user_id, "amount": body.get("amount") or 0, "status": body.get("status") or "pending", "notes": body.get("notes") or "", **body},
+        staff,
+    )
     await session.commit()
     return {"data": row}
 

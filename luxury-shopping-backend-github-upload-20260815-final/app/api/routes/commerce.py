@@ -2648,7 +2648,11 @@ async def change_order_status(
         if assignment is None:
             raise HTTPException(status_code=403, detail="courier_not_assigned")
     previous, next_status = assert_allowed_transition(order.status, next_status, courier=courier_actor)
-    assert_delivery_proof(next_status, body)
+    # Couriers must provide delivery proof. Staff and administrators are
+    # allowed to record a verified/manual delivery from the operations panel,
+    # where the authenticated staff action is already audited below.
+    if courier_actor:
+        assert_delivery_proof(next_status, body)
     order.status = next_status
     history_model = MODEL_BY_TABLE["order_status_history"]
     session.add(history_model(order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status}))

@@ -711,6 +711,62 @@ async def find_receipt_for_access(
     return row
 
 
+async def find_file_asset_for_access(
+    session: AsyncSession,
+    *,
+    receipt_ref: str,
+    user: User,
+    roles: set[str],
+) -> FileAsset:
+    """Resolve receipts uploaded through the shared private-file pipeline.
+
+    Admin payment screens upload local/international receipts as FileAsset
+    records (``file:<uuid>``).  They are intentionally not copied into the
+    legacy payment_receipts table, so signed-url access must authorize that
+    record directly.
+    """
+    ref = receipt_ref.strip()
+    if ref.startswith("file:"):
+        ref = ref.split(":", 1)[1]
+    try:
+        asset_id = uuid.UUID(ref)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="receipt_not_found") from exc
+    asset = (
+        await session.execute(
+            select(FileAsset)
+            .where(
+                FileAsset.id == asset_id,
+                FileAsset.deleted_at.is_(None),
+                FileAsset.status == "available",
+                FileAsset.scan_status.in_(("clean", "not_required")),
+                FileAsset.policy_key == "payment_receipt",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if asset is None:
+        raise HTTPException(status_code=404, detail="receipt_not_found")
+    if (
+        asset.owner_user_id != user.id
+        and asset.created_by != user.id
+        and not roles.intersection(FINANCE_REVIEW_ROLES)
+    ):
+        raise HTTPException(status_code=404, detail="receipt_not_found")
+    return asset
+
+
+def _file_asset_storage_path(asset: FileAsset, storage: FileStorage) -> Path:
+    if str(asset.storage_provider or "").strip() == "cloudflare_r2":
+        # Private receipt policies are kept on the backend filesystem.  Do
+        # not silently turn a private R2 key into a local path.
+        raise HTTPException(status_code=503, detail="private_receipt_storage_unavailable")
+    target = storage._safe_join(str(asset.storage_key or ""))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="receipt_file_not_found")
+    return target
+
+
 def _receipt_storage_path(row: Any, storage: FileStorage) -> Path:
     extra = dict(getattr(row, "extra_data", {}) or {})
     storage_key = str(extra.get("storage_key") or "").strip()
@@ -789,23 +845,42 @@ async def issue_signed_receipt_url(
             max(requested_seconds, SIGNED_RECEIPT_MIN_AGE_SECONDS),
             SIGNED_RECEIPT_MAX_AGE_SECONDS,
         )
-    row = await find_receipt_for_access(session, receipt_ref=receipt_ref, user=user, roles=roles)
-    target = _receipt_storage_path(row, storage)
+    if receipt_ref.strip().lower().startswith("file:"):
+        asset = await find_file_asset_for_access(
+            session,
+            receipt_ref=receipt_ref,
+            user=user,
+            roles=roles,
+        )
+        target = _file_asset_storage_path(asset, storage)
+        record_id = asset.id
+        file_asset_id = str(asset.id)
+    else:
+        row = await find_receipt_for_access(session, receipt_ref=receipt_ref, user=user, roles=roles)
+        target = _receipt_storage_path(row, storage)
+        record_id = row.id
+        file_asset_id = None
     exp = _now() + timedelta(seconds=expires_in_effective)
     payload = {
         "sub": str(user.id),
-        "receipt_id": str(row.id),
+        "receipt_id": str(record_id),
         "storage_sha256": hashlib.sha256(str(target.relative_to(storage.root)).encode("utf-8")).hexdigest(),
         "exp": int(exp.timestamp()),
         "purpose": "payment_receipt_access",
     }
+    if file_asset_id:
+        payload["file_asset_id"] = file_asset_id
     token = _signed_token(payload)
     _add_audit_log(
         session,
         user_id=user.id,
         action="payment_receipt.signed_url_issued",
-        description=f"Issued signed receipt access for {row.id}",
-        extra_data={"payment_receipt_id": row.id, "expires_at": exp.isoformat()},
+        description=f"Issued signed receipt access for {record_id}",
+        extra_data={
+            "payment_receipt_id": record_id if not file_asset_id else None,
+            "file_asset_id": record_id if file_asset_id else None,
+            "expires_at": exp.isoformat(),
+        },
     )
     await session.commit()
     signed_url = f"{str(request.base_url).rstrip('/')}/receipts/access?token={token}"
@@ -814,7 +889,8 @@ async def issue_signed_receipt_url(
         "url": signed_url,
         "expires_at": exp.isoformat(),
         "expires_in_effective": expires_in_effective,
-        "receipt_id": str(row.id),
+        "receipt_id": str(record_id),
+        "file_asset_id": file_asset_id,
     }
 
 
@@ -827,10 +903,36 @@ async def signed_receipt_file_response(
     payload = _verify_signed_token(token)
     if payload.get("purpose") != "payment_receipt_access":
         raise HTTPException(status_code=403, detail="invalid_receipt_token")
-    try:
-        receipt_id = uuid.UUID(str(payload["receipt_id"]))
-    except (KeyError, ValueError):
-        raise HTTPException(status_code=403, detail="invalid_receipt_token")
+    file_asset_id_raw = payload.get("file_asset_id")
+    if file_asset_id_raw:
+        try:
+            file_asset_id = uuid.UUID(str(file_asset_id_raw))
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=403, detail="invalid_receipt_token")
+        asset = (
+            await session.execute(
+                select(FileAsset)
+                .where(
+                    FileAsset.id == file_asset_id,
+                    FileAsset.deleted_at.is_(None),
+                    FileAsset.status == "available",
+                    FileAsset.scan_status.in_(("clean", "not_required")),
+                    FileAsset.policy_key == "payment_receipt",
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if asset is None:
+            raise HTTPException(status_code=404, detail="receipt_not_found")
+        target = _file_asset_storage_path(asset, storage)
+        storage_hash = hashlib.sha256(str(target.relative_to(storage.root)).encode("utf-8")).hexdigest()
+        if payload.get("storage_sha256") != storage_hash:
+            raise HTTPException(status_code=403, detail="invalid_receipt_token")
+        return FileResponse(
+            target,
+            media_type=str(asset.content_type or "application/octet-stream"),
+            filename=str(asset.original_filename or target.name),
+        )
     model = MODEL_BY_TABLE["payment_receipts"]
     row = (
         await session.execute(select(model).where(model.id == receipt_id, model.deleted_at.is_(None)).limit(1))
