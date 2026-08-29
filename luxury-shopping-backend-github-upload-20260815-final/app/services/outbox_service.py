@@ -229,12 +229,74 @@ def _email_message_html(message: str) -> str:
     linked_message = re.sub(
         r"(https?://[^\s<]+)",
         lambda match: (
-            f'<a href="{match.group(1)}" style="color:#58a6ff;text-decoration:underline;'
+            f'<a class="email-link" href="{match.group(1)}" style="color:#58a6ff;text-decoration:underline;'
             f'word-break:break-all">{match.group(1)}</a>'
         ),
         escaped_message,
     )
     return linked_message.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
+def _render_branded_email_html(
+    *,
+    logo_url: str,
+    safe_subject: str,
+    safe_message: str,
+    verification_code_html: str,
+    action_html: str,
+) -> str:
+    """Render a light-first email that follows the recipient's color scheme."""
+    return f"""<!doctype html>
+<html lang=\"ar\" dir=\"rtl\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"x-apple-disable-message-reformatting\">
+<meta name=\"format-detection\" content=\"telephone=no\">
+<meta name=\"color-scheme\" content=\"light dark\">
+<meta name=\"supported-color-schemes\" content=\"light dark\">
+<style>
+:root {{ color-scheme: light dark; supported-color-schemes: light dark; }}
+html, body {{ margin: 0; padding: 0; width: 100%; }}
+body {{ background-color: #f7f5ef; color: #202124; font-family: Arial, Tahoma, sans-serif; line-height: 1.6; }}
+.email-page {{ background-color: #f7f5ef !important; }}
+.email-container, .email-brand, .email-card {{ background-color: #fffdf8 !important; }}
+.email-card {{ border-color: #e4e1d8 !important; }}
+.email-heading, .email-text {{ color: #202124 !important; }}
+.email-muted {{ color: #737780 !important; }}
+.email-link {{ color: #1677c8 !important; }}
+.email-divider {{ border-color: #e4e1d8 !important; }}
+.email-code {{ color: #9a6900 !important; }}
+@media (prefers-color-scheme: dark) {{
+  html, body, .email-page {{ background-color: #111318 !important; color: #f0f2f5 !important; }}
+  .email-container, .email-brand, .email-card {{ background-color: #1d2027 !important; }}
+  .email-card {{ border-color: #3b414d !important; }}
+  .email-heading, .email-text {{ color: #f0f2f5 !important; }}
+  .email-muted {{ color: #aeb5c1 !important; }}
+  .email-link {{ color: #f2bd39 !important; }}
+  .email-divider {{ border-color: #3b414d !important; }}
+  .email-code {{ color: #f2bd39 !important; }}
+}}
+[data-ogsc] .email-page {{ background-color: #111318 !important; }}
+[data-ogsc] .email-container, [data-ogsc] .email-brand, [data-ogsc] .email-card {{ background-color: #1d2027 !important; }}
+[data-ogsc] .email-card, [data-ogsc] .email-divider {{ border-color: #3b414d !important; }}
+[data-ogsc] .email-heading, [data-ogsc] .email-text {{ color: #f0f2f5 !important; }}
+[data-ogsc] .email-muted {{ color: #aeb5c1 !important; }}
+[data-ogsc] .email-link, [data-ogsc] .email-code {{ color: #f2bd39 !important; }}
+@media only screen and (max-width: 480px) {{
+  .email-page {{ padding: 16px 8px !important; }}
+  .email-card {{ padding: 16px 14px !important; }}
+}}
+</style>
+</head>
+<body dir=\"rtl\" class=\"email-page\" bgcolor=\"#f7f5ef\" style=\"margin:0;padding:0;background-color:#f7f5ef;color:#202124;font-family:Arial,Tahoma,sans-serif;line-height:1.6\">
+<div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">تجربة تسوق تليق بك من رفاهية التسوق</div>
+<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" class=\"email-page\" bgcolor=\"#f7f5ef\" style=\"background-color:#f7f5ef;padding:24px 12px\"><tr><td align=\"center\">
+<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" class=\"email-container\" bgcolor=\"#fffdf8\" style=\"max-width:420px;background-color:#fffdf8\">
+<tr><td class=\"email-brand\" bgcolor=\"#fffdf8\" style=\"padding:8px 18px 18px;text-align:center;background-color:#fffdf8\"><img src=\"{escape(logo_url, quote=True)}\" alt=\"رفاهية التسوق\" width=\"24\" height=\"24\" style=\"display:block;margin:0 auto 8px;width:24px;height:24px;object-fit:contain\"><p class=\"email-text\" style=\"margin:0;color:#202124;font-size:11px;line-height:1.5;letter-spacing:normal\">رفاهية التسوق</p></td></tr>
+<tr><td style=\"padding:0 0 16px;text-align:center;direction:rtl\"><h1 class=\"email-heading\" style=\"margin:0;color:#202124;font-size:21px;line-height:1.35;font-weight:700\">{safe_subject}</h1></td></tr>
+<tr><td class=\"email-card\" bgcolor=\"#fffdf8\" style=\"border:1px solid #e4e1d8;border-radius:7px;padding:18px 16px;background-color:#fffdf8;text-align:right;direction:rtl\"><p class=\"email-text\" style=\"margin:0;color:#202124;font-size:15px;line-height:1.9\">{safe_message}</p>{verification_code_html}{action_html}</td></tr>
+<tr><td class=\"email-muted\" style=\"padding:18px 10px 4px;color:#737780;text-align:center;font-size:11px;line-height:1.8\">هذه رسالة آلية من رفاهية التسوق.<br>إذا لم تطلب هذه الرسالة، يمكنك تجاهلها بأمان.</td></tr>
+</table></td></tr></table></body></html>"""
 
 
 def _send_email_sync(
@@ -274,18 +336,18 @@ def _send_email_sync(
     safe_message = _email_message_html(display_message)
     verification_code_html = (
         f'<div style="margin:20px 0 4px;text-align:center">'
-        f'<div style="color:#8b949e;font-size:11px;line-height:1.5">رمز التفعيل</div>'
-        f'<div dir="ltr" style="margin-top:4px;color:#f0f2f5;font-size:24px;font-weight:700;letter-spacing:3px;line-height:1.3">{escape(verification_code)}</div></div>'
+        f'<div class="email-muted" style="color:#737780;font-size:11px;line-height:1.5">رمز التفعيل</div>'
+        f'<div class="email-code" dir="ltr" style="margin-top:4px;color:#9a6900;font-size:24px;font-weight:700;letter-spacing:3px;line-height:1.3">{escape(verification_code)}</div></div>'
         if verification_code
         else ""
     )
     action_html = ""
     if action_url and action_url.startswith(("https://", "http://")):
         action_html = (
-            f'<div style="margin:20px 0 0;padding-top:14px;border-top:1px solid #34373c">'
-            f'<p style="font-size:12px;color:#8b949e;line-height:1.7;margin:0 0 4px">{escape(action_label)}:</p>'
+            f'<div class="email-divider" style="margin:20px 0 0;padding-top:14px;border-top:1px solid #e4e1d8">'
+            f'<p class="email-muted" style="font-size:12px;color:#737780;line-height:1.7;margin:0 0 4px">{escape(action_label)}:</p>'
             f'<p dir="ltr" style="font-size:12px;word-break:break-all;line-height:1.8;margin:0">'
-            f'<a href="{escape(action_url, quote=True)}" style="color:#58a6ff;text-decoration:underline;word-break:break-all">'
+            f'<a class="email-link" href="{escape(action_url, quote=True)}" style="color:#58a6ff;text-decoration:underline;word-break:break-all">'
             f'{escape(action_url)}</a></p></div>'
         )
     plain_message = str(message or "رفاهية التسوق")
@@ -293,18 +355,13 @@ def _send_email_sync(
         plain_message = f"{plain_message}\n\n{action_label}: {action_url}"
     email.set_content(plain_message)
     email.add_alternative(
-        f"""<!doctype html>
-<html lang=\"ar\" dir=\"rtl\">
-<head><meta charset=\"utf-8\"><meta name=\"x-apple-disable-message-reformatting\"><meta name=\"format-detection\" content=\"telephone=no\"></head>
-<body dir=\"rtl\" style=\"margin:0;padding:0;background:#202124;color:#f0f2f5;font-family:Arial,Tahoma,sans-serif;line-height:1.6\">
-<div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">تجربة تسوق تليق بك من رفاهية التسوق</div>
-<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#202124;padding:24px 12px\"><tr><td align=\"center\">
-<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:420px;background:#202124\">
-<tr><td style=\"padding:8px 18px 18px;text-align:center;background:#202124\"><img src=\"{escape(logo_url, quote=True)}\" alt=\"رفاهية التسوق\" width=\"24\" height=\"24\" style=\"display:block;margin:0 auto 8px;width:24px;height:24px;object-fit:contain\"><p style=\"margin:0;color:#f0f2f5;font-size:11px;line-height:1.5;letter-spacing:normal\">رفاهية التسوق</p></td></tr>
-<tr><td style=\"padding:0 0 16px;text-align:center;direction:rtl\"><h1 style=\"margin:0;color:#f0f2f5;font-size:21px;line-height:1.35;font-weight:700\">{safe_subject}</h1></td></tr>
-<tr><td style=\"border:1px solid #34373c;border-radius:7px;padding:18px 16px;background:#202124;text-align:right;direction:rtl\"><p style=\"margin:0;color:#f0f2f5;font-size:15px;line-height:1.9\">{safe_message}</p>{verification_code_html}{action_html}</td></tr>
-<tr><td style=\"padding:18px 10px 4px;color:#8b949e;text-align:center;font-size:11px;line-height:1.8\">هذه رسالة آلية من رفاهية التسوق.<br>إذا لم تطلب هذه الرسالة، يمكنك تجاهلها بأمان.</td></tr>
-</table></td></tr></table></body></html>""",
+        _render_branded_email_html(
+            logo_url=logo_url,
+            safe_subject=safe_subject,
+            safe_message=safe_message,
+            verification_code_html=verification_code_html,
+            action_html=action_html,
+        ),
         subtype="html",
     )
     if _email_provider_mode(settings) == "resend":
