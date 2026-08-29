@@ -298,24 +298,35 @@ async def _queue_email_verification(
         f"{urlencode({'email': user.email, 'code': code})}"
     )
     status = _email_delivery_status()
-    session.add(
-        EMAIL_OUTBOX(
-            user_id=user.id,
-            title="فعّل حسابك في رفاهية التسوق",
-            email=user.email,
-            message=(
-                "مرحبًا بك في رفاهية التسوق. رمز تفعيل حسابك هو: "
-                f"{code}. ينتهي الرمز خلال 10 دقائق. يمكنك أيضًا الضغط على زر تفعيل الحساب."
-            ),
-            status=status,
-            extra_data={
-                "purpose": "email_verification",
-                "verification_url": verify_link,
-                "action_label": "تفعيل الحساب",
-                "verification_expires_minutes": 10,
-            },
-        )
+    email_row = EMAIL_OUTBOX(
+        user_id=user.id,
+        title="فعّل حسابك في رفاهية التسوق",
+        email=user.email,
+        message=(
+            "مرحبًا بك في رفاهية التسوق. رمز تفعيل حسابك هو: "
+            f"{code}. ينتهي الرمز خلال 10 دقائق. يمكنك أيضًا الضغط على زر تفعيل الحساب."
+        ),
+        status=status,
+        extra_data={
+            "purpose": "email_verification",
+            "verification_url": verify_link,
+            "action_label": "تفعيل الحساب",
+            "verification_expires_minutes": 10,
+        },
     )
+    session.add(email_row)
+    await session.flush()
+    if not get_settings().fixtures_enabled:
+        delivery = await deliver_email_now(session, email_row)
+        status = str(delivery.get("status") or "")
+        if status != "provider_accepted":
+            logger.warning(
+                "email_verification_delivery_failed provider=%s error_code=%s",
+                delivery.get("provider") or "none",
+                delivery.get("error_code") or "unknown",
+            )
+            detail = "email_verification_email_unconfigured" if status == "blocked_configuration" else "email_verification_delivery_failed"
+            raise HTTPException(status_code=503, detail=detail)
     await record_security_event(
         session,
         user_id=user.id,
