@@ -29,6 +29,7 @@ from ...schemas.auth import (
     LoginRequest,
     PasswordChangeRequest,
     PasswordResetRequest,
+    PasswordResetVerifyRequest,
     PasswordResetConfirm,
     PhoneOtpSendRequest,
     PhoneOtpVerifyRequest,
@@ -37,7 +38,7 @@ from ...schemas.auth import (
     RegisterRequest,
 )
 from ...security.passwords import get_password_policy, hash_password, validate_password, verify_password
-from ...security.tokens import token_hash
+from ...security.tokens import create_password_reset_ticket, decode_token, token_hash
 from ...services.auth_service import (
     auth_payload,
     account_security_for,
@@ -64,6 +65,7 @@ from ...services.staff_permissions import (
 )
 from ...services.firebase_auth_service import firebase_admin_configuration_status, verify_firebase_id_token
 from ...services.outbox_service import deliver_email_now, email_delivery_configured
+from ...services.notification_service import NotificationPayload, NotificationService
 
 
 router = APIRouter(tags=["auth"])
@@ -72,6 +74,33 @@ PartnerApplication = MODEL_BY_TABLE["partner_applications"]
 AccountDeletionRequest = MODEL_BY_TABLE["account_deletion_requests"]
 EMAIL_OUTBOX = MODEL_BY_TABLE["email_outbox"]
 WHATSAPP_OUTBOX = MODEL_BY_TABLE["whatsapp_outbox"]
+
+
+async def _queue_email_push_mirror(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    title: str,
+    body: str,
+    notification_type: str,
+    category: str,
+    action_url: str | None = None,
+) -> None:
+    """Mirror a direct email event in the app and on the registered phone."""
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=user_id,
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            category=category,
+            priority="high" if category == "security" else "normal",
+            action_type="open_link" if action_url else None,
+            action_url=action_url,
+            source="auth_email_mirror",
+            delivery_channels=("in_app", "mobile_push"),
+        )
+    )
 
 
 async def _session_after_json(request: Request):
@@ -172,6 +201,18 @@ def _email_delivery_status() -> str:
     if email_delivery_configured(settings):
         return "pending"
     return "blocked_credentials"
+
+
+def _uses_web_password_reset_otp(client_type: str | None) -> bool:
+    return str(client_type or "").strip().lower() in {
+        "web",
+        "website",
+        "react",
+        "flutter",
+        "mobile",
+        "android",
+        "ios",
+    }
 
 
 def _phone_delivery_status() -> str:
@@ -297,6 +338,17 @@ async def _queue_email_verification(
         f"{settings.frontend_public_url.rstrip('/')}/verify-email?"
         f"{urlencode({'email': user.email, 'code': code})}"
     )
+    await _queue_email_push_mirror(
+        session,
+        user_id=user.id,
+        title="فعّل حسابك في رفاهية التسوق",
+        body=(
+            "مرحبًا بك في رفاهية التسوق. رمز تفعيل حسابك صالح لمدة 10 دقائق، "
+            "وتم إرسال تفاصيل التفعيل إلى بريدك الإلكتروني."
+        ),
+        notification_type="email_verification_requested",
+        category="security",
+    )
     status = _email_delivery_status()
     email_row = EMAIL_OUTBOX(
         user_id=user.id,
@@ -382,30 +434,26 @@ def _web_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _set_refresh_cookie(response: Response, payload: dict[str, Any]) -> None:
+def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent: bool = True) -> None:
     secure_cookie = get_settings().app_env in {"production", "staging"}
+    cookie_options: dict[str, Any] = {
+        "httponly": True,
+        "samesite": "lax",
+        "secure": secure_cookie,
+        "path": "/",
+    }
     access_token = payload.get("access_token")
     if access_token:
-        response.set_cookie(
-            "at",
-            str(access_token),
-            httponly=True,
-            samesite="lax",
-            secure=secure_cookie,
-            path="/",
-            max_age=int(payload.get("expires_in") or 3600),
-        )
+        access_cookie_options = dict(cookie_options)
+        if persistent:
+            access_cookie_options["max_age"] = int(payload.get("expires_in") or 3600)
+        response.set_cookie("at", str(access_token), **access_cookie_options)
     token = payload.get("refresh_token")
     if token:
-        response.set_cookie(
-            "rt",
-            str(token),
-            httponly=True,
-            samesite="lax",
-            secure=secure_cookie,
-            path="/",
-            max_age=60 * 60 * 24 * 30,
-        )
+        refresh_cookie_options = dict(cookie_options)
+        if persistent:
+            refresh_cookie_options["max_age"] = 60 * 60 * 24 * 30
+        response.set_cookie("rt", str(token), **refresh_cookie_options)
 
 
 BLOCKED_FIREBASE_ACCOUNT_STATUSES = {"disabled", "deleted", "anonymized", "deletion_pending", "merchant_rejected"}
@@ -511,7 +559,7 @@ async def web_firebase_auth(
 @router.post("/api/auth/login")
 async def web_login(body: LoginRequest, request: Request, response: Response, session: AsyncSession = Depends(get_session)):
     payload = await login(body, request, session)
-    _set_refresh_cookie(response, payload)
+    _set_refresh_cookie(response, payload, persistent=body.remember_me)
     return _web_auth_payload(payload)
 
 
@@ -1578,7 +1626,7 @@ async def password_reset_request(
     session: AsyncSession = Depends(_session_after_json),
 ):
     email = str(body.email).strip().lower()
-    redirect_target = _resolve_password_reset_redirect(body.redirect_to, body.client_type)
+    redirect_target = "" if _uses_web_password_reset_otp(body.client_type) else _resolve_password_reset_redirect(body.redirect_to, body.client_type)
     ip = extract_client_ip(request)
     await check_action_rate_limit(
         session,
@@ -1602,6 +1650,8 @@ async def password_reset_request(
         settings = get_settings()
         if not settings.fixtures_enabled and not email_delivery_configured(settings):
             raise HTTPException(status_code=503, detail="password_reset_email_unconfigured")
+        uses_otp = _uses_web_password_reset_otp(body.client_type)
+        expires_minutes = 10 if uses_otp else 30
         now = datetime.now(timezone.utc)
         old_tokens = (
             await session.execute(
@@ -1619,32 +1669,53 @@ async def password_reset_request(
                 session.add(PasswordResetTokenState(reset_token_id=old_reset.id, invalidated_at=now))
             elif old_state.invalidated_at is None:
                 old_state.invalidated_at = now
-        raw_token = secrets.token_urlsafe(48)
+        raw_token = f"{secrets.randbelow(1_000_000):06d}" if uses_otp else secrets.token_urlsafe(48)
         reset_row = PasswordResetToken(
             user_id=user.id,
             token_hash=token_hash(raw_token),
-            expires_at=now + timedelta(minutes=30),
+            expires_at=now + timedelta(minutes=expires_minutes),
             requested_ip=ip,
         )
         session.add(reset_row)
         await session.flush()
         reset_state = PasswordResetTokenState(reset_token_id=reset_row.id)
         session.add(reset_state)
-        reset_link = _append_query_param(redirect_target, "token", raw_token)
+        await _queue_email_push_mirror(
+            session,
+            user_id=user.id,
+            title="استعادة كلمة المرور",
+            body=(
+                "تم إرسال رمز استعادة كلمة المرور المكوّن من 6 أرقام إلى بريدك الإلكتروني، والرمز صالح لمدة 10 دقائق."
+                if uses_otp
+                else "تم إرسال رابط استعادة كلمة المرور إلى بريدك الإلكتروني، والرابط صالح لمدة 30 دقيقة."
+            ),
+            notification_type="password_reset_requested",
+            category="security",
+        )
         delivery_status = _email_delivery_status()
+        email_message = (
+            f"رمز استعادة كلمة المرور هو: {raw_token}\nالرمز صالح لمدة {expires_minutes} دقائق."
+            if uses_otp
+            else f"استخدم رابط استعادة كلمة المرور خلال {expires_minutes} دقيقة:\n{_append_query_param(redirect_target, 'token', raw_token)}"
+        )
+        email_extra_data: dict[str, Any] = {
+            "client_type": body.client_type,
+            "category": "security",
+            "expires_in_minutes": expires_minutes,
+            "delivery_method": "otp" if uses_otp else "link",
+        }
+        if not uses_otp:
+            email_extra_data.update({
+                "reset_url": _append_query_param(redirect_target, "token", raw_token),
+                "redirect_to": redirect_target,
+            })
         email_row = EMAIL_OUTBOX(
             user_id=user.id,
             title="استعادة كلمة المرور",
             email=user.email,
-            message=f"استخدم رابط استعادة كلمة المرور خلال 30 دقيقة:\n{reset_link}",
+            message=email_message,
             status=delivery_status,
-            extra_data={
-                "reset_url": reset_link,
-                "redirect_to": redirect_target,
-                "client_type": body.client_type,
-                "category": "security",
-                "expires_in_minutes": 30,
-            },
+            extra_data=email_extra_data,
         )
         session.add(email_row)
         await session.flush()
@@ -1669,7 +1740,81 @@ async def password_reset_request(
             request=request,
         )
     await session.commit()
-    return {"ok": True, "delivery_status": delivery_status}
+    return {
+        "ok": True,
+        "delivery_status": delivery_status,
+        "delivery_method": "otp" if _uses_web_password_reset_otp(body.client_type) else "link",
+        "expires_in_minutes": 10 if _uses_web_password_reset_otp(body.client_type) else 30,
+    }
+
+
+@router.post("/api/auth/password-reset-verify")
+@router.post("/auth/password-reset-verify")
+async def password_reset_verify(
+    body: PasswordResetVerifyRequest,
+    request: Request,
+    session: AsyncSession = Depends(_session_after_json),
+):
+    email = str(body.email).strip().lower()
+    ip = extract_client_ip(request)
+    await check_action_rate_limit(
+        session,
+        email=email,
+        ip=ip,
+        detail="password_reset_otp_verify",
+        maximum=get_settings().otp_rate_limit,
+        window_minutes=30,
+    )
+    session.add(LoginAttempt(email=email, ip_address=ip, succeeded=True, detail="password_reset_otp_verify"))
+    user = (await session.execute(
+        select(User).where(func.lower(User.email) == email, User.deleted_at.is_(None))
+    )).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    reset = None
+    reset_state = None
+    if user is not None:
+        reset = (await session.execute(
+            select(PasswordResetToken)
+            .where(
+                PasswordResetToken.user_id == user.id,
+                PasswordResetToken.used_at.is_(None),
+            )
+            .order_by(PasswordResetToken.created_at.desc())
+            .with_for_update()
+        )).scalars().first()
+        reset_state = await session.get(PasswordResetTokenState, reset.id) if reset is not None else None
+    valid = (
+        reset is not None
+        and reset.expires_at > now
+        and (reset_state is None or reset_state.invalidated_at is None)
+        and token_hash(body.code) == reset.token_hash
+    )
+    if not valid:
+        if user is not None:
+            await record_security_event(
+                session,
+                user_id=user.id,
+                event_type="password_reset_otp_failed",
+                status="blocked",
+                description="Incorrect or expired password reset OTP submitted.",
+                request=request,
+            )
+        await session.commit()
+        raise HTTPException(status_code=400, detail="invalid_or_expired_reset_token")
+    await record_security_event(
+        session,
+        user_id=user.id,
+        event_type="password_reset_otp_verified",
+        status="verified",
+        description="Password reset OTP verified; a short-lived reset ticket was issued.",
+        request=request,
+    )
+    await session.commit()
+    return {
+        "ok": True,
+        "reset_token": create_password_reset_ticket(str(user.id), str(reset.id), reset.expires_at),
+        "expires_in_minutes": max(1, int((reset.expires_at - now).total_seconds() / 60)),
+    }
 
 
 @router.post("/auth/password-reset-confirm")
@@ -1678,17 +1823,48 @@ async def password_reset_confirm(
     session: AsyncSession = Depends(get_session),
 ):
     now = datetime.now(timezone.utc)
-    result = await session.execute(
-        select(PasswordResetToken)
-        .where(PasswordResetToken.token_hash == token_hash(body.token))
-        .with_for_update()
-    )
-    reset = result.scalar_one_or_none()
+    reset = None
+    user = None
+    if body.token:
+        try:
+            ticket = decode_token(body.token)
+        except Exception:
+            ticket = None
+        if ticket and ticket.get("type") == "password_reset_otp":
+            try:
+                reset_id = uuid.UUID(str(ticket["rid"]))
+                ticket_user_id = uuid.UUID(str(ticket["sub"]))
+            except (KeyError, TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="invalid_or_expired_reset_token")
+            reset = await session.get(PasswordResetToken, reset_id, with_for_update=True)
+            if reset is None or reset.user_id != ticket_user_id:
+                raise HTTPException(status_code=400, detail="invalid_or_expired_reset_token")
+            user = await session.get(User, ticket_user_id, with_for_update=True)
+        else:
+            result = await session.execute(
+                select(PasswordResetToken)
+                .where(PasswordResetToken.token_hash == token_hash(body.token))
+                .with_for_update()
+            )
+            reset = result.scalar_one_or_none()
+            user = await session.get(User, reset.user_id, with_for_update=True) if reset is not None else None
+    else:
+        user = (await session.execute(
+            select(User).where(func.lower(User.email) == str(body.email).strip().lower(), User.deleted_at.is_(None))
+        )).scalar_one_or_none()
+        if user is not None:
+            reset = (await session.execute(
+                select(PasswordResetToken)
+                .where(PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None))
+                .order_by(PasswordResetToken.created_at.desc())
+                .with_for_update()
+            )).scalars().first()
+            if reset is not None and token_hash(body.code or "") != reset.token_hash:
+                reset = None
     reset_state = await session.get(PasswordResetTokenState, reset.id) if reset is not None else None
     if reset is None or reset.used_at is not None or (reset_state is not None and reset_state.invalidated_at is not None) or reset.expires_at <= now:
         raise HTTPException(status_code=400, detail="invalid_or_expired_reset_token")
-    user = await session.get(User, reset.user_id, with_for_update=True)
-    if user is None or user.deleted_at is not None:
+    if user is None or user.deleted_at is not None or user.id != reset.user_id:
         raise HTTPException(status_code=400, detail="invalid_or_expired_reset_token")
     try:
         validate_password(body.new_password, email=user.email)

@@ -188,6 +188,57 @@ def test_verification_code_is_not_duplicated_in_branded_html(monkeypatch) -> Non
     assert captured["html"].count("17155284") == 1
 
 
+def test_otp_email_contains_six_digit_code_without_reset_link_or_cta(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        email_provider="resend",
+        resend_api_key="resend_test_key",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="no-reply@luxuryshoppings.com",
+        smtp_host="",
+        smtp_port=587,
+        smtp_username="",
+        smtp_password="",
+        smtp_from_email="",
+    )
+    captured = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"id": "email_otp_test_id"}
+
+    def fake_post(url, *, headers, json, timeout):
+        captured["payload"] = json
+        return Response()
+
+    monkeypatch.setattr(outbox_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(outbox_service.httpx, "post", fake_post)
+
+    outbox_service._send_email_sync(
+        "customer@example.com",
+        "استعادة كلمة المرور",
+        "رمز استعادة كلمة المرور هو: 123456\nالرمز صالح لمدة 10 دقائق.",
+        {
+            "delivery_method": "otp",
+            "reset_url": "https://luxuryshoppings.com/reset-password?token=must-not-be-sent",
+        },
+    )
+
+    payload = captured["payload"]
+    assert payload["text"].count("123456") == 1
+    assert "https://" not in payload["text"]
+    assert "123456" in payload["html"]
+    assert "must-not-be-sent" not in payload["html"]
+    assert "href=" not in payload["html"]
+    assert payload["headers"] == {
+        "Importance": "high",
+        "X-Priority": "1",
+        "X-MSMail-Priority": "High",
+    }
+
+
 @pytest.mark.asyncio
 async def test_critical_email_delivery_returns_provider_acceptance(monkeypatch) -> None:
     settings = SimpleNamespace(

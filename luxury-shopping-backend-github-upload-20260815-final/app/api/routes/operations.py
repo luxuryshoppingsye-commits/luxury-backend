@@ -123,6 +123,34 @@ from .commerce import _delete_product_file_assets, _serialize_orders_with_financ
 router = APIRouter(tags=["operations"])
 storage = FileStorage()
 SEED_UPLOADS_ZIP = BACKEND_DIR / "seed_data" / "uploads_seed.zip"
+
+
+async def _queue_email_push_mirror(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    title: str,
+    body: str,
+    notification_type: str,
+    category: str,
+    created_by: uuid.UUID | None = None,
+    deduplication_key: str | None = None,
+) -> None:
+    """Mirror a direct email workflow in the app and on the registered phone."""
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=user_id,
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            category=category,
+            priority="high" if category == "security" else "normal",
+            created_by=created_by,
+            source="operations_email_mirror",
+            deduplication_key=deduplication_key,
+            delivery_channels=("in_app", "mobile_push"),
+        )
+    )
 SEED_UPLOADS_SAMPLE = "products/0039c8877ec3f5759d10cb9b.webp"
 ADMIN_NOTIFICATION_ROLES = {"admin", "manager"}
 DIRECT_RECEIPT_INPUT_FIELDS = frozenset(
@@ -7780,6 +7808,16 @@ async def api_order_invoice_email(order_id: uuid.UUID, staff: User = Depends(req
     if recipient is None:
         raise HTTPException(status_code=404, detail="recipient_not_found")
     dedupe_key = f"order-invoice-email:{order_id}:{row.user_id}"
+    await _queue_email_push_mirror(
+        session,
+        user_id=row.user_id,
+        title="فاتورة طلبك جاهزة",
+        body=f"فاتورة الطلب رقم {row.order_number} جاهزة للمراجعة.",
+        notification_type="order_invoice_ready",
+        category="order",
+        created_by=staff.id,
+        deduplication_key=dedupe_key,
+    )
     outbox_model = MODEL_BY_TABLE["email_outbox"]
     existing = (
         await session.execute(
@@ -7813,6 +7851,16 @@ async def resend_order_confirmation(order_id: uuid.UUID, user: User = Depends(cu
     if order is None or order.user_id != user.id or order.deleted_at is not None:
         raise HTTPException(status_code=404, detail="order_not_found")
     dedupe_key = f"order-confirmation-email:{order.id}:{user.id}"
+    await _queue_email_push_mirror(
+        session,
+        user_id=user.id,
+        title="تم استلام طلبك",
+        body=f"تم استلام طلبك رقم {order.order_number} بنجاح.",
+        notification_type="order_confirmation_resent",
+        category="order",
+        created_by=user.id,
+        deduplication_key=dedupe_key,
+    )
     outbox_model = MODEL_BY_TABLE["email_outbox"]
     existing = (
         await session.execute(
@@ -7958,6 +8006,28 @@ async def api_reply_contact_message(
         raise HTTPException(status_code=422, detail="reply_message_invalid")
     if not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", recipient):
         raise HTTPException(status_code=422, detail="contact_email_invalid")
+    recipient_user_id = getattr(contact, "user_id", None)
+    if recipient_user_id is None:
+        recipient_user_id = (
+            await session.execute(
+                select(User.id).where(func.lower(User.email) == recipient.lower(), User.deleted_at.is_(None)).limit(1)
+            )
+        ).scalar_one_or_none()
+    if recipient_user_id is not None:
+        reply_dedupe_key = "contact-reply:{}:{}".format(
+            record_id,
+            hashlib.sha256(f"{subject}\n{message}".encode("utf-8")).hexdigest(),
+        )
+        await _queue_email_push_mirror(
+            session,
+            user_id=recipient_user_id,
+            title=subject,
+            body=message,
+            notification_type="support_reply",
+            category="support",
+            created_by=staff.id,
+            deduplication_key=reply_dedupe_key,
+        )
     outbox = await _api_create(session, "email_outbox", {
         "user_id": staff.id,
         "title": subject,

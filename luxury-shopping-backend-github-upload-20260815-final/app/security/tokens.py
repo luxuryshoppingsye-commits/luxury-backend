@@ -29,6 +29,18 @@ def create_access_token(user_id: str, roles: list[str], security_version: int = 
     return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
 
 
+def create_password_reset_ticket(user_id: str, reset_id: str, expires_at: datetime) -> str:
+    payload = {
+        "sub": user_id,
+        "rid": reset_id,
+        "type": "password_reset_otp",
+        "jti": str(uuid.uuid4()),
+        "iat": datetime.now(timezone.utc),
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, get_settings().jwt_secret, algorithm=ALGORITHM)
+
+
 def create_refresh_token() -> tuple[str, str, datetime]:
     settings = get_settings()
     raw = secrets.token_urlsafe(64)

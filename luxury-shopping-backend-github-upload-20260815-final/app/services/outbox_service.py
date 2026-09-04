@@ -172,17 +172,21 @@ def _send_resend_email_sync(
     subject: str,
     plain_message: str,
     html_message: str,
+    headers: dict[str, str] | None = None,
 ) -> None:
+    payload = {
+        "from": settings.resend_from_email,
+        "to": [recipient],
+        "subject": subject,
+        "text": plain_message,
+        "html": html_message,
+    }
+    if headers:
+        payload["headers"] = headers
     response = httpx.post(
         settings.resend_api_url,
         headers={"Authorization": f"Bearer {settings.resend_api_key}"},
-        json={
-            "from": settings.resend_from_email,
-            "to": [recipient],
-            "subject": subject,
-            "text": plain_message,
-            "html": html_message,
-        },
+        json=payload,
         timeout=20,
     )
     response.raise_for_status()
@@ -316,11 +320,19 @@ def _send_email_sync(
     email["From"] = sender
     email["To"] = recipient
     email["Subject"] = str(subject or "Luxury Shopping")[:200].replace("\r", " ").replace("\n", " ")
+    is_otp = str(extra.get("delivery_method") or "").strip().lower() == "otp"
     email.set_content(str(message or ""))
+    if is_otp:
+        # These are transactional security messages. The receiving mailbox still
+        # decides final placement, but these headers preserve the user's intent
+        # that the one-time code is high priority.
+        email["Importance"] = "high"
+        email["X-Priority"] = "1"
+        email["X-MSMail-Priority"] = "High"
     logo_url = BRAND_LOGO_URL
     safe_subject = escape(str(subject or "رفاهية التسوق"))
     raw_message = str(message or "")
-    action_url = str(extra.get("verification_url") or extra.get("reset_url") or "").strip()
+    action_url = "" if is_otp else str(extra.get("verification_url") or extra.get("reset_url") or "").strip()
     action_label = str(extra.get("action_label") or "فتح الرابط").strip()
     verification_code_match = re.search(r"(?:هو|is)\s*[:：]\s*([0-9]{4,10})", raw_message, flags=re.IGNORECASE)
     verification_code = verification_code_match.group(1) if verification_code_match else ""
@@ -349,8 +361,10 @@ def _send_email_sync(
             f'<p dir="ltr" style="font-size:12px;word-break:break-all;line-height:1.8;margin:0">'
             f'<a class="email-link" href="{escape(action_url, quote=True)}" style="color:#58a6ff;text-decoration:underline;word-break:break-all">'
             f'{escape(action_url)}</a></p></div>'
-        )
+    )
     plain_message = str(message or "رفاهية التسوق")
+    if is_otp:
+        plain_message = re.sub(r"https?://[^\s]+", "", plain_message).strip()
     if action_url and action_url.startswith(("https://", "http://")):
         plain_message = f"{plain_message}\n\n{action_label}: {action_url}"
     email.set_content(plain_message)
@@ -372,6 +386,11 @@ def _send_email_sync(
             subject=str(subject or "Luxury Shopping")[:200],
             plain_message=plain_message,
             html_message=html_part.get_content() if html_part is not None else "",
+            headers={
+                name: str(email[name])
+                for name in ("Importance", "X-Priority", "X-MSMail-Priority")
+                if email[name]
+            },
         )
         return
     if settings.smtp_port == 465:

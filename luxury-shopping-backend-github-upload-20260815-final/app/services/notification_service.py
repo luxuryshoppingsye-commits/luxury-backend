@@ -101,6 +101,9 @@ class NotificationPayload:
     source: str = "fastapi"
     deduplication_key: str | None = None
     expires_at: datetime | None = None
+    # Direct email workflows can enqueue their matching in-app/mobile event
+    # without creating a second email message.
+    delivery_channels: tuple[str, ...] | None = None
 
 
 class NotificationService:
@@ -241,6 +244,7 @@ class NotificationService:
                 "dedupe_key": payload.deduplication_key,
                 "max_attempts": get_settings().message_max_attempts,
                 "source": payload.source,
+                "delivery_channels": list(payload.delivery_channels) if payload.delivery_channels is not None else None,
             },
         )
         self.session.add(row)
@@ -535,7 +539,12 @@ class NotificationService:
 
     async def _deliver_outbox(self, row: Any) -> dict[str, Any]:
         notification_id = (row.payload or {}).get("notification_id")
-        channels = await self._allowed_channels(row.user_id, row.type or "message")
+        configured_channels = _extra(row).get("delivery_channels")
+        channels = await self._allowed_channels(
+            row.user_id,
+            row.type or "message",
+            configured_channels if isinstance(configured_channels, list) else None,
+        )
         if not channels:
             return {"ok": True, "blocked": False, "suppressed": True, "error": "communication_suppressed"}
         ok = True
@@ -549,7 +558,17 @@ class NotificationService:
                 errors.append(f"{channel}:{status}")
         return {"ok": ok, "blocked": blocked and not ok, "suppressed": False, "error": None if ok or blocked else ",".join(errors) or "delivery_failed"}
 
-    async def _allowed_channels(self, user_id: uuid.UUID, notification_type: str) -> list[str]:
+    async def _allowed_channels(
+        self,
+        user_id: uuid.UUID,
+        notification_type: str,
+        configured_channels: list[Any] | None = None,
+    ) -> list[str]:
+        if configured_channels is not None:
+            allowed = {"in_app", "mobile_push", "web_push"}
+            return list(dict.fromkeys(
+                str(channel) for channel in configured_channels if str(channel) in allowed
+            ))
         pref = await self.preferences_for(user_id)
         category = _category_from_type(notification_type)
         channels = []
@@ -559,8 +578,14 @@ class NotificationService:
             channels.append("mobile_push")
         if pref.web_push_enabled and _category_allowed(pref, category):
             channels.append("web_push")
-        if email_delivery_configured(get_settings()):
+        email_enabled = email_delivery_configured(get_settings())
+        if email_enabled:
             channels.append("email")
+            # If the same event is eligible for email, it must also try the
+            # registered mobile device. The token and OS permission still
+            # determine whether the provider can show the popup.
+            if "mobile_push" not in channels:
+                channels.append("mobile_push")
         if category in SECURITY_CATEGORIES:
             for required in ("in_app", "mobile_push", "web_push"):
                 if required not in channels:
@@ -665,8 +690,11 @@ class NotificationService:
             if value is not None
         }
         notification_data.setdefault("notification_id", str(notification_id or ""))
-        # Android handles data-only messages through the app background
-        # handler, which keeps Arabic text and the branded large icon intact.
+        # Keep the full text in data for the foreground Flutter presentation
+        # and deep-link handling. The notification payload is also required
+        # so Android can display a system tray/heads-up notification when the
+        # app is backgrounded or terminated, without depending on Dart being
+        # scheduled by the device.
         notification_data.setdefault("title", notification["title"])
         notification_data.setdefault("body", notification["body"])
         notification_data.setdefault("message", notification["body"])
@@ -681,8 +709,7 @@ class NotificationService:
             token = getattr(token_row, "token", None)
             if not token:
                 continue
-            platform = str(getattr(token_row, "platform", "") or "").lower()
-            android_notification = None if platform == "android" else messaging.AndroidNotification(
+            android_notification = messaging.AndroidNotification(
                 channel_id="luxury_notifications",
                 icon="ic_notification",
                 color="#9A6A05",
@@ -691,9 +718,7 @@ class NotificationService:
             )
             message = messaging.Message(
                 token=token,
-                # Android is data-only so Flutter owns the Arabic rendering
-                # and can show the exact app branding in the expanded card.
-                notification=None if platform == "android" else messaging.Notification(
+                notification=messaging.Notification(
                     title=notification["title"],
                     body=notification["body"],
                 ),

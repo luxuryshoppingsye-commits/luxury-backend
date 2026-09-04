@@ -1561,14 +1561,6 @@ async def _approve_partner(
             deduplication_key=f"partner-application-review:{application.id}:approved",
         )
     )
-    await _queue_message(
-        session,
-        "email_outbox",
-        user_id=application.user_id,
-        title="تم قبول طلب انضمام التاجر",
-        message="تم تفعيل بوابة التاجر ويمكنك تسجيل الدخول الآن.",
-        body={"email": application.email, "application_id": str(application.id)},
-    )
     return {"ok": True, "application": serialize_record(application)}
 
 
@@ -1789,22 +1781,32 @@ async def execute_function(
                     )
                 ).scalars()
             )
+        service = NotificationService(session)
+        title = _text(body, "title", default="إشعار")
+        message = _text(body, "message", "body", "p_message", "p_body")
+        notification_type = _text(body, "type", "notification_type", default="message")
+        category = _text(body, "category", default="system")
+        priority = _text(body, "priority", default="high")
+        action_url = _text(body, "actionUrl", "action_url", "url", "deep_link") or None
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
         created = []
         for target in user_ids:
             target_id = _uuid(target, "user_id")
-            notification = MODEL_BY_TABLE["notifications"](
-                user_id=target_id,
-                recipient_id=target_id,
-                title=_text(body, "title", default="إشعار"),
-                message=_text(body, "message", "body", "p_message", "p_body"),
-                body=_text(body, "message", "body", "p_message", "p_body"),
-                type=_text(body, "type", default="message"),
-                status="new",
-                is_read=False,
+            notification = await service.create_notification(
+                NotificationPayload(
+                    user_id=target_id,
+                    title=title,
+                    body=message,
+                    notification_type=notification_type,
+                    category=category,
+                    priority=priority,
+                    action_url=action_url,
+                    payload=payload,
+                    created_by=actor.id,
+                    source="function_fanout",
+                )
             )
-            session.add(notification)
             created.append(notification)
-        await session.flush()
         return {"ok": True, "created": len(created)}
     if function_name == "create-partner-user":
         actor = _require_user(user)
