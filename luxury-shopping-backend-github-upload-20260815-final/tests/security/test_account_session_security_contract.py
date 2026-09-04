@@ -123,6 +123,15 @@ async def test_email_verification_gates_new_customer_and_invalidates_old_links()
         assert body["requires_verification"] is True
         assert body.get("access_token") is None
 
+        async with SessionFactory() as session:
+            pending_user = await session.get(User, user_id)
+            pending_state = await session.get(AccountSecurity, user_id)
+            assert pending_user is not None
+            assert pending_user.is_active is False
+            assert pending_state is not None
+            assert pending_state.account_status == "pending_email_verification"
+            assert pending_state.email_verified_at is None
+
         blocked_login = await client.post("/auth/login", json={"email": email, "password": "ValidPass123"})
         assert blocked_login.status_code == 403
         assert blocked_login.json()["detail"] == "pending_email_verification"
