@@ -1,0 +1,973 @@
+{
+  "resources_discovered": 126,
+  "resources_classified": 126,
+  "resources_in_explicit_mutation_registry": 43,
+  "unclassified_resources": [],
+  "coverage": [
+    {
+      "resource": "account_deletion_requests",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "account_security",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "admin_notifications",
+      "classification": [
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "analytics_events",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "audit_logs",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "backup_records",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "banner_history",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "banners",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "blog_articles",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "brands",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "cache_snapshots",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "cash_transactions",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "categories",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "client_mutations",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "color_options",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "contact_messages",
+      "classification": [
+        "explicit_mutation_policy",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "coupon_usage",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "coupons",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "courier_assignments",
+      "classification": [
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "courier_location_updates",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "couriers",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "currencies",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "custom_elements",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "customer_addresses",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "data_access_logs",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "deployment_checks",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "email_outbox",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "employee_payments",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "file_assets",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "financial_reports",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "financial_vouchers",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "form_settings",
+      "classification": [
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "general_expenses",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "global_sites",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "international_order_payments",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "international_orders",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "international_purchases",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "inventory",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "inventory_locations",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "inventory_movements",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "kpi_metrics",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "local_merchants",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "local_shopping_requests",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "login_attempts",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "loyalty_settings",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "loyalty_tiers",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "marketer_commissions",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "marketer_payments",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "marketers",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "marketing_campaigns",
+      "classification": [
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "notification_delivery_attempts",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "notification_outbox",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "notification_preferences",
+      "classification": [
+        "explicit_mutation_policy",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "notifications",
+      "classification": [
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "operational_alerts",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "operational_days",
+      "classification": [
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "order_financials",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "order_fulfillments",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "order_items",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "order_payments",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "order_shipping",
+      "classification": [
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "order_status_history",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "orders",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "page_sections",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "page_versions",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_applications",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_contracts",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_coupons",
+      "classification": [
+        "explicit_mutation_policy",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_notification_preferences",
+      "classification": [
+        "explicit_mutation_policy",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_order_items",
+      "classification": [
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_order_requests",
+      "classification": [
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_payments",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_profiles",
+      "classification": [
+        "explicit_mutation_policy",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_settlements",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_storefronts",
+      "classification": [
+        "explicit_mutation_policy",
+        "partner_owned",
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "partner_wallets",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "partner_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "password_reset_token_state",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "password_reset_tokens",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "payment_receipts",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "payments",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "phone_otp_tokens",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "points_transactions",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "product_comparisons",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "product_likes",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "product_reviews",
+      "classification": [
+        "explicit_mutation_policy",
+        "public_read",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "product_variants",
+      "classification": [
+        "explicit_mutation_policy",
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "products",
+      "classification": [
+        "explicit_mutation_policy",
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "profiles",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "public_marketer_codes",
+      "classification": [
+        "explicit_mutation_policy",
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "purchase_items",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "push_tokens",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "refresh_token_security",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "refresh_tokens",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "refunds",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "report_exports",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "risk_alerts",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "sales_forecasts",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "security_events",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "shipping_carriers",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "shipping_history",
+      "classification": [
+        "typed_endpoint_only_for_partner"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "shipping_stages",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "shipping_zones",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "site_content",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "site_menus",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "site_settings",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "size_options",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "social_links",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "staff_permission_sets",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "static_pages",
+      "classification": [
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "store_reviews",
+      "classification": [
+        "explicit_mutation_policy",
+        "public_read",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "suppliers",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "support_tickets",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "sync_dead_letters",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "sync_events",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "theme_settings",
+      "classification": [
+        "generic_write_blocked",
+        "public_read"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "ticket_messages",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "user_cart",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "user_loyalty",
+      "classification": [
+        "explicit_mutation_policy",
+        "generic_write_blocked",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "user_roles",
+      "classification": [],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "users",
+      "classification": [],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "verification_tokens",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "vouchers",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "warehouses",
+      "classification": [
+        "staff_or_admin_generic_only"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "web_push_subscriptions",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "whatsapp_outbox",
+      "classification": [
+        "generic_select_blocked",
+        "generic_write_blocked"
+      ],
+      "has_runtime_decision": true
+    },
+    {
+      "resource": "wishlist",
+      "classification": [
+        "explicit_mutation_policy",
+        "user_owned"
+      ],
+      "has_runtime_decision": true
+    }
+  ]
+}

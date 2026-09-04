@@ -1,0 +1,29 @@
+{
+  "run_id": "permission_query_live_14b21710bbb14a94b5a7b18c013bc191",
+  "statuses": [
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200
+  ],
+  "wishlist_rows": 1,
+  "duplicate_failures": 0,
+  "ownership_failures": 0,
+  "lost_updates": 0
+}

@@ -1,13 +1,13 @@
 {
-  "checked_at": "2026-08-19T12:10:13.483373+00:00",
+  "checked_at": "2026-08-28T17:36:05.325426+00:00",
   "app_env": "test",
   "allow_test_fixtures": true,
-  "database_name": "luxury_test",
+  "database_name": "luxury_full_cross_platform_e2e_test",
   "host": "127.0.0.1",
-  "port": 55432,
+  "port": 55433,
   "database_name_contains_test": true,
   "database_is_recovery": false,
-  "safe_for_writes": false,
+  "safe_for_writes": true,
   "database_url_printed": false,
   "password_printed": false,
   "tokens_printed": false

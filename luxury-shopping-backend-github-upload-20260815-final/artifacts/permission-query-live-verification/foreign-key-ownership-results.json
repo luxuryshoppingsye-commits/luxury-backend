@@ -1,0 +1,42 @@
+{
+  "checked_at": "2026-08-28T17:36:14.294752+00:00",
+  "checks": [
+    {
+      "name": "profiles_missing_user",
+      "orphan_rows": 0
+    },
+    {
+      "name": "addresses_missing_user",
+      "orphan_rows": 0
+    },
+    {
+      "name": "wishlist_missing_user",
+      "orphan_rows": 0
+    },
+    {
+      "name": "wishlist_missing_product",
+      "orphan_rows": 0
+    },
+    {
+      "name": "cart_missing_user",
+      "orphan_rows": 0
+    },
+    {
+      "name": "cart_missing_product",
+      "orphan_rows": 0
+    },
+    {
+      "name": "variants_missing_product",
+      "orphan_rows": 0
+    },
+    {
+      "name": "orders_missing_user",
+      "orphan_rows": 0
+    },
+    {
+      "name": "order_items_missing_order",
+      "orphan_rows": 0
+    }
+  ],
+  "unexpected_orphan_rows": 0
+}

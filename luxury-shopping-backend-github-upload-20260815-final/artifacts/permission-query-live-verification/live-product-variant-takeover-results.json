@@ -1,0 +1,21 @@
+{
+  "run_id": "permission_query_live_14b21710bbb14a94b5a7b18c013bc191",
+  "results": [
+    {
+      "case": "partner_update_other_product",
+      "status": 404,
+      "expected": 404
+    },
+    {
+      "case": "partner_update_other_variant",
+      "status": 404,
+      "expected": 404
+    },
+    {
+      "case": "partner_create_variant_for_other_product",
+      "status": 403,
+      "expected": 403
+    }
+  ],
+  "failures": 0
+}

@@ -1,0 +1,24 @@
+{
+  "status": "ok",
+  "mode": "postgresql",
+  "database": "connected",
+  "database_connected": true,
+  "app_env": "test",
+  "database_name": "luxury_full_cross_platform_e2e_test",
+  "allow_test_fixtures": true,
+  "fixtures_enabled": true,
+  "storage_environment": "test:uploads",
+  "storage": {
+    "upload_dir_exists": true,
+    "upload_dir_name": "uploads",
+    "upload_dir_writable": true,
+    "product_upload_files": 453,
+    "seed_uploads_zip_exists": true,
+    "seed_uploads_zip_bytes": 70280989,
+    "seed_sample_exists": true
+  },
+  "users": 1057,
+  "products": 421,
+  "categories": 89,
+  "orders": 153
+}

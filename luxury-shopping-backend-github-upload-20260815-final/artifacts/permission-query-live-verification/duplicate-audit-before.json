@@ -1,0 +1,54 @@
+{
+  "checked_at": "2026-08-28T17:36:06.604472+00:00",
+  "checks": [
+    {
+      "name": "users_email",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "profiles_user_id",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "roles_user_role",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "addresses_default",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "wishlist_user_product",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "cart_user_product_variant",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "categories_slug",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "brands_slug",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "products_sku",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "variants_sku",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "orders_number",
+      "duplicate_groups": 0
+    },
+    {
+      "name": "notifications_dedupe",
+      "duplicate_groups": 0
+    }
+  ],
+  "unexpected_duplicate_rows": 0
+}

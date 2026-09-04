@@ -1,0 +1,39 @@
+{
+  "run_id": "permission_query_live_14b21710bbb14a94b5a7b18c013bc191",
+  "database": "luxury_full_cross_platform_e2e_test",
+  "port": 55433,
+  "address_b": {
+    "id": "9790799b-82bd-4d41-ab1b-a2d5b4426c19",
+    "user_id": "7c910b48-8c70-414c-a368-7642613d6c2f",
+    "label": "Target Address 2f23dec6cb",
+    "deleted_at": "None"
+  },
+  "product_b": {
+    "id": "e4f56dc1-9bca-49a2-bc5c-fbdd9f9c4853",
+    "partner_id": "fb16861c-f1f5-4f92-9d94-6e06557939ee",
+    "price": "130.00"
+  },
+  "variant_b": {
+    "id": "078e44ab-9996-4f8b-82a1-305275780f27",
+    "product_id": "e4f56dc1-9bca-49a2-bc5c-fbdd9f9c4853",
+    "price": "130.00"
+  },
+  "order_b": {
+    "id": "284cc6c7-7dbd-4730-90ee-a4ef976b590f",
+    "user_id": "7c910b48-8c70-414c-a368-7642613d6c2f",
+    "status": "pending",
+    "total": "130.00"
+  },
+  "table_counts": {
+    "users": 1057,
+    "profiles": 1055,
+    "user_roles": 1101,
+    "products": 421,
+    "product_variants": 76,
+    "orders": 153,
+    "wishlist": 10,
+    "user_cart": 71,
+    "customer_addresses": 27
+  },
+  "public_product_total": 37
+}

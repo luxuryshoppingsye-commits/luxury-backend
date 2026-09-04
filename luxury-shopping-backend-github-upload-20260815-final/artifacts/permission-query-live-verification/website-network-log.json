@@ -1,0 +1,265 @@
+{
+  "requests": [
+    {
+      "name": "health",
+      "method": "GET",
+      "url": "/health",
+      "status": 200,
+      "request_id": "6bf6cb16043b44d49d1e4f28edcd1b1c"
+    },
+    {
+      "name": "customer_a_select_customer_b_address",
+      "method": "POST",
+      "url": "/resources/customer_addresses/query",
+      "status": 200,
+      "request_id": "55cd8c5e136547198231ba78e9ff3645"
+    },
+    {
+      "name": "customer_a_update_customer_b_address",
+      "method": "POST",
+      "url": "/resources/customer_addresses/query",
+      "status": 404,
+      "request_id": "7bc6a0e246e04007853364de3ede5637"
+    },
+    {
+      "name": "customer_a_delete_customer_b_address",
+      "method": "POST",
+      "url": "/resources/customer_addresses/query",
+      "status": 404,
+      "request_id": "70a88506ad704a6bbd9919a8dc10d029"
+    },
+    {
+      "name": "customer_a_upsert_customer_b_address",
+      "method": "POST",
+      "url": "/resources/customer_addresses/query",
+      "status": 404,
+      "request_id": "7bc63e2fb7ac4c32bea167992d44cb3b"
+    },
+    {
+      "name": "customer_mutate_order_status",
+      "method": "POST",
+      "url": "/resources/orders/query",
+      "status": 403,
+      "request_id": "c17baf8a71e94a7f995927d20d89058a"
+    },
+    {
+      "name": "customer_delete_order",
+      "method": "POST",
+      "url": "/resources/orders/query",
+      "status": 403,
+      "request_id": "29a71d9c741945fda3b1854272d75de8"
+    },
+    {
+      "name": "customer_mutate_loyalty",
+      "method": "POST",
+      "url": "/resources/user_loyalty/query",
+      "status": 403,
+      "request_id": "fd2b4f1af8274a579400df3300bbde8d"
+    },
+    {
+      "name": "customer_insert_points",
+      "method": "POST",
+      "url": "/resources/points_transactions/query",
+      "status": 403,
+      "request_id": "12e9987b0f4e4b398f0c405c85492fc2"
+    },
+    {
+      "name": "partner_update_other_product",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 404,
+      "request_id": "d2732e201708486db8bd6209de5eab33"
+    },
+    {
+      "name": "partner_update_other_variant",
+      "method": "POST",
+      "url": "/resources/product_variants/query",
+      "status": 404,
+      "request_id": "4331b4672e294d62bc2d1b0a1b5e9d0f"
+    },
+    {
+      "name": "partner_create_variant_for_other_product",
+      "method": "POST",
+      "url": "/resources/product_variants/query",
+      "status": 403,
+      "request_id": "95d71f16b6d243d48a61246dbf9ebd3f"
+    },
+    {
+      "name": "partner_update_other_wallet",
+      "method": "POST",
+      "url": "/resources/partner_wallets/query",
+      "status": 403,
+      "request_id": "63479e6a95bf4ad29fd7095c023016cb"
+    },
+    {
+      "name": "courier_a_select_unassigned_order",
+      "method": "POST",
+      "url": "/resources/orders/query",
+      "status": 200,
+      "request_id": "932a7a9880c849e4ae26fa35d4b1a668"
+    },
+    {
+      "name": "courier_b_select_assigned_order",
+      "method": "POST",
+      "url": "/resources/orders/query",
+      "status": 200,
+      "request_id": "8859f621f1ba4f649715ac54786b329f"
+    },
+    {
+      "name": "courier_a_mutate_assignment_b",
+      "method": "POST",
+      "url": "/resources/courier_assignments/query",
+      "status": 403,
+      "request_id": "cfc8fc08305b4f118ed07c55aec5cb8c"
+    },
+    {
+      "name": "marketer_a_select_marketer_b_commission",
+      "method": "POST",
+      "url": "/resources/marketer_commissions/query",
+      "status": 200,
+      "request_id": "8ae754848e9544ad9f14889cbd591d06"
+    },
+    {
+      "name": "marketer_create_commission",
+      "method": "POST",
+      "url": "/resources/marketer_commissions/query",
+      "status": 403,
+      "request_id": "0afb41d67e71426999afbc46a213dc1d"
+    },
+    {
+      "name": "wishlist_valid_on_conflict",
+      "method": "POST",
+      "url": "/resources/wishlist/query",
+      "status": 200,
+      "request_id": "af931ab5a27a40e5a8c94d9f5e072468"
+    },
+    {
+      "name": "wishlist_invalid_on_conflict",
+      "method": "POST",
+      "url": "/resources/wishlist/query",
+      "status": 403,
+      "request_id": "6d2be33207e648c7a0df2a10d4e35acf"
+    },
+    {
+      "name": "products_or_filter",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 200,
+      "request_id": "35c4a4e11a004321b9f12aac616c1473"
+    },
+    {
+      "name": "products_not_in_filter",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 200,
+      "request_id": "8faeec13d6974d1fa48153ccbf518332"
+    },
+    {
+      "name": "products_not_is_filter",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 200,
+      "request_id": "950c4aed86e84a3fafea44da88a44a40"
+    },
+    {
+      "name": "products_select_projection",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 200,
+      "request_id": "4c443478c2d244728bda7b5980680b45"
+    },
+    {
+      "name": "product_reviews_deleted_at_projection_denied",
+      "method": "POST",
+      "url": "/resources/product_reviews/query",
+      "status": 403,
+      "request_id": "3974b292b1e340cabb417ff5b31a2efb"
+    },
+    {
+      "name": "admin_count_users_over_500",
+      "method": "POST",
+      "url": "/resources/users/query",
+      "status": 200,
+      "request_id": "a0f8debedd8149c48923d147e35757b0"
+    },
+    {
+      "name": "single_one_user",
+      "method": "POST",
+      "url": "/resources/users/query",
+      "status": 200,
+      "request_id": "96cfee7fbdfb4acf9e839baae52aa1ac"
+    },
+    {
+      "name": "single_no_user",
+      "method": "POST",
+      "url": "/resources/users/query",
+      "status": 404,
+      "request_id": "a1afe11fba764495b94b7e94db8a3dff"
+    },
+    {
+      "name": "single_many_users",
+      "method": "POST",
+      "url": "/resources/users/query",
+      "status": 409,
+      "request_id": "09051d9107d547d8b35774c2fd60643d"
+    },
+    {
+      "name": "maybe_single_no_user",
+      "method": "POST",
+      "url": "/resources/users/query",
+      "status": 200,
+      "request_id": "3a4a99fe637d432d854fe5472a17c400"
+    },
+    {
+      "name": "maybe_single_many_users",
+      "method": "POST",
+      "url": "/resources/users/query",
+      "status": 409,
+      "request_id": "6c6b5246a3dd4b6595607875a6e7e546"
+    },
+    {
+      "name": "customer_review_approval_forced_pending",
+      "method": "POST",
+      "url": "/resources/product_reviews/query",
+      "status": 200,
+      "request_id": "cc3db29a018043138204addd1166b299"
+    },
+    {
+      "name": "unknown_resource",
+      "method": "POST",
+      "url": "/resources/not_a_resource/query",
+      "status": 404,
+      "request_id": "761b371b6e2b4501a379af458af49463"
+    },
+    {
+      "name": "invalid_operator",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 400,
+      "request_id": "306dc9799f0e4f53a37b6e94e67ce59e"
+    },
+    {
+      "name": "invalid_is",
+      "method": "POST",
+      "url": "/resources/products/query",
+      "status": 422,
+      "request_id": "ba503f0454634163b45965ce0511f650"
+    },
+    {
+      "name": "anonymous_mutation",
+      "method": "POST",
+      "url": "/resources/customer_addresses/query",
+      "status": 401,
+      "request_id": "b1c4da654fbd4ca2a5a7314eeca549b9"
+    },
+    {
+      "name": "invalid_token",
+      "method": "POST",
+      "url": "/resources/customer_addresses/query",
+      "status": 401,
+      "request_id": "69aeaad3600f4afe9da0b899058b239c"
+    }
+  ],
+  "tokens_printed": false,
+  "authorization_headers_printed": false
+}

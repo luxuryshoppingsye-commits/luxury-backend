@@ -1,0 +1,27 @@
+{
+  "run_id": "permission_query_live_14b21710bbb14a94b5a7b18c013bc191",
+  "ids": {
+    "customer_a": "649f3d42-bc19-4ed0-8efa-551af7e30a21",
+    "customer_b": "7c910b48-8c70-414c-a368-7642613d6c2f",
+    "admin": "59b435ec-b64e-4397-9307-6e1260deeeec",
+    "partner_a": "03b1a49f-4a1a-4690-9207-87c3bddca3c8",
+    "partner_b": "fb16861c-f1f5-4f92-9d94-6e06557939ee",
+    "courier_a": "bef328d3-c920-4cc9-abf5-cb9bd0b2ed78",
+    "courier_b": "4650dca3-b5b7-4345-a6c4-be12c3022b6a",
+    "marketer_a": "0367e563-414f-45f1-9922-9ee789f20a86",
+    "marketer_b": "995fa919-f6f4-4262-97be-cb8ea1837d0e",
+    "category": "d439bc37-bcb7-4362-8a3a-79019a6fef3f",
+    "brand": "28e000e7-fcde-4f13-8ced-b324ceec8426",
+    "product_a": "f482ffeb-abfb-4cd6-941f-929bf0215335",
+    "product_b": "e4f56dc1-9bca-49a2-bc5c-fbdd9f9c4853",
+    "variant_a": "0b68f77e-a1be-40a3-b34b-f5e379342c49",
+    "variant_b": "078e44ab-9996-4f8b-82a1-305275780f27",
+    "order_b": "284cc6c7-7dbd-4730-90ee-a4ef976b590f",
+    "address_b": "9790799b-82bd-4d41-ab1b-a2d5b4426c19",
+    "wallet_b": "1ec09014-359c-4d3f-a1a0-5bce360a4297",
+    "commission_b": "51f3c6a0-dab2-4607-b6f3-a690d05a7b91",
+    "assignment_b": "42eb32ad-cece-4321-9f18-ed985aba8d78"
+  },
+  "tokens_printed": false,
+  "passwords_printed": false
+}

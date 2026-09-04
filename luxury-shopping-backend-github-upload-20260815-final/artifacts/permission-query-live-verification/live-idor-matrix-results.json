@@ -1,0 +1,46 @@
+{
+  "run_id": "permission_query_live_14b21710bbb14a94b5a7b18c013bc191",
+  "results": [
+    {
+      "case": "customer_select_other_address",
+      "status": 200,
+      "leaked_rows": 0
+    },
+    {
+      "case": "customer_update_other_address",
+      "status": 404,
+      "expected": 404
+    },
+    {
+      "case": "customer_delete_other_address",
+      "status": 404,
+      "expected": 404
+    },
+    {
+      "case": "customer_upsert_other_address",
+      "status": 404,
+      "expected": 404
+    },
+    {
+      "case": "customer_mutate_order_status",
+      "status": 403,
+      "expected": 403
+    },
+    {
+      "case": "customer_delete_order",
+      "status": 403,
+      "expected": 403
+    },
+    {
+      "case": "customer_mutate_loyalty",
+      "status": 403,
+      "expected": 403
+    },
+    {
+      "case": "customer_insert_points",
+      "status": 403,
+      "expected": 403
+    }
+  ],
+  "failures": 0
+}
