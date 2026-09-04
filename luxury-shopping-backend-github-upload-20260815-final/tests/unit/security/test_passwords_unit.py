@@ -21,6 +21,16 @@ def test_hash_password_uses_salted_argon2_and_never_returns_plaintext() -> None:
     assert verify_password("WrongPass123", first) == (False, False)
 
 
+def test_hash_password_round_trip_preserves_unicode_password_value() -> None:
+    password = "كلمةمرور١٢٣"
+
+    encoded = hash_password(password)
+
+    assert encoded.startswith("$argon2id$")
+    assert verify_password(password, encoded) == (True, False)
+    assert verify_password("كلمةمرور123", encoded) == (False, False)
+
+
 def test_verify_password_handles_invalid_hash_without_leaking_exception() -> None:
     assert verify_password("ValidPass123", "not-a-valid-hash") == (False, False)
     assert verify_password("ValidPass123", "$argon2id$broken") == (False, False)
