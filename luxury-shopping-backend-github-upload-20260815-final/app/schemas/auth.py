@@ -24,6 +24,7 @@ class LoginRequest(BaseModel):
     # Existing accounts may have legacy passwords shorter than the new policy.
     # Strength is enforced for registration and password changes, not login.
     password: str = Field(min_length=1, max_length=256)
+    remember_me: bool = False
 
 
 class RegisterRequest(BaseModel):
@@ -138,10 +139,35 @@ class PasswordResetRequest(BaseModel):
         return data
 
 
+class PasswordResetVerifyRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_camel_case(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            if "verificationCode" in data and "code" not in data:
+                data["code"] = data.pop("verificationCode")
+        return data
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("invalid_password_reset_code")
+        return value
+
+
 class PasswordResetConfirm(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    token: str = Field(min_length=32, max_length=512)
+    token: str | None = Field(default=None, min_length=32, max_length=512)
+    email: EmailStr | None = None
+    code: str | None = Field(default=None, min_length=6, max_length=6)
     new_password: str = Field(min_length=8, max_length=256)
 
     @model_validator(mode="before")
@@ -154,6 +180,21 @@ class PasswordResetConfirm(BaseModel):
             data = dict(data)
             data["new_password"] = data.pop("newPassword")
         return data
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, value: str | None) -> str | None:
+        if value is not None and not value.isdigit():
+            raise ValueError("invalid_password_reset_code")
+        return value
+
+    @model_validator(mode="after")
+    def require_token_or_otp(self) -> "PasswordResetConfirm":
+        has_token = self.token is not None
+        has_otp = self.email is not None and self.code is not None
+        if has_token == has_otp:
+            raise ValueError("password_reset_token_or_otp_exclusive")
+        return self
 
 
 class ProfileUpdateRequest(BaseModel):
