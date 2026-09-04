@@ -1817,6 +1817,7 @@ async def password_reset_verify(
     }
 
 
+@router.post("/auth/reset-password")
 @router.post("/auth/password-reset-confirm")
 async def password_reset_confirm(
     body: PasswordResetConfirm,

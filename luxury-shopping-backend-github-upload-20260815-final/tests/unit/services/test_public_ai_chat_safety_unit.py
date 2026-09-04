@@ -8,6 +8,7 @@ from backend.app.services.function_service import (
     _extract_gemini_answer,
     _gemini_answer,
     _gemini_model_candidates,
+    _chat_direct_guidance,
     _chat_site_context,
     _answer_matches_chat_intent,
     _customer_safe_site_context_v2,
@@ -119,6 +120,51 @@ async def test_public_ai_general_question_does_not_query_catalog():
 
     assert "سؤال عام" in context
     assert has_products is False
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("كيف أضيف منتج للسلة؟", "إضافة للسلة"),
+        ("كيف أجرب المنتج بالواقع المعزز؟", "الواقع المعزز"),
+        ("كيف أتابع طلباتي؟", "طلباتي"),
+    ],
+)
+def test_public_ai_direct_guidance_answers_the_requested_app_action(message, expected):
+    answer = _chat_direct_guidance(message, "ar")
+
+    assert answer is not None
+    assert expected in answer
+    assert "خيارات مناسبة" not in answer
+
+
+@pytest.mark.asyncio
+async def test_public_ai_app_guidance_does_not_query_catalog():
+    class NoQuerySession:
+        async def execute(self, _statement):
+            raise AssertionError("App guidance must not query or recommend catalog products")
+
+    context, has_products = await _chat_site_context(
+        NoQuerySession(),
+        "كيف أجرب المنتج بالواقع المعزز؟",
+        language="ar",
+        user=None,
+    )
+
+    assert "الواقع المعزز" in context
+    assert "خيارات مناسبة" not in context
+    assert has_products is False
+
+
+def test_public_ai_chat_rejects_unrelated_product_answer_for_app_action():
+    assert not _answer_matches_chat_intent(
+        "كيف أجرب المنتج بالواقع المعزز؟",
+        "خيارات مناسبة: حقيبة أنيقة — 1850 ر.ي.",
+    )
+    assert _answer_matches_chat_intent(
+        "كيف أجرب المنتج بالواقع المعزز؟",
+        "افتح تفاصيل المنتج واضغط تجربة الواقع المعزز ثم وجّه الكاميرا.",
+    )
 
 
 def test_public_ai_chat_keeps_safe_price_bullets_without_coupon_codes():

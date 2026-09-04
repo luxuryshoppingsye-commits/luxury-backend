@@ -79,6 +79,159 @@ def _has_any_whole_chat_term(value: str, terms: list[str]) -> bool:
     )
 
 
+def _chat_direct_guidance(message: str, language: str) -> str | None:
+    """Return precise app guidance before catalog retrieval or model generation."""
+    english = language == "en"
+    add_to_cart = (
+        _has_any_chat_term(
+            message,
+            [
+                "اضيف للسلة",
+                "أضيف للسلة",
+                "اضف للسلة",
+                "أضف للسلة",
+                "add to cart",
+                "اضافة للسلة",
+            ],
+        )
+        or (
+            _has_any_chat_term(message, ["اضيف", "اضف", "أضيف", "أضف", "add"])
+            and _has_any_chat_term(message, ["سلة", "السلة", "عربة", "عربه", "cart"])
+        )
+    )
+    remove_from_cart = (
+        _has_any_chat_term(
+            message,
+            [
+                "احذف من السلة",
+                "أحذف من السلة",
+                "ازيل من السلة",
+                "أزيل من السلة",
+                "شيل من السلة",
+                "remove from cart",
+                "delete from cart",
+            ],
+        )
+        or (
+            _has_any_chat_term(message, ["احذف", "أحذف", "ازيل", "أزيل", "شيل", "remove", "delete"])
+            and _has_any_chat_term(message, ["سلة", "السلة", "عربة", "عربه", "cart"])
+        )
+    )
+    add_to_wishlist = (
+        _has_any_chat_term(
+            message,
+            [
+                "اضيف للمفضلة",
+                "أضيف للمفضلة",
+                "اضف للمفضلة",
+                "أضف للمفضلة",
+                "add to wishlist",
+                "add to favorites",
+            ],
+        )
+        or (
+            _has_any_chat_term(message, ["اضيف", "اضف", "أضيف", "أضف", "add"])
+            and _has_any_chat_term(message, ["مفضلة", "المفضلة", "امنيات", "أمنيات", "wishlist", "favorites"])
+        )
+    )
+    remove_from_wishlist = (
+        _has_any_chat_term(
+            message,
+            [
+                "احذف من المفضلة",
+                "أحذف من المفضلة",
+                "ازيل من المفضلة",
+                "أزيل من المفضلة",
+                "remove from wishlist",
+                "remove from favorites",
+            ],
+        )
+        or (
+            _has_any_chat_term(message, ["احذف", "أحذف", "ازيل", "أزيل", "شيل", "remove", "delete"])
+            and _has_any_chat_term(message, ["مفضلة", "المفضلة", "امنيات", "أمنيات", "wishlist", "favorites"])
+        )
+    )
+
+    if add_to_cart:
+        return (
+            "Open the product, choose an available color or size, set the quantity, then tap Add to cart."
+            if english
+            else "افتح المنتج، اختر اللون أو المقاس المتاح، حدد الكمية، ثم اضغط إضافة للسلة."
+        )
+    if remove_from_cart:
+        return (
+            "Open the Cart tab, find the item, then use its remove or delete control."
+            if english
+            else "افتح تبويب السلة، ابحث عن المنتج، ثم استخدم زر الحذف أو الإزالة."
+        )
+    if add_to_wishlist:
+        return (
+            "Tap the heart on the product card to save it to your Wishlist."
+            if english
+            else "اضغط أيقونة القلب في بطاقة المنتج لإضافته إلى المفضلة."
+        )
+    if remove_from_wishlist:
+        return (
+            "Open Wishlist and tap the filled heart on the product to remove it."
+            if english
+            else "افتح المفضلة واضغط القلب المعبأ على المنتج لإزالته."
+        )
+
+    normalized = _normalize_chat_text(message)
+    if _has_any_chat_term(
+        message,
+        ["واقع معزز", "الواقع المعزز", "تجربة المنتج", "try-on", "try on", "augmented reality"],
+    ) or bool(re.search(r"\bar\b", normalized)):
+        return (
+            "Open product details and tap AR try-on when available. Point the camera at the body, hand, or foot, then move and resize the item."
+            if english
+            else "افتح تفاصيل المنتج ثم اضغط تجربة الواقع المعزز إذا كانت متاحة. وجّه الكاميرا للجسم أو اليد أو القدم حسب نوع المنتج، وبعدها حرّك المنتج وعدّل حجمه."
+        )
+    if _has_any_chat_term(message, ["تتبع الطلب", "طلباتي", "رقم الطلب", "tracking", "my orders"]):
+        return (
+            "Sign in, open My Orders, choose the order, and check its status and tracking updates."
+            if english
+            else "سجّل دخولك، افتح طلباتي، اختر الطلب، ثم راجع حالته وتحديثات التتبع."
+        )
+    if _has_any_chat_term(message, ["شراء", "اشتري", "أشتري", "اكمل الطلب", "إتمام الطلب", "checkout", "buy now"]):
+        return (
+            "Open the product, choose its options, add it to cart, then sign in and complete checkout with your address and payment method."
+            if english
+            else "افتح المنتج، اختر خياراته، أضفه للسلة، ثم سجّل دخولك وأكمل الطلب بالعنوان وطريقة الدفع."
+        )
+    if _has_any_chat_term(message, ["طرق الدفع", "طريقة الدفع", "دفع", "تحويل", "payment", "receipt"]):
+        return (
+            "Payment methods appear during checkout. If you choose a transfer, upload the receipt from the order page."
+            if english
+            else "طرق الدفع تظهر أثناء إتمام الطلب. إذا اخترت التحويل، ارفع الإيصال من صفحة الطلب."
+        )
+    if _has_any_chat_term(message, ["الشحن", "شحن", "التوصيل", "توصيل", "shipping", "delivery"]):
+        return (
+            "Shipping cost and delivery time appear during checkout based on the address and delivery method."
+            if english
+            else "تكلفة الشحن ووقت الوصول يظهران أثناء إتمام الطلب حسب العنوان وطريقة التوصيل."
+        )
+    if _has_any_chat_term(message, ["ارجاع", "إرجاع", "استبدال", "refund", "return", "exchange"]):
+        return (
+            "Open the order from My Orders and contact support to request a return or exchange. Keep the order number and product details ready."
+            if english
+            else "افتح الطلب من طلباتي وتواصل مع الدعم لطلب الإرجاع أو الاستبدال. جهّز رقم الطلب وتفاصيل المنتج."
+        )
+    if _has_any_chat_term(message, ["مقارنة", "قارن", "مقارنه", "compare"]):
+        return (
+            "Open the product card, tap Compare, select the other products, then open the comparison page to review the details."
+            if english
+            else "افتح بطاقة المنتج واضغط مقارنة، اختر المنتجات الأخرى، ثم افتح صفحة المقارنة لمراجعة التفاصيل."
+        )
+    if _has_any_chat_term(message, ["مشاركة", "شارك", "مشاركه", "share"]):
+        return (
+            "Open the product card and tap Share to send its product link."
+            if english
+            else "افتح بطاقة المنتج واضغط مشاركة لإرسال رابط المنتج."
+        )
+    return None
+
+
 def _fallback_chat_answer(message: str, language: str = "ar", context: str = "") -> str:
     english = language == "en"
     if _has_any_chat_term(
@@ -93,6 +246,9 @@ def _fallback_chat_answer(message: str, language: str = "ar", context: str = "")
             if english
             else "ما أقدر أشارك أسرارًا أو معرفات خاصة أو روابط قواعد بيانات أو إحصاءات داخلية. أقدر أساعدك بأمان في المنتجات والعروض والطلبات والدعم."
         )
+    direct_guidance = _chat_direct_guidance(message, language)
+    if direct_guidance:
+        return direct_guidance
     safe_context = _sanitize_public_chat_response(context, language) if context.strip() else ""
     if (
         safe_context
@@ -124,6 +280,69 @@ def _fallback_chat_answer(message: str, language: str = "ar", context: str = "")
             "Open the Offers page to see discounted products. If you have a coupon, enter it during checkout."
             if english
             else "نعم، توجد عروض مختارة. افتح صفحة العروض للخصومات الحالية، أو اكتب القسم أو الميزانية وبأرشح لك خيارات مخفضة مناسبة."
+        )
+    if _has_any_chat_term(
+        message,
+        [
+            "اضيف للسلة", "أضيف للسلة", "اضف للسلة", "أضف للسلة",
+            "add to cart", "اضافة للسلة",
+        ],
+    ):
+        return (
+            "Open the product, choose an available color or size, set the quantity, then tap Add to cart."
+            if english
+            else "افتح المنتج، اختر اللون أو المقاس المتاح، حدد الكمية، ثم اضغط إضافة للسلة."
+        )
+    if _has_any_chat_term(
+        message,
+        [
+            "احذف من السلة", "أحذف من السلة", "ازيل من السلة", "أزيل من السلة",
+            "شيل من السلة", "remove from cart", "delete from cart",
+        ],
+    ):
+        return (
+            "Open the Cart tab, find the item, and use its remove or delete control."
+            if english
+            else "افتح تبويب السلة، ابحث عن المنتج، ثم استخدم زر الحذف أو الإزالة."
+        )
+    if _has_any_chat_term(
+        message,
+        [
+            "اضيف للمفضلة", "أضيف للمفضلة", "اضف للمفضلة", "أضف للمفضلة",
+            "add to wishlist", "add to favorites",
+        ],
+    ):
+        return (
+            "Tap the heart on the product card to save it to your Wishlist."
+            if english
+            else "اضغط أيقونة القلب في بطاقة المنتج لإضافته إلى المفضلة."
+        )
+    if _has_any_chat_term(
+        message,
+        [
+            "احذف من المفضلة", "أحذف من المفضلة", "ازيل من المفضلة", "أزيل من المفضلة",
+            "remove from wishlist", "remove from favorites",
+        ],
+    ):
+        return (
+            "Open Wishlist and tap the filled heart on the product to remove it."
+            if english
+            else "افتح المفضلة واضغط القلب المعبأ على المنتج لإزالته."
+        )
+    if _has_any_chat_term(
+        message,
+        [
+            "مميز", "مميزه", "الافضل", "الأفضل", "الاكثر طلبا",
+            "featured", "best product", "best products",
+        ],
+    ):
+        safe_context = _sanitize_public_chat_response(context, language) if context.strip() else ""
+        if safe_context and _answer_matches_chat_intent(message, safe_context):
+            return safe_context
+        return (
+            "Open Featured Products on the home page to browse the store's highlighted picks."
+            if english
+            else "افتح قسم المنتجات المميزة في الرئيسية لمشاهدة اختيارات المتجر المميزة."
         )
     if _has_any_chat_term(message, ["منتج", "بحث", "شنطه", "حقيبه", "فستان", "ساعه", "حذاء", "product", "search", "bag", "dress", "watch", "shoe"]):
         return (
@@ -500,6 +719,8 @@ Personality:
 - Never invent order, payment, or stock facts that are not in the provided context.
 - If the question needs live external information outside the provided context, say that you do not have a verified live source for that detail and explain the safe next step.
 - If products, offers, categories, stores, or orders are present in the context, use only customer-safe names and guidance.
+- If the context contains "Verified app guidance", follow that procedure exactly. Do not replace an app-how-to answer with product recommendations or an unrelated list.
+- Only mention products when the customer asks for a product, offer, gift, price, category, or recommendation. Never add product names just to fill an answer.
 - Never reveal internal catalog counts, database wording, coupon codes, raw IDs, hashes, staff/admin statuses, or technical record metadata.
 - Product names and customer-visible prices in the context are public enough to recommend, but keep the answer to 2-4 concise lines.
 - For offers or gift recommendations, name up to three options with customer-visible prices and one short reason or next step.
@@ -526,6 +747,8 @@ Context:
 - استخدمي اسم العميل عند توفره بدون مبالغة: {customer_name}.
 - لا تخترعي حالة طلب أو دفع أو مخزون غير موجودة في السياق.
  - إذا وجدت منتجات أو عروض أو تصنيفات أو متاجر في السياق، استخدمي أسماء آمنة للعميل فقط وباختصار.
+ - إذا احتوى السياق على عبارة «إجابة إجرائية مؤكدة للتطبيق»، اتبعي الخطوات كما هي ولا تستبدليها بترشيحات منتجات أو قائمة لا علاقة لها بالسؤال.
+ - لا تذكري أسماء منتجات إلا إذا سأل العميل عن منتج أو عرض أو هدية أو سعر أو تصنيف أو ترشيح. لا تضيفي منتجات لمجرد ملء الرد.
  - لا تذكري أرقام العد، أو عبارة قاعدة الموقع، أو أكواد الخصم، أو المعرفات، أو الحالات الداخلية، أو تفاصيل تشغيلية.
  - أسماء المنتجات والأسعار الظاهرة للعميل مسموح استخدامها للترشيح، لكن اجعلي الرد من 2 إلى 4 أسطر مختصرة.
  - عند سؤال العروض أو الهدايا، اذكري حتى ثلاثة خيارات مع السعر الظاهر وسبب قصير أو خطوة تالية.
@@ -824,6 +1047,47 @@ def _looks_like_unusable_ai_answer(value: str, language: str) -> bool:
 
 
 def _answer_matches_chat_intent(message: str, answer: str) -> bool:
+    direct_guidance = _chat_direct_guidance(message, "ar") or _chat_direct_guidance(message, "en")
+    if direct_guidance:
+        normalized_message = _normalize_chat_text(message)
+        if _has_any_chat_term(
+            message,
+            ["سلة", "السلة", "عربة", "عربه", "cart"],
+        ) and _has_any_chat_term(
+            answer,
+            ["سلة", "السلة", "عربة", "عربه", "cart", "add", "اضافة", "إضافة", "حذف", "إزالة", "remove", "delete"],
+        ):
+            return True
+        if _has_any_chat_term(
+            message,
+            ["مفضلة", "المفضلة", "امنيات", "أمنيات", "wishlist", "favorites"],
+        ) and _has_any_chat_term(
+            answer,
+            ["مفضلة", "المفضلة", "امنيات", "أمنيات", "wishlist", "favorites", "قلب", "heart", "remove", "إزالة"],
+        ):
+            return True
+        if _has_any_chat_term(
+            message,
+            ["واقع معزز", "الواقع المعزز", "تجربة المنتج", "try-on", "try on", "augmented reality"],
+        ) or bool(re.search(r"\bar\b", normalized_message)):
+            return _has_any_chat_term(
+                answer,
+                ["واقع معزز", "الواقع المعزز", "تجربة", "الكاميرا", "ar", "try-on", "try on", "camera"],
+            )
+        if _has_any_chat_term(message, ["تتبع", "طلباتي", "رقم الطلب", "tracking", "my orders"]):
+            return _has_any_chat_term(answer, ["تتبع", "طلباتي", "حالة", "tracking", "my orders", "order"])
+        if _has_any_chat_term(message, ["شراء", "اشتري", "أشتري", "اكمل الطلب", "إتمام الطلب", "checkout", "buy"]):
+            return _has_any_chat_term(answer, ["شراء", "السلة", "الطلب", "تسجيل دخول", "checkout", "cart", "sign in"])
+        if _has_any_chat_term(message, ["مقارنة", "قارن", "مقارنه", "compare"]):
+            return _has_any_chat_term(answer, ["مقارنة", "قارن", "compare"])
+        if _has_any_chat_term(message, ["مشاركة", "شارك", "مشاركه", "share"]):
+            return _has_any_chat_term(answer, ["مشاركة", "شارك", "رابط", "share", "link"])
+        if _has_any_chat_term(message, ["دفع", "تحويل", "payment", "receipt"]):
+            return _has_any_chat_term(answer, ["دفع", "تحويل", "إيصال", "payment", "receipt", "checkout"])
+        if _has_any_chat_term(message, ["شحن", "توصيل", "shipping", "delivery"]):
+            return _has_any_chat_term(answer, ["شحن", "توصيل", "shipping", "delivery", "checkout"])
+        if _has_any_chat_term(message, ["ارجاع", "إرجاع", "استبدال", "return", "refund", "exchange"]):
+            return _has_any_chat_term(answer, ["ارجاع", "إرجاع", "استبدال", "return", "refund", "exchange", "دعم", "support"])
     category_terms = ["تصنيف", "تصنيفات", "قسم", "اقسام", "category", "categories"]
     if _has_any_whole_chat_term(message, category_terms):
         return _has_any_chat_term(answer, category_terms)
@@ -1004,6 +1268,7 @@ def _customer_safe_site_context_v2(
     wants_payment: bool,
     wants_site_info: bool,
     wants_gift: bool,
+    wants_featured: bool,
     budget: Decimal | None,
     terms: list[str],
 ) -> tuple[str, bool]:
@@ -1063,6 +1328,19 @@ def _customer_safe_site_context_v2(
                 "Open Offers for the current discounted items, or tell me a category or budget."
                 if english
                 else "توجد عروض مختارة تتغير حسب التوفر. افتح صفحة العروض، أو اكتب القسم أو الميزانية وبأرشح لك خيارًا مناسبًا."
+            )
+    elif wants_featured:
+        if product_summaries:
+            lines.append(
+                f"Featured products: {product_summaries}. Open Products to see images, options, and final availability."
+                if english
+                else f"المنتجات المميزة الآن: {product_summaries}. افتح المنتجات لمشاهدة الصور والخيارات والتوفر النهائي."
+            )
+        else:
+            lines.append(
+                "Open Featured Products to see the store's highlighted picks."
+                if english
+                else "افتح قسم المنتجات المميزة لمشاهدة اختيارات المتجر المميزة."
             )
     elif wants_gift or budget is not None:
         budget_text = _money_text(budget, language) if budget is not None else ""
@@ -1225,6 +1503,10 @@ async def _chat_site_context(
         ],
     )
     wants_gift = _has_any_chat_term(message, ["هدية", "هديه", "اقتراح", "انصح", "افضل", "أفضل", "gift", "present", "recommend", "best"])
+    wants_featured = _has_any_chat_term(
+        message,
+        ["مميز", "مميزه", "الافضل", "الأفضل", "الاكثر طلبا", "featured", "best product", "best products"],
+    )
     budget = _extract_chat_budget(message)
     wants_internal_data = _has_any_chat_term(
         message,
@@ -1251,6 +1533,7 @@ async def _chat_site_context(
             wants_payment,
             wants_site_info,
             wants_gift,
+            wants_featured,
             budget is not None,
             _has_any_chat_term(
                 message,
@@ -1270,6 +1553,14 @@ async def _chat_site_context(
             else "Do not share secrets, database links, keys, identifiers, or internal statistics. Refuse politely and offer safe public help.",
             False,
         )
+    direct_guidance = _chat_direct_guidance(message, language)
+    if direct_guidance:
+        return (
+            f"إجابة إجرائية مؤكدة للتطبيق: {direct_guidance}"
+            if language != "en"
+            else f"Verified app guidance: {direct_guidance}",
+            False,
+        )
     if not catalog_intent:
         return (
             "هذا سؤال عام لا يحتاج بيانات المتجر. أجب عنه مباشرة من معرفتك العامة وبنفس لغة العميل، من دون تحويله إلى إعلان أو قائمة منتجات."
@@ -1277,7 +1568,7 @@ async def _chat_site_context(
             else "This is a general question that does not need store data. Answer it directly from general knowledge in the customer's language without turning it into a product promotion.",
             False,
         )
-    if wants_gift or budget is not None:
+    if wants_gift or wants_featured or budget is not None:
         terms = []
 
     public_product_filters = [Product.is_active.is_(True), *public_product_clauses(Product)]
@@ -1382,22 +1673,15 @@ async def _chat_site_context(
         wants_payment=wants_payment,
         wants_site_info=wants_site_info,
         wants_gift=wants_gift,
+        wants_featured=wants_featured,
         budget=budget,
         terms=terms,
     )
 
 
 async def _chat_customer_name(session: AsyncSession, user: User | None) -> str:
-    if user is None:
-        return "عزيزي العميل"
-    profile = (
-        await session.execute(select(Profile).where(Profile.user_id == user.id).limit(1))
-    ).scalar_one_or_none()
-    if profile:
-        for value in (getattr(profile, "full_name", None), getattr(profile, "first_name", None)):
-            if value and str(value).strip():
-                return str(value).strip()
-    return user.email or "عزيزي العميل"
+    # The public assistant must never read or forward customer identity data.
+    return "عزيزي العميل"
 
 
 async def execute_public_ai_chat(
@@ -1414,11 +1698,14 @@ async def execute_public_ai_chat(
         session,
         message,
         language=language,
-        user=user,
+        user=None,
     )
-    customer_name = await _chat_customer_name(session, user)
-    history = body.get("conversationHistory") or body.get("conversation_history")
-    conversation_history = history if isinstance(history, list) else None
+    customer_name = "عزيزي العميل"
+    # Keep the provider request independent from customer-entered history.
+    # Noura may use the current question and public catalog context only;
+    # private messages, order identifiers, and contact details never enter
+    # the model context.
+    conversation_history = None
     action = _text(body, "action")
     context = "\n".join(
         part
@@ -1938,19 +2225,72 @@ async def execute_function(
             request=request,
         )
         question = _text(body, "question", "message")
-        product_name = _text(body, "productName", "product_name", "name")
+        product_payload = body.get("product")
+        product_payload = product_payload if isinstance(product_payload, dict) else {}
+
+        def product_text(*names: str) -> str:
+            return _text(product_payload, *names)
+
+        product_name = _text(
+            body,
+            "productName",
+            "product_name",
+            "name",
+            default=product_text("name", "display_name", "displayName"),
+        )
         price = body.get("price")
+        if price is None:
+            price = product_payload.get("price") or product_payload.get("priceLabel")
         stock = body.get("stock") or body.get("stock_quantity")
+        if stock is None:
+            stock = product_payload.get("stockQuantity") or product_payload.get("stock_quantity")
         details = []
         if product_name:
             details.append(f"المنتج: {product_name}")
+        name_en = product_text("nameEn", "name_en")
+        if name_en and name_en != product_name:
+            details.append(f"الاسم بالإنجليزية: {name_en}")
         if price is not None:
             details.append(f"السعر: {price}")
+        original_price = product_payload.get("originalPrice") or product_payload.get("original_price")
+        if original_price is not None:
+            details.append(f"السعر قبل الخصم: {original_price}")
         if stock is not None:
             details.append(f"المخزون المتاح: {stock}")
+        for label, value in (
+            ("القسم", product_text("category", "categoryName", "category_name")),
+            ("الماركة", product_text("brand", "brandName", "brand_name")),
+            ("المورد", product_text("supplier", "supplierName", "supplier_name")),
+            ("المتجر", product_text("store", "storeName", "store_name")),
+            ("الوصف", product_text("description", "short_description", "rich_description")),
+        ):
+            if value:
+                details.append(f"{label}: {value[:1200]}")
+
+        variants = body.get("variants") or product_payload.get("variants") or []
+        if isinstance(variants, list):
+            available_colors: list[str] = []
+            available_sizes: list[str] = []
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                available = variant.get("available")
+                variant_stock = variant.get("stockQuantity") or variant.get("stock_quantity")
+                if available is False or (available is None and variant_stock is not None and int(variant_stock or 0) <= 0):
+                    continue
+                color = _text(variant, "color", "name")
+                size = _text(variant, "size")
+                if color and color not in available_colors:
+                    available_colors.append(color)
+                if size and size not in available_sizes:
+                    available_sizes.append(size)
+            if available_colors:
+                details.append(f"الألوان المتاحة: {', '.join(available_colors[:12])}")
+            if available_sizes:
+                details.append(f"المقاسات المتاحة: {', '.join(available_sizes[:12])}")
         context = "، ".join(details) if details else "لا توجد بيانات منتج إضافية."
         try:
-            language = "en" if str(body.get("language") or "").lower().startswith("en") else "ar"
+            language = "en" if str(body.get("language") or body.get("locale") or "").lower().startswith("en") else "ar"
             answer = await _ai_answer(question, context, language=language)
             answer = _sanitize_public_chat_response(answer, language)
         except HTTPException as exc:

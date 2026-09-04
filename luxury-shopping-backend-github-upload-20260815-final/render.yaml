@@ -117,9 +117,9 @@ services:
       - key: AI_PROVIDER_NAME
         value: gemini
       - key: AI_DEFAULT_MODEL
-        value: gemini-2.0-flash
+        value: gemini-2.5-flash
       - key: AI_MODEL_ALLOWLIST
-        value: gemini-2.0-flash
+        value: gemini-2.5-flash
       - key: IMAGE_AI_ENHANCEMENT_ENABLED
         value: "true"
       - key: IMAGE_AI_MODEL
