@@ -272,7 +272,7 @@ def test_extract_client_ip_trusts_forwarded_for_only_from_trusted_proxy(
 
 
 @pytest.mark.asyncio
-async def test_authenticate_records_bad_password_without_leaking_reason(
+async def test_authenticate_records_bad_password_and_reports_password_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user = _user(email="user@example.test")
@@ -287,7 +287,7 @@ async def test_authenticate_records_bad_password_without_leaking_reason(
         await auth_service.authenticate(session, " USER@example.test ", "bad", "127.0.0.1")
 
     assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "invalid_login"
+    assert exc_info.value.detail == "invalid_password"
     attempt = _only_added(session, LoginAttempt)
     assert attempt.email == "user@example.test"
     assert attempt.succeeded is False
@@ -366,11 +366,15 @@ async def test_authenticate_succeeds_when_optional_security_tables_are_missing(
 
 
 @pytest.mark.asyncio
-async def test_authenticate_rejects_unknown_inactive_or_deleted_users(
+async def test_authenticate_reports_unknown_or_unavailable_accounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(auth_service, "get_settings", lambda: SimpleNamespace(login_rate_limit=5))
-    for candidate in [None, _user(active=False), _user(deleted=True)]:
+    for candidate, expected_detail in [
+        (None, "email_not_registered"),
+        (_user(active=False), "account_unavailable"),
+        (_user(deleted=True), "account_unavailable"),
+    ]:
         session = _FakeSession([
             _Result(scalar=0),
             _Result(scalar=candidate),
@@ -378,6 +382,7 @@ async def test_authenticate_rejects_unknown_inactive_or_deleted_users(
         with pytest.raises(HTTPException) as exc_info:
             await auth_service.authenticate(session, "ghost@example.test", "Valid123", "10.0.0.1")
         assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == expected_detail
         assert _only_added(session, LoginAttempt).detail == "unknown_or_inactive_user"
 
 
@@ -432,8 +437,9 @@ async def test_create_user_rejects_duplicate_email() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("account_status", ["active", "pending_merchant_review"])
 async def test_rotate_refresh_token_revokes_old_token_and_links_replacement(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, account_status: str,
 ) -> None:
     user = _user(email="refresh@example.test")
     stored = RefreshToken(
@@ -454,9 +460,9 @@ async def test_rotate_refresh_token_revokes_old_token_and_links_replacement(
     monkeypatch.setattr(auth_service, "create_access_token", lambda subject, roles, security_version=0: "new-access")
     session = _FakeSession([
         _Result(scalar=stored),
-        _Result(scalar=_account_security(user)),
+        _Result(scalar=AccountSecurity(user_id=user.id, account_status=account_status, security_version=0)),
         _Result(scalars=["customer"]),
-        _Result(scalar=_account_security(user)),
+        _Result(scalar=AccountSecurity(user_id=user.id, account_status=account_status, security_version=0)),
         _Result(scalar=_profile(user)),
         _Result(scalar=replacement_id),
     ])
@@ -563,3 +569,85 @@ def _only_added(session: _FakeSession, model):
     matches = [item for item in session.added if isinstance(item, model)]
     assert len(matches) == 1
     return matches[0]
+
+
+@pytest.mark.parametrize("status,allowed", [
+    ("active", True), ("pending_merchant_review", True),
+    ("pending_email_verification", False), ("disabled", False),
+    ("deleted", False), ("deletion_pending", False), ("merchant_rejected", False),
+])
+def test_merchant_review_does_not_block_customer_account(status, allowed):
+    user = _user()
+    state = AccountSecurity(user_id=user.id, account_status=status)
+    assert auth_service.account_can_login(user, state) is allowed
+    user.is_active = False
+    assert auth_service.account_can_login(user, state) is False
+
+
+@pytest.mark.asyncio
+async def test_pending_merchant_authenticates_as_existing_customer(monkeypatch):
+    user = _user()
+    state = AccountSecurity(user_id=user.id, account_status="pending_merchant_review", security_version=8)
+    async def security(*args, **kwargs):
+        return state
+    monkeypatch.setattr(auth_service, "account_security_for", security)
+    monkeypatch.setattr(auth_service, "get_settings", lambda: SimpleNamespace(login_rate_limit=5))
+    monkeypatch.setattr(auth_service, "verify_password", lambda *_: (True, False))
+    session = _FakeSession([_Result(scalar=0), _Result(scalar=user)])
+    assert await auth_service.authenticate(session, user.email, "Valid123", "127.0.0.1") is user
+    assert state.security_version == 8
+    assert state.account_status == "pending_merchant_review"
+
+
+@pytest.mark.asyncio
+async def test_pending_merchant_access_token_keeps_customer_access(monkeypatch):
+    from backend.app import dependencies
+    from fastapi.security import HTTPAuthorizationCredentials
+    user = _user()
+    state = AccountSecurity(user_id=user.id, account_status="pending_merchant_review", security_version=8)
+    async def security(*args, **kwargs):
+        return state
+    monkeypatch.setattr(dependencies, "account_security_for", security)
+    monkeypatch.setattr(dependencies, "decode_token", lambda _: {"sub": str(user.id), "type": "access", "sv": 8})
+    session = _FakeSession([])
+    session.get_result = user
+    assert await dependencies.optional_user(credentials=HTTPAuthorizationCredentials(scheme="Bearer", credentials="test"), session=session) is user
+    with pytest.raises(HTTPException) as error:
+        await dependencies.require_partner(user=user, roles={"customer"})
+    assert error.value.status_code == 403
+    state.security_version = 9
+    with pytest.raises(HTTPException) as error:
+        await dependencies.optional_user(credentials=HTTPAuthorizationCredentials(scheme="Bearer", credentials="test"), session=session)
+    assert error.value.detail == "stale_access_token"
+
+
+@pytest.mark.asyncio
+async def test_register_merchant_preserves_current_customer_session(monkeypatch):
+    from backend.app.api.routes import auth
+    user = _user()
+    state = AccountSecurity(user_id=user.id, account_status="active", security_version=8)
+    class Session(_FakeSession):
+        async def commit(self):
+            pass
+    class Request:
+        async def json(self):
+            return {"storeName": "Test Store"}
+    session = Session([_Result(scalar=_profile(user)), _Result(), _Result()])
+    async def security(*args, **kwargs):
+        return state
+    async def event(*args, **kwargs):
+        pass
+    async def payload(*args, **kwargs):
+        return {"user": {"id": str(user.id)}, "roles": ["customer"]}
+    async def forbidden_bump(*args, **kwargs):
+        pytest.fail("Submitting a merchant application must not revoke the customer session")
+    monkeypatch.setattr(auth, "account_security_for", security)
+    monkeypatch.setattr(auth, "record_security_event", event)
+    monkeypatch.setattr(auth, "auth_payload", payload)
+    monkeypatch.setattr(auth, "bump_security_version", forbidden_bump)
+    result = await auth.register_merchant(Request(), user=user, session=session)
+    assert state.security_version == 8
+    assert auth_service.account_can_login(user, state)
+    assert result["roles"] == ["customer"]
+    assert result["merchant_portal_enabled"] is False
+    assert result["application_status"] == "pending"

@@ -60,9 +60,11 @@ async def test_postgresql_api_end_to_end() -> None:
         await session.execute(delete(LoginAttempt))
         await session.commit()
     admin_email = f"admin-{suffix}@example.com"
+    partner_email = f"partner-{suffix}@example.com"
     delivery_email = f"delivery-{suffix}@example.com"
     marketer_email = f"marketer-{suffix}@example.com"
     admin_id, admin_password = await _seed_user(admin_email, "admin", "Test Admin")
+    partner_id, partner_password = await _seed_user(partner_email, "partner", "Test Partner")
     delivery_id, delivery_password = await _seed_user(delivery_email, "delivery", "Test Courier")
     marketer_id, marketer_password = await _seed_user(marketer_email, "marketer", "Test Marketer")
 
@@ -83,6 +85,7 @@ async def test_postgresql_api_end_to_end() -> None:
             stock_quantity=20,
             is_active=True,
             approval_status="approved",
+            partner_id=partner_id,
             image_url=f"/uploads/{image_relative_path}",
             images=[f"/uploads/{image_relative_path}"],
         )
@@ -237,6 +240,37 @@ async def test_postgresql_api_end_to_end() -> None:
             json={"p_order_id": order["id"], "p_target": "admin", "p_message": "Order is late"},
         )
         assert ticket.status_code == 200, ticket.text
+        merchant_ticket = await client.post(
+            "/functions/create_order_delay_ticket",
+            headers=customer_headers,
+            json={
+                "p_order_id": order["id"],
+                "p_target": "partner",
+                "p_message": "The order is delayed. Please provide a preparation update.",
+            },
+        )
+        assert merchant_ticket.status_code == 200, merchant_ticket.text
+        merchant_ticket_id = merchant_ticket.json()["id"]
+        partner_auth = await _login(client, partner_email, partner_password)
+        partner_headers = _headers(_token(partner_auth, "access_token"))
+        partner_tickets = await client.get("/api/support/tickets", headers=partner_headers)
+        assert partner_tickets.status_code == 200, partner_tickets.text
+        assert any(row["id"] == merchant_ticket_id for row in partner_tickets.json()["data"])
+        partner_reply = await client.post(
+            f"/api/support/tickets/{merchant_ticket_id}/messages",
+            headers=partner_headers,
+            json={"message": "The order is being prepared and will be updated shortly."},
+        )
+        assert partner_reply.status_code == 201, partner_reply.text
+        customer_messages = await client.get(
+            f"/api/support/tickets/{merchant_ticket_id}/messages",
+            headers=customer_headers,
+        )
+        assert customer_messages.status_code == 200, customer_messages.text
+        assert any(
+            row["message"] == "The order is being prepared and will be updated shortly."
+            for row in customer_messages.json()["data"]
+        )
         support = await client.post(
             "/support/tickets",
             headers=customer_headers,

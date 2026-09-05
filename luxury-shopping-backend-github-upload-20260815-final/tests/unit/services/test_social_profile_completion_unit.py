@@ -34,6 +34,52 @@ async def test_only_new_social_accounts_require_completion(monkeypatch, provider
 
 
 @pytest.mark.asyncio
+async def test_apple_private_relay_identity_does_not_require_email_verified_claim(monkeypatch):
+    user = SimpleNamespace(id=uuid.uuid4(), deleted_at=None, is_active=True)
+    profile = SimpleNamespace(full_name="Customer", phone=None, city=None, extra_data={})
+    result = lambda value: SimpleNamespace(scalar_one_or_none=lambda: value)
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[result(user), result(profile)]), commit=AsyncMock())
+    account_state = SimpleNamespace(account_status="active", email_verified_at=None)
+    monkeypatch.setattr(auth, "verify_firebase_id_token", AsyncMock(return_value={
+        "email": "customer@privaterelay.appleid.com",
+        "email_verified": False,
+        "uid": "apple-firebase-test",
+        "firebase": {"sign_in_provider": "apple.com"},
+    }))
+    monkeypatch.setattr(auth, "account_security_for", AsyncMock(return_value=account_state))
+    monkeypatch.setattr(auth, "record_login_attempt", AsyncMock())
+    monkeypatch.setattr(auth, "record_security_event", AsyncMock())
+    monkeypatch.setattr(auth, "auth_payload", AsyncMock(return_value={"user": {"id": str(user.id)}}))
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+    body = auth.FirebaseAuthRequest(idToken="synthetic-test-token-long-enough", provider="apple.com")
+
+    await auth._firebase_auth_payload(body, request, session)
+
+    assert account_state.email_verified_at is not None
+    assert profile.extra_data["auth_provider"] == "apple.com"
+
+
+@pytest.mark.asyncio
+async def test_social_provider_must_match_the_firebase_token(monkeypatch):
+    monkeypatch.setattr(auth, "verify_firebase_id_token", AsyncMock(return_value={
+        "email": "customer@example.test",
+        "email_verified": True,
+        "uid": "firebase-test",
+        "firebase": {"sign_in_provider": "google.com"},
+    }))
+    session = SimpleNamespace(execute=AsyncMock())
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+    body = auth.FirebaseAuthRequest(idToken="synthetic-test-token-long-enough", provider="apple.com")
+
+    with pytest.raises(auth.HTTPException) as error:
+        await auth._firebase_auth_payload(body, request, session)
+
+    assert error.value.status_code == 401
+    assert error.value.detail == "firebase_provider_mismatch"
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phone,city,complete", [("777123456", "Sanaa Street", True), (None, "Sanaa", False), ("bad", "Sanaa", False), ("777123456", "", False)])
 async def test_completion_marker_clears_only_after_contact_details_save(monkeypatch, phone, city, complete):
     profile = SimpleNamespace(full_name="Customer", phone=None, city=None,

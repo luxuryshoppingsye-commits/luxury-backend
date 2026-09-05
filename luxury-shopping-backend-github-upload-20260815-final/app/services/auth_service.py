@@ -32,9 +32,9 @@ from ..security.tokens import create_access_token, create_refresh_token, token_h
 from .api_protection import trusted_client_ip
 
 ACTIVE_ACCOUNT_STATUS = "active"
+CUSTOMER_LOGIN_STATUSES = {ACTIVE_ACCOUNT_STATUS, "pending_merchant_review"}
 LOGIN_BLOCKED_STATUSES = {
     "pending_email_verification",
-    "pending_merchant_review",
     "disabled",
     "merchant_rejected",
     "deletion_pending",
@@ -304,7 +304,7 @@ def account_can_login(user: User, state: AccountSecurity) -> bool:
     return (
         user.is_active is True
         and user.deleted_at is None
-        and state.account_status == ACTIVE_ACCOUNT_STATUS
+        and state.account_status in CUSTOMER_LOGIN_STATUSES
     )
 
 
@@ -499,7 +499,7 @@ async def authenticate(session: AsyncSession, email: str, password: str, ip: str
         await record_login_attempt(session, normalized, ip, False, "unknown_or_inactive_user")
         raise HTTPException(status_code=401, detail="account_unavailable")
     account_state = await account_security_for(session, user.id)
-    if account_state.account_status != ACTIVE_ACCOUNT_STATUS:
+    if account_state.account_status not in CUSTOMER_LOGIN_STATUSES:
         await record_login_attempt(session, normalized, ip, False, "account_not_active")
         raise HTTPException(status_code=403, detail=account_state.account_status or "account_not_active")
     if not user.is_active:
@@ -613,7 +613,7 @@ async def cleanup_security_artifacts(
             or_(
                 User.is_active.is_not(True),
                 User.deleted_at.is_not(None),
-                AccountSecurity.account_status.is_not(None) & (AccountSecurity.account_status != ACTIVE_ACCOUNT_STATUS),
+                AccountSecurity.account_status.is_not(None) & AccountSecurity.account_status.notin_(CUSTOMER_LOGIN_STATUSES),
             )
         )
     )

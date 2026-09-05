@@ -515,7 +515,8 @@ async def _firebase_auth_payload(
         await record_login_attempt(session, email, extract_client_ip(request), False, "firebase_account_not_active")
         raise HTTPException(status_code=403, detail=account_state.account_status or "account_not_active")
 
-    account_state.account_status = "active"
+    if account_state.account_status != "pending_merchant_review":
+        account_state.account_status = "active"
     if (email_verified or trusted_apple_identity) and account_state.email_verified_at is None:
         account_state.email_verified_at = now
     user.is_active = True
@@ -735,7 +736,6 @@ async def register_merchant(
     session.add(application)
     account_state = await account_security_for(session, user.id, for_update=True)
     account_state.account_status = "pending_merchant_review"
-    await bump_security_version(session, user, reason="merchant_application_submitted", request=request)
     await record_security_event(
         session,
         user_id=user.id,

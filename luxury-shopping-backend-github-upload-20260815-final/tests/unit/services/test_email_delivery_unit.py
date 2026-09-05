@@ -38,6 +38,23 @@ def test_email_provider_falls_back_to_smtp_when_resend_is_unconfigured() -> None
     assert outbox_service.email_delivery_configured(settings) is True
 
 
+def test_email_provider_requires_resend_in_production() -> None:
+    settings = SimpleNamespace(
+        app_env="production",
+        email_provider="auto",
+        resend_api_key="",
+        resend_api_url="https://api.resend.com/emails",
+        resend_from_email="",
+        smtp_host="smtp.gmail.com",
+        smtp_username="sender@example.com",
+        smtp_password="app-password",
+        smtp_from_email="sender@example.com",
+    )
+
+    assert outbox_service._email_provider_mode(settings) == "resend"
+    assert outbox_service.email_delivery_configured(settings) is False
+
+
 def test_email_provider_requires_verified_sender_for_resend() -> None:
     settings = SimpleNamespace(
         email_provider="resend",

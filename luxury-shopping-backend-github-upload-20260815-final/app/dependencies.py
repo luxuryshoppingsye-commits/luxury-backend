@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .database import get_session
 from .models.domain import User
 from .security.tokens import decode_token
-from .services.auth_service import account_security_for, roles_for
+from .services.auth_service import CUSTOMER_LOGIN_STATUSES, account_security_for, roles_for
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -39,7 +39,7 @@ async def optional_user(
     state = await account_security_for(session, user.id, create=False)
     account_status = getattr(state, "account_status", "active")
     security_version = int(getattr(state, "security_version", 0) or 0)
-    if account_status != "active":
+    if account_status not in CUSTOMER_LOGIN_STATUSES:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="account_not_active")
     if security_version != token_security_version:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="stale_access_token")
