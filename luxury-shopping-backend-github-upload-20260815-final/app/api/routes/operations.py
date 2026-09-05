@@ -73,7 +73,7 @@ from ...services.financial_calculator import (
     _coupon_discount,
 )
 from ...services.outbox_service import process_email_outbox, process_whatsapp_outbox
-from ...services.notification_service import NotificationPayload, NotificationService
+from ...services.notification_service import NotificationPayload, NotificationService, customer_notification_visible_clause
 from ...services.payment_refund_security import (
     create_payment_receipt,
     create_refund_request,
@@ -8938,7 +8938,7 @@ async def notifications(
             default_page_size=100,
             max_page_size=500,
         )
-        where_clause = _notification_visible_clause(model, user.id)
+        where_clause = and_(_notification_visible_clause(model, user.id), customer_notification_visible_clause(model, user.id))
         total = int(
             (
                 await session.execute(

@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
+from ..models.domain import UserRole
 from ..models import MODEL_BY_TABLE
 from ..repositories.resources import serialize_record
 from .firebase_auth_service import ensure_firebase_admin_app
@@ -31,6 +32,19 @@ try:
 except ImportError:  # pragma: no cover - exercised when optional dependency is not installed
     WebPushException = Exception
     webpush = None
+
+
+CUSTOMER_NOTIFICATION_TYPES = frozenset(['order_created', 'order_update', 'order_status', 'order_status_changed', 'order_status_rolled_back', 'customer_order_cancelled', 'partner_order_status_changed', 'order_confirmed', 'order_processing', 'order_shipped', 'order_delivered', 'order_cancelled', 'order_canceled', 'order_completed', 'order_returned', 'shipping_update', 'shipping_status_changed', 'delivery_update', 'delivery_status_changed', 'payment_reminder', 'payment_due', 'payment_pending', 'payment_due_reminder', 'cart_discount', 'cart_coupon', 'cart_offer', 'cart_discount_available', 'promo', 'promotion', 'promotional', 'marketing', 'marketing_campaign', 'offer', 'offer_published', 'coupon', 'discount'])
+STAFF_NOTIFICATION_ROLES = {"admin", "manager", "finance", "logistics", "staff", "employee", "courier", "delivery"}
+
+
+def customer_notification_allowed(notification_type: str) -> bool:
+    return str(notification_type or "").strip().lower() in CUSTOMER_NOTIFICATION_TYPES
+
+
+def customer_notification_visible_clause(model: Any, user_id: uuid.UUID) -> Any:
+    staff = select(UserRole.user_id).where(UserRole.user_id == user_id, UserRole.role.in_(STAFF_NOTIFICATION_ROLES)).exists()
+    return or_(staff, func.lower(func.trim(func.coalesce(model.type, ""))).in_(CUSTOMER_NOTIFICATION_TYPES))
 
 
 SECURITY_CATEGORIES = {"security", "account_security", "password", "login"}
@@ -110,6 +124,14 @@ class NotificationService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def customer_channels_allowed(self, user_id: uuid.UUID, notification_type: str) -> bool:
+        if customer_notification_allowed(notification_type):
+            return True
+        result = await self.session.execute(
+            select(UserRole.user_id).where(UserRole.user_id == user_id, UserRole.role.in_(STAFF_NOTIFICATION_ROLES)).limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def preferences_for(self, user_id: uuid.UUID) -> Any:
         model = MODEL_BY_TABLE["notification_preferences"]
         row = (
@@ -180,6 +202,10 @@ class NotificationService:
         )
         self.session.add(row)
         await self.session.flush()
+        if not await self.customer_channels_allowed(payload.user_id, payload.notification_type):
+            if enqueue:
+                await self.enqueue_notification(row, payload)
+            return row
         realtime_event = await RealtimeEventService().record_event(
             self.session,
             channel=f"user:{payload.user_id}",
@@ -318,6 +344,8 @@ class NotificationService:
                         or_(model.user_id == user_id, model.recipient_id == user_id),
                         model.is_read.is_(False),
                         model.deleted_at.is_(None),
+                        customer_notification_visible_clause(model, user_id),
+                        or_(model.expires_at.is_(None), model.expires_at > _now()),
                     )
                 )
             ).scalar_one()
@@ -564,6 +592,9 @@ class NotificationService:
         notification_type: str,
         configured_channels: list[Any] | None = None,
     ) -> list[str]:
+        if not await self.customer_channels_allowed(user_id, notification_type):
+            # Email workflows remain independent of app and device notifications.
+            return ["email"] if configured_channels is None and email_delivery_configured(get_settings()) else []
         if configured_channels is not None:
             allowed = {"in_app", "mobile_push", "web_push"}
             return list(dict.fromkeys(
@@ -581,11 +612,6 @@ class NotificationService:
         email_enabled = email_delivery_configured(get_settings())
         if email_enabled:
             channels.append("email")
-            # If the same event is eligible for email, it must also try the
-            # registered mobile device. The token and OS permission still
-            # determine whether the provider can show the popup.
-            if "mobile_push" not in channels:
-                channels.append("mobile_push")
         if category in SECURITY_CATEGORIES:
             for required in ("in_app", "mobile_push", "web_push"):
                 if required not in channels:
@@ -695,6 +721,7 @@ class NotificationService:
         # so Android can display a system tray/heads-up notification when the
         # app is backgrounded or terminated, without depending on Dart being
         # scheduled by the device.
+        notification_data["notification_type"] = row.type or "message"
         notification_data.setdefault("title", notification["title"])
         notification_data.setdefault("body", notification["body"])
         notification_data.setdefault("message", notification["body"])
@@ -906,6 +933,8 @@ def _is_uuid(value: str) -> bool:
 
 def _category_from_type(notification_type: str) -> str:
     lowered = notification_type.lower()
+    if lowered.startswith("cart_") or lowered in {"promo", "promotion", "promotional", "marketing", "marketing_campaign", "offer", "offer_published", "coupon", "discount"}:
+        return "promotional"
     if "order" in lowered:
         return "order"
     if "payment" in lowered or "refund" in lowered:

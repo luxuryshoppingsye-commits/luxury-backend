@@ -492,8 +492,16 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
         assert pending.json().get("access_token") is None
 
         pending_login = await client.post("/auth/login", json={"email": merchant_email, "password": "ValidPass123"})
-        assert pending_login.status_code == 403
-        assert pending_login.json()["detail"] == "pending_merchant_review"
+        assert pending_login.status_code == 200, pending_login.text
+        pending_payload = pending_login.json()
+        assert pending_payload["user"]["account_status"] == "pending_merchant_review"
+        assert "customer" in pending_payload["roles"]
+        assert "partner" not in pending_payload["roles"]
+        pending_customer_cart = await client.get(
+            "/cart",
+            headers={"Authorization": f"Bearer {pending_payload['access_token']}"},
+        )
+        assert pending_customer_cart.status_code == 200, pending_customer_cart.text
 
         async with SessionFactory() as session:
             user = (await session.execute(select(User).where(User.email == merchant_email))).scalar_one()
@@ -516,6 +524,7 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
 
         merchant_login = await client.post("/auth/login", json={"email": merchant_email, "password": "ValidPass123"})
         assert merchant_login.status_code == 200, merchant_login.text
+        assert "customer" in merchant_login.json()["roles"]
         assert "partner" in merchant_login.json()["roles"]
 
         rejected, rejected_password = await _seed_user(f"{run_id}-reject", role="customer")
