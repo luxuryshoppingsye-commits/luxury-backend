@@ -70,6 +70,7 @@ from ...services.financial_calculator import (
     request_hash,
     serialize_local_shopping_requests,
     sync_order_payment_status,
+    _coupon_discount,
 )
 from ...services.outbox_service import process_email_outbox, process_whatsapp_outbox
 from ...services.notification_service import NotificationPayload, NotificationService
@@ -117,7 +118,7 @@ from ...services.report_admin_services import (
 from ...services.r2_migration import R2MigrationService
 from ...services.secure_backup import BackupCoordinator
 from ...storage import FileStorage, StoragePolicyRegistry
-from .commerce import _delete_product_file_assets, _serialize_orders_with_financials
+from .commerce import _delete_product_file_assets, _serialize_orders_with_financials, _validated_cart_lines
 
 
 router = APIRouter(tags=["operations"])
@@ -455,6 +456,238 @@ def _first_text(*values: Any, default: str = "") -> str:
         if text_value:
             return text_value
     return default
+
+
+_PARTNER_COUPON_TYPES = frozenset({"percentage", "fixed"})
+_PARTNER_COUPON_SCOPES = frozenset({"all", "products", "categories"})
+_PARTNER_COUPON_AUDIENCES = frozenset({"all", "new_customers", "loyalty_members"})
+
+
+def _coupon_datetime(value: Any, field: str) -> datetime | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=f"invalid_coupon_{field}") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _coupon_ids(value: Any, field: str) -> list[str]:
+    raw_values = value if isinstance(value, list) else str(value or "").split(",")
+    ids: list[str] = []
+    for raw_value in raw_values:
+        text_value = str(raw_value or "").strip()
+        if not text_value:
+            continue
+        try:
+            normalized = str(uuid.UUID(text_value))
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=f"invalid_coupon_{field}") from error
+        if normalized not in ids:
+            ids.append(normalized)
+    return ids
+
+
+def _coupon_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _partner_coupon_values(body: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Normalize the merchant campaign fields kept with the coupon record."""
+    current = dict(existing or {})
+    title = _first_text(body.get("title"), body.get("name"), current.get("title"), default="كوبون خصم")
+    code = _first_text(body.get("code"), current.get("code")).upper().replace(" ", "")
+    if not code:
+        raise HTTPException(status_code=422, detail="coupon_code_required")
+    discount_type = _first_text(body.get("discount_type"), body.get("type"), current.get("discount_type"), default="percentage").lower()
+    if discount_type not in _PARTNER_COUPON_TYPES:
+        raise HTTPException(status_code=422, detail="invalid_coupon_discount_type")
+    raw_value = body.get("discount_value") if body.get("discount_value") is not None else body.get("amount")
+    discount_value = _money_from_payload(raw_value if raw_value is not None else current.get("discount_value"))
+    if discount_value <= 0 or (discount_type == "percentage" and discount_value > 100):
+        raise HTTPException(status_code=422, detail="invalid_coupon_discount_value")
+    minimum_order = _money_from_payload(
+        body.get("minimum_order_amount")
+        if body.get("minimum_order_amount") is not None
+        else current.get("minimum_order_amount")
+    )
+    max_uses_raw = body.get("max_uses") if body.get("max_uses") is not None else current.get("max_uses", 0)
+    try:
+        max_uses = int(max_uses_raw or 0)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail="invalid_coupon_max_uses") from error
+    if max_uses < 0:
+        raise HTTPException(status_code=422, detail="invalid_coupon_max_uses")
+    valid_from = _coupon_datetime(
+        body.get("valid_from") if body.get("valid_from") is not None else current.get("valid_from"),
+        "valid_from",
+    )
+    valid_until = _coupon_datetime(
+        body.get("valid_until") if body.get("valid_until") is not None else current.get("valid_until"),
+        "valid_until",
+    )
+    if valid_from and valid_until and valid_until <= valid_from:
+        raise HTTPException(status_code=422, detail="coupon_end_must_follow_start")
+    scope = _first_text(body.get("scope"), current.get("scope"), default="all").lower()
+    if scope not in _PARTNER_COUPON_SCOPES:
+        raise HTTPException(status_code=422, detail="invalid_coupon_scope")
+    product_ids = _coupon_ids(
+        body.get("product_ids") if body.get("product_ids") is not None else current.get("product_ids"),
+        "product_ids",
+    )
+    category_ids = _coupon_ids(
+        body.get("category_ids") if body.get("category_ids") is not None else current.get("category_ids"),
+        "category_ids",
+    )
+    if scope == "products" and not product_ids:
+        raise HTTPException(status_code=422, detail="coupon_products_required")
+    if scope == "categories" and not category_ids:
+        raise HTTPException(status_code=422, detail="coupon_categories_required")
+    audience = _first_text(body.get("audience"), current.get("audience"), default="all").lower()
+    if audience not in _PARTNER_COUPON_AUDIENCES:
+        raise HTTPException(status_code=422, detail="invalid_coupon_audience")
+    return {
+        "title": title,
+        "code": code,
+        "amount": discount_value,
+        "expires_at": valid_until,
+        "extra_data": {
+            "title": title,
+            "discount_type": discount_type,
+            "discount_value": float(discount_value),
+            "minimum_order_amount": float(minimum_order),
+            "max_uses": max_uses,
+            "usage_limit": max_uses,
+            "valid_from": valid_from.isoformat() if valid_from else None,
+            "valid_until": valid_until.isoformat() if valid_until else None,
+            "scope": scope,
+            "product_ids": product_ids,
+            "category_ids": category_ids,
+            "audience": audience,
+            "notify_customers": _coupon_bool(
+                body.get("notify_customers"), _coupon_bool(current.get("notify_customers"))
+            ),
+        },
+    }
+
+
+async def _assert_coupon_code_available(
+    session: AsyncSession,
+    code: str,
+    *,
+    partner_coupon_id: uuid.UUID | None = None,
+    customer_coupon_id: uuid.UUID | None = None,
+) -> None:
+    partner_model = MODEL_BY_TABLE["partner_coupons"]
+    customer_model = MODEL_BY_TABLE["coupons"]
+    partner_query = select(partner_model.id).where(
+        func.upper(partner_model.code) == code,
+        partner_model.deleted_at.is_(None),
+    )
+    if partner_coupon_id is not None:
+        partner_query = partner_query.where(partner_model.id != partner_coupon_id)
+    if (await session.execute(partner_query.limit(1))).scalar_one_or_none() is not None:
+        raise HTTPException(status_code=409, detail="coupon_code_exists")
+    customer_query = select(customer_model.id).where(
+        func.upper(customer_model.code) == code,
+        customer_model.deleted_at.is_(None),
+    )
+    if customer_coupon_id is not None:
+        customer_query = customer_query.where(customer_model.id != customer_coupon_id)
+    if (await session.execute(customer_query.limit(1))).scalar_one_or_none() is not None:
+        raise HTTPException(status_code=409, detail="coupon_code_exists")
+
+
+async def _notify_coupon_customers(
+    session: AsyncSession,
+    *,
+    actor: User,
+    coupon: Any,
+    campaign: dict[str, Any],
+) -> int:
+    """Create an opt-in in-app/push announcement once for a new campaign."""
+    if not campaign.get("notify_customers"):
+        return 0
+    preferences = MODEL_BY_TABLE["notification_preferences"]
+    preference_rows = await session.execute(
+        select(preferences.user_id, preferences.promotional_notifications).where(
+            preferences.deleted_at.is_(None)
+        )
+    )
+    opted_in = {user_id: enabled for user_id, enabled in preference_rows.all()}
+    customer_rows = await session.execute(
+        select(User.id)
+        .join(UserRole, UserRole.user_id == User.id)
+        .where(
+            User.is_active.is_(True),
+            User.deleted_at.is_(None),
+            User.id != actor.id,
+            UserRole.role == "customer",
+        )
+        .limit(1000)
+    )
+    customer_ids = list(customer_rows.scalars().all())
+    audience = str(campaign.get("audience") or "all").lower()
+    if audience == "new_customers" and customer_ids:
+        prior_customer_ids = set(
+            (
+                await session.execute(
+                    select(Order.user_id).where(
+                        Order.user_id.in_(customer_ids),
+                        Order.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        customer_ids = [customer_id for customer_id in customer_ids if customer_id not in prior_customer_ids]
+    elif audience == "loyalty_members" and customer_ids:
+        loyalty_model = MODEL_BY_TABLE["user_loyalty"]
+        loyalty_customer_ids = set(
+            (
+                await session.execute(
+                    select(loyalty_model.user_id).where(
+                        loyalty_model.user_id.in_(customer_ids),
+                        loyalty_model.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        customer_ids = [customer_id for customer_id in customer_ids if customer_id in loyalty_customer_ids]
+    title = str(campaign.get("title") or "كوبون خصم")
+    discount_value = campaign.get("discount_value") or 0
+    discount_type = campaign.get("discount_type") or "percentage"
+    discount_label = f"{discount_value:g}%" if discount_type == "percentage" else f"{discount_value:g} ر.ي"
+    product_ids = list(campaign.get("product_ids") or [])
+    action_url = f"/product/{product_ids[0]}" if product_ids else "/offers"
+    payloads = [
+        NotificationPayload(
+            user_id=customer_id,
+            title="كوبون جديد متاح",
+            body=f"{title}: استخدم {coupon.code} واحصل على خصم {discount_label}.",
+            notification_type="coupon",
+            category="promotional",
+            action_url=action_url,
+            entity_type="coupon",
+            entity_id=str(coupon.id),
+            payload={"coupon_code": coupon.code, "discount": discount_label},
+            created_by=actor.id,
+            source="partner_coupon_campaign",
+            deduplication_key=f"coupon-campaign:{coupon.id}:{customer_id}",
+            delivery_channels=("in_app", "mobile_push"),
+        )
+        for customer_id in customer_ids
+        if opted_in.get(customer_id, True) is not False
+    ]
+    if payloads:
+        await NotificationService(session).create_bulk_notifications(payloads)
+    return len(payloads)
 
 
 async def _public_resource_rows(session: AsyncSession, table: str, *, limit: int = 500) -> list[dict[str, Any]]:
@@ -1397,6 +1630,64 @@ async def list_partner_coupons(
     return {"data": [serialize_record(row) for row in rows]}
 
 
+@router.get("/api/catalog/products/{product_id}/coupons")
+async def public_product_coupons(
+    product_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Return only currently usable merchant campaigns for one public product."""
+    parsed_product_id = decode_compact_uuid(product_id)
+    if parsed_product_id is None:
+        try:
+            parsed_product_id = uuid.UUID(product_id)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=404, detail="product_not_found") from error
+    product = validate_public_product_or_404(await session.get(Product, parsed_product_id))
+    now = datetime.now(timezone.utc)
+    coupon_model = MODEL_BY_TABLE["coupons"]
+    rows = (
+        await session.execute(
+            select(coupon_model)
+            .where(
+                coupon_model.is_active.is_(True),
+                coupon_model.deleted_at.is_(None),
+                or_(coupon_model.expires_at.is_(None), coupon_model.expires_at > now),
+            )
+            .order_by(coupon_model.created_at.desc())
+            .limit(300)
+        )
+    ).scalars().all()
+    campaigns: list[dict[str, Any]] = []
+    for coupon in rows:
+        extra = dict(coupon.extra_data or {})
+        partner_id = str(extra.get("partner_id") or "")
+        if not partner_id or partner_id != str(product.partner_id or ""):
+            continue
+        valid_from = _coupon_datetime(extra.get("valid_from"), "valid_from")
+        if valid_from and valid_from > now:
+            continue
+        scope = str(extra.get("scope") or "all").lower()
+        product_ids = {str(item) for item in extra.get("product_ids") or []}
+        category_ids = {str(item) for item in extra.get("category_ids") or []}
+        if scope == "products" and str(product.id) not in product_ids:
+            continue
+        if scope == "categories" and str(product.category_id or "") not in category_ids:
+            continue
+        campaigns.append(
+            {
+                "id": str(coupon.id),
+                "code": coupon.code,
+                "title": extra.get("title") or coupon.title or "كوبون خصم",
+                "discount_type": extra.get("discount_type") or "fixed",
+                "discount_value": extra.get("discount_value", float(coupon.amount or 0)),
+                "minimum_order_amount": extra.get("minimum_order_amount", 0),
+                "valid_until": extra.get("valid_until") or (coupon.expires_at.isoformat() if coupon.expires_at else None),
+                "scope": scope,
+            }
+        )
+    return {"data": campaigns}
+
+
 @router.post("/partner/coupons", status_code=201)
 async def create_partner_coupon(
     request: Request,
@@ -1404,23 +1695,52 @@ async def create_partner_coupon(
     session: AsyncSession = Depends(get_session),
 ):
     body = await request.json()
-    code = _first_text(body.get("code")).upper()
-    if not code:
-        raise HTTPException(status_code=422, detail="coupon_code_required")
-    row = await _api_create(
-        session,
-        "partner_coupons",
-        {
-            "partner_id": user.id,
-            "code": code,
-            "amount": _money_from_payload(body.get("discount_value") or body.get("amount") or 0),
-            "status": "active",
-            "is_active": True,
+    values = _partner_coupon_values(body)
+    await _assert_coupon_code_available(session, values["code"])
+    partner_model = MODEL_BY_TABLE["partner_coupons"]
+    customer_model = MODEL_BY_TABLE["coupons"]
+    partner_coupon = partner_model(
+        partner_id=user.id,
+        code=values["code"],
+        amount=values["amount"],
+        status="active",
+        is_active=True,
+        expires_at=values["expires_at"],
+        extra_data=values["extra_data"],
+    )
+    session.add(partner_coupon)
+    await session.flush()
+    campaign = dict(values["extra_data"])
+    customer_coupon = customer_model(
+        code=values["code"],
+        title=values["title"],
+        amount=values["amount"],
+        status="active",
+        is_active=True,
+        expires_at=values["expires_at"],
+        extra_data={
+            **campaign,
+            "partner_coupon_id": str(partner_coupon.id),
+            "partner_id": str(user.id),
+            "source": "partner_coupon",
         },
-        user,
+    )
+    session.add(customer_coupon)
+    await session.flush()
+    partner_coupon.extra_data = {
+        **campaign,
+        "customer_coupon_id": str(customer_coupon.id),
+    }
+    notified_customers = await _notify_coupon_customers(
+        session,
+        actor=user,
+        coupon=customer_coupon,
+        campaign=campaign,
     )
     await session.commit()
-    return {"data": row}
+    payload = serialize_record(partner_coupon)
+    payload["notified_customers"] = notified_customers
+    return {"data": payload}
 
 
 @router.patch("/partner/coupons/{record_id}")
@@ -1435,10 +1755,56 @@ async def update_partner_coupon(
     if row is None or row.partner_id != user.id:
         raise HTTPException(status_code=404, detail="coupon_not_found")
     body = await request.json()
-    if body.get("code") is not None:
-        row.code = _first_text(body.get("code"), row.code).upper()
-    if body.get("discount_value") is not None or body.get("amount") is not None:
-        row.amount = _money_from_payload(body.get("discount_value") or body.get("amount"))
+    existing = dict(row.extra_data or {})
+    existing["code"] = row.code
+    existing["discount_value"] = existing.get("discount_value", float(row.amount or 0))
+    values = _partner_coupon_values(body, existing)
+    linked_id = existing.get("customer_coupon_id")
+    customer_coupon_id = _uuid(linked_id, "customer_coupon_id") if linked_id else None
+    await _assert_coupon_code_available(
+        session,
+        values["code"],
+        partner_coupon_id=row.id,
+        customer_coupon_id=customer_coupon_id,
+    )
+    row.code = values["code"]
+    row.amount = values["amount"]
+    row.expires_at = values["expires_at"]
+    row.extra_data = {**values["extra_data"], "customer_coupon_id": str(customer_coupon_id) if customer_coupon_id else None}
+    customer_model = MODEL_BY_TABLE["coupons"]
+    if customer_coupon_id is not None:
+        customer_coupon = await session.get(customer_model, customer_coupon_id, with_for_update=True)
+        if customer_coupon is not None:
+            customer_coupon.code = values["code"]
+            customer_coupon.title = values["title"]
+            customer_coupon.amount = values["amount"]
+            customer_coupon.expires_at = values["expires_at"]
+            customer_coupon.is_active = True
+            customer_coupon.status = "active"
+            customer_coupon.extra_data = {
+                **values["extra_data"],
+                "partner_coupon_id": str(row.id),
+                "partner_id": str(user.id),
+                "source": "partner_coupon",
+            }
+    else:
+        customer_coupon = customer_model(
+            code=values["code"],
+            title=values["title"],
+            amount=values["amount"],
+            status="active",
+            is_active=True,
+            expires_at=values["expires_at"],
+            extra_data={
+                **values["extra_data"],
+                "partner_coupon_id": str(row.id),
+                "partner_id": str(user.id),
+                "source": "partner_coupon",
+            },
+        )
+        session.add(customer_coupon)
+        await session.flush()
+        row.extra_data = {**values["extra_data"], "customer_coupon_id": str(customer_coupon.id)}
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -1453,7 +1819,19 @@ async def delete_partner_coupon(
     row = await session.get(model, record_id, with_for_update=True)
     if row is None or row.partner_id != user.id:
         raise HTTPException(status_code=404, detail="coupon_not_found")
-    await session.delete(row)
+    linked_id = (row.extra_data or {}).get("customer_coupon_id")
+    if linked_id:
+        try:
+            customer_coupon = await session.get(MODEL_BY_TABLE["coupons"], _uuid(linked_id, "customer_coupon_id"), with_for_update=True)
+        except HTTPException:
+            customer_coupon = None
+        if customer_coupon is not None:
+            customer_coupon.is_active = False
+            customer_coupon.status = "deleted"
+            customer_coupon.deleted_at = datetime.now(timezone.utc)
+    row.is_active = False
+    row.status = "deleted"
+    row.deleted_at = datetime.now(timezone.utc)
     await session.commit()
     return {"ok": True}
 
@@ -7956,9 +8334,64 @@ async def api_delete_order_payment(
     return {"ok": True}
 
 
+def _validated_public_contact_message(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_payload_invalid", "message": "بيانات الرسالة غير صالحة."},
+        )
+    name = str(body.get("name") or "").strip()
+    email = str(body.get("email") or "").strip().lower()
+    phone = str(body.get("phone") or "").strip()
+    subject = str(body.get("subject") or "").strip()
+    message = str(body.get("message") or "").strip()
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_name_required", "message": "الاسم الكامل يجب أن يحتوي على حرفين على الأقل."},
+        )
+    if not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", email):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_email_invalid", "message": "يرجى إدخال بريد إلكتروني صحيح."},
+        )
+    if len(subject) < 3:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_subject_required", "message": "موضوع الرسالة يجب أن يحتوي على 3 أحرف على الأقل."},
+        )
+    if not message:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_message_required", "message": "اكتب رسالتك."},
+        )
+    if len(message) < 10:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_message_too_short", "message": "رسالتك قصيرة. اكتب 10 أحرف على الأقل حتى نعرف كيف نساعدك."},
+        )
+    if len(message) > 2000:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "contact_message_too_long", "message": "الرسالة طويلة جدًا. اختصرها إلى 2000 حرف أو أقل."},
+        )
+    return {
+        "name": name,
+        "email": email,
+        "phone": phone or None,
+        "subject": subject,
+        "message": message,
+        "status": "new",
+    }
+
+
 @router.post("/api/communication/contact", status_code=201)
 async def api_create_contact_message(request: Request, session: AsyncSession = Depends(get_session)):
-    row = await _api_create(session, "contact_messages", await request.json())
+    row = await _api_create(
+        session,
+        "contact_messages",
+        _validated_public_contact_message(await request.json()),
+    )
     await session.commit()
     return {"data": row}
 
@@ -9106,51 +9539,248 @@ async def create_support_ticket(
     return await SupportWorkflowService().create(session, user=user, roles=roles, body=await request.json())
 
 
+_PARTNER_SALES_PERIODS = {
+    "week": 7,
+    "month": 30,
+    "all": None,
+}
+_PARTNER_SALES_EXCLUDED_STATUSES = frozenset(
+    {"cancelled", "canceled", "rejected", "failed", "void", "draft"}
+)
+_PARTNER_SALES_PENDING_STATUSES = frozenset(
+    {
+        "pending",
+        "confirmed",
+        "accepted",
+        "processing",
+        "preparing",
+        "ready_for_shipment",
+        "shipped",
+        "out_for_delivery",
+        "postponed",
+    }
+)
+
+
+def _partner_sales_window(period: str) -> tuple[str, datetime | None, datetime]:
+    normalized = str(period or "month").strip().lower()
+    if normalized not in _PARTNER_SALES_PERIODS:
+        raise HTTPException(status_code=422, detail="invalid_partner_sales_period")
+    end = datetime.now(timezone.utc)
+    days = _PARTNER_SALES_PERIODS[normalized]
+    if days is None:
+        return normalized, None, end
+    start_of_today = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
+    return normalized, start_of_today - timedelta(days=days - 1), end
+
+
+async def _partner_sales_analytics(
+    session: AsyncSession,
+    *,
+    partner_id: uuid.UUID,
+    period: str,
+) -> dict[str, Any]:
+    normalized_period, start, end = _partner_sales_window(period)
+    clauses = [Order.deleted_at.is_(None), OrderItem.partner_id == partner_id]
+    if start is not None:
+        clauses.append(Order.created_at >= start)
+    clauses.append(Order.created_at <= end)
+    result = await session.execute(
+        select(
+            Order.id.label("order_id"),
+            Order.status.label("status"),
+            Order.created_at.label("created_at"),
+            Order.user_id.label("customer_id"),
+            Order.subtotal.label("order_subtotal"),
+            Order.discount_total.label("order_discount_total"),
+            OrderItem.product_name.label("product_name"),
+            OrderItem.quantity.label("quantity"),
+            OrderItem.total_price.label("total_price"),
+        )
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(*clauses)
+        .order_by(Order.created_at.asc())
+    )
+
+    orders: dict[uuid.UUID, dict[str, Any]] = {}
+    status_totals: dict[str, dict[str, Any]] = {}
+    product_totals: dict[str, dict[str, Any]] = {}
+    for row in result.mappings():
+        order_id = row["order_id"]
+        status = str(row["status"] or "pending").strip().lower() or "pending"
+        created_at = row["created_at"]
+        amount = money(row["total_price"] or 0)
+        order = orders.setdefault(
+            order_id,
+            {
+                "status": status,
+                "created_at": created_at,
+                "customer_id": row["customer_id"],
+                "subtotal": money(row["order_subtotal"] or 0),
+                "discount_total": money(row["order_discount_total"] or 0),
+                "total": Decimal("0.00"),
+            },
+        )
+        order["total"] = money(order["total"] + amount)
+
+        status_total = status_totals.setdefault(
+            status,
+            {"orders": set(), "revenue": Decimal("0.00")},
+        )
+        status_total["orders"].add(order_id)
+        status_total["revenue"] = money(status_total["revenue"] + amount)
+
+        if status in _PARTNER_SALES_EXCLUDED_STATUSES:
+            continue
+        product_name = str(row["product_name"] or "منتج بدون اسم").strip() or "منتج بدون اسم"
+        product_total = product_totals.setdefault(
+            product_name,
+            {"quantity": 0, "revenue": Decimal("0.00")},
+        )
+        product_total["quantity"] += int(row["quantity"] or 0)
+        product_total["revenue"] = money(product_total["revenue"] + amount)
+
+    sale_orders = [
+        row
+        for row in orders.values()
+        if row["status"] not in _PARTNER_SALES_EXCLUDED_STATUSES
+    ]
+    gross_revenue = money(sum((row["total"] for row in sale_orders), Decimal("0.00")))
+    orders_count = len(sale_orders)
+    pending = sum(1 for row in sale_orders if row["status"] in _PARTNER_SALES_PENDING_STATUSES)
+    completed = sum(1 for row in sale_orders if row["status"] == "delivered")
+    average_order = money(gross_revenue / orders_count) if orders_count else Decimal("0.00")
+    allocated_discounts = Decimal("0.00")
+    customer_orders: dict[uuid.UUID, int] = {}
+    for row in sale_orders:
+        subtotal = money(row["subtotal"])
+        order_discount = money(row["discount_total"])
+        if subtotal > 0 and order_discount > 0:
+            share = min(Decimal("1.00"), money(row["total"]) / subtotal)
+            allocated_discounts = money(allocated_discounts + (order_discount * share))
+        customer_id = row["customer_id"]
+        if isinstance(customer_id, uuid.UUID):
+            customer_orders[customer_id] = customer_orders.get(customer_id, 0) + 1
+    allocated_discounts = money(allocated_discounts)
+    customers_count = len(customer_orders)
+    returning_customers = sum(1 for count in customer_orders.values() if count > 1)
+
+    sales_series: dict[str, dict[str, Any]] = {}
+    for row in sale_orders:
+        created_at = row["created_at"]
+        if not isinstance(created_at, datetime):
+            continue
+        bucket = (
+            created_at.strftime("%Y-%m")
+            if normalized_period == "all"
+            else created_at.strftime("%Y-%m-%d")
+        )
+        point = sales_series.setdefault(
+            bucket,
+            {"date": f"{bucket}-01" if normalized_period == "all" else bucket, "orders": 0, "revenue": Decimal("0.00")},
+        )
+        point["orders"] += 1
+        point["revenue"] = money(point["revenue"] + row["total"])
+    if normalized_period != "all" and start is not None:
+        cursor = start
+        while cursor.date() <= end.date():
+            bucket = cursor.strftime("%Y-%m-%d")
+            sales_series.setdefault(
+                bucket,
+                {"date": bucket, "orders": 0, "revenue": Decimal("0.00")},
+            )
+            cursor += timedelta(days=1)
+    ordered_series = sorted(sales_series.values(), key=lambda point: point["date"])
+    if normalized_period == "all":
+        ordered_series = ordered_series[-12:]
+
+    recognized = await RevenueRecognitionService.summary(
+        session,
+        start=start,
+        end=end,
+        partner_id=partner_id,
+    )
+    return {
+        "period": normalized_period,
+        "range": {
+            "start": start.isoformat() if start is not None else None,
+            "end": end.isoformat(),
+            "series_unit": "month" if normalized_period == "all" else "day",
+        },
+        "orders": orders_count,
+        "ordersCount": orders_count,
+        "revenue": recognized["net_revenue"],
+        "totalRevenue": recognized["net_revenue"],
+        "merchantRevenue": recognized["net_revenue"],
+        "grossRevenue": format(gross_revenue, "f"),
+        "discountsAmount": format(allocated_discounts, "f"),
+        "averageOrder": format(average_order, "f"),
+        "pending": pending,
+        "completed": completed,
+        "salesSeries": [
+            {
+                "date": point["date"],
+                "orders": point["orders"],
+                "revenue": format(point["revenue"], "f"),
+            }
+            for point in ordered_series
+        ],
+        "statusBreakdown": [
+            {
+                "status": status,
+                "orders": len(value["orders"]),
+                "revenue": format(value["revenue"], "f"),
+            }
+            for status, value in sorted(
+                status_totals.items(),
+                key=lambda item: (-len(item[1]["orders"]), item[0]),
+            )
+        ],
+        "topProducts": [
+            {
+                "name": name,
+                "quantity": value["quantity"],
+                "revenue": format(value["revenue"], "f"),
+            }
+            for name, value in sorted(
+                product_totals.items(),
+                key=lambda item: (-item[1]["revenue"], item[0]),
+            )[:5]
+        ],
+        "customerSummary": {
+            "uniqueCustomers": customers_count,
+            "returningCustomers": returning_customers,
+            "oneTimeCustomers": max(0, customers_count - returning_customers),
+            "averageOrdersPerCustomer": format(
+                money(Decimal(orders_count) / customers_count)
+                if customers_count
+                else Decimal("0.00"),
+                "f",
+            ),
+        },
+        "aggregation": "own_order_items_successful_payments_minus_refunds",
+        "recognizedRevenue": recognized,
+    }
+
+
 @router.get("/reports/summary")
 @router.get("/admin/reports/summary")
 @router.get("/partner/reports/summary")
-async def reports_summary(request: Request, user: User = Depends(current_user), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
+async def reports_summary(
+    request: Request,
+    period: str = "month",
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
     statement = select(Order).where(Order.deleted_at.is_(None))
     if request.url.path.startswith("/partner"):
         if "partner" not in roles:
             raise HTTPException(status_code=403, detail="partner_required")
-        order_join = OrderItem.__table__.join(Order.__table__, OrderItem.order_id == Order.id)
-        base_clauses = (Order.deleted_at.is_(None), OrderItem.partner_id == user.id)
-        orders_count = int(
-            (
-                await session.execute(
-                    select(func.count(func.distinct(Order.id))).select_from(order_join).where(*base_clauses)
-                )
-            ).scalar_one()
-            or 0
-        )
-        revenue = money(
-            (
-                await session.execute(
-                    select(func.coalesce(func.sum(OrderItem.total_price), 0)).select_from(order_join).where(*base_clauses)
-                )
-            ).scalar_one()
-            or 0
-        )
-        pending = int(
-            (
-                await session.execute(
-                    select(func.count(func.distinct(Order.id)))
-                    .select_from(order_join)
-                    .where(*base_clauses, Order.status.in_(["pending", "processing"]))
-                )
-            ).scalar_one()
-            or 0
-        )
-        completed = int(
-            (
-                await session.execute(
-                    select(func.count(func.distinct(Order.id)))
-                    .select_from(order_join)
-                    .where(*base_clauses, Order.status == "delivered")
-                )
-            ).scalar_one()
-            or 0
+        payload = await _partner_sales_analytics(
+            session,
+            partner_id=user.id,
+            period=period,
         )
         products_count = int(
             (
@@ -9160,21 +9790,7 @@ async def reports_summary(request: Request, user: User = Depends(current_user), 
             ).scalar_one()
             or 0
         )
-        recognized = await RevenueRecognitionService.summary(session, partner_id=user.id)
-        revenue_text = str(recognized["net_revenue"])
-        return {
-            "orders": orders_count,
-            "ordersCount": orders_count,
-            "revenue": revenue_text,
-            "totalRevenue": revenue_text,
-            "merchantRevenue": revenue_text,
-            "pending": pending,
-            "completed": completed,
-            "productsCount": products_count,
-            "appPending": 0,
-            "aggregation": "own_order_items_successful_payments_minus_refunds",
-            "recognizedRevenue": recognized,
-        }
+        return {**payload, "productsCount": products_count, "appPending": 0}
     elif request.url.path.startswith("/admin") and not roles.intersection({"admin", "manager", "finance", "staff"}):
         raise HTTPException(status_code=403, detail="staff_required")
     elif not request.url.path.startswith("/admin"):
@@ -9280,12 +9896,26 @@ async def shipping_quote(request: Request, session: AsyncSession = Depends(get_s
 async def validate_coupon(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     body = await request.json()
     code = str(body.get("code") or "").upper().strip()
-    model = MODEL_BY_TABLE["coupons"]
-    result = await session.execute(select(model).where(func.upper(model.code) == code, model.is_active.is_(True)).limit(1))
-    coupon = result.scalar_one_or_none()
-    if coupon is None or (coupon.expires_at and coupon.expires_at < datetime.now(timezone.utc)):
+    if not code:
         raise HTTPException(status_code=404, detail="coupon_invalid")
-    return {**serialize_record(coupon), "valid": True, "discountAmount": str(money(coupon.amount or 0))}
+    lines, subtotal, product_discount = await _validated_cart_lines(session, user.id)
+    merchandise_total = money(subtotal - product_discount)
+    discount, coupon_id, metadata = await _coupon_discount(
+        session,
+        code=code,
+        subtotal=merchandise_total,
+        user_id=user.id,
+        coupon_lines=[(product, item.quantity, unit) for item, product, _variant, unit in lines],
+    )
+    return {
+        "valid": True,
+        "coupon_id": coupon_id,
+        "code": metadata.get("code", code),
+        "discount_type": metadata.get("discount_type", "fixed"),
+        "discount_value": metadata.get("discount_value", "0"),
+        "discount_amount": str(discount),
+        "free_shipping": metadata.get("free_shipping") is True,
+    }
 
 
 @router.post("/loyalty/initialize", status_code=201)
@@ -9752,6 +10382,14 @@ async def function_proxy(function_name: str, request: Request, user: User | None
 async def ai_chat_support_compat(request: Request, user: User | None = Depends(public_optional_user), session: AsyncSession = Depends(get_session)):
     body = await request.json()
     return await execute_public_ai_chat(body, user, session, request)
+
+
+@router.post("/ai/image-search")
+async def ai_image_search_compat(request: Request, user: User | None = Depends(public_optional_user), session: AsyncSession = Depends(get_session)):
+    body = await request.json()
+    result = await execute_function("image-search", body, user, session, request)
+    await session.commit()
+    return result
 
 
 @router.post("/ai/product-assistant")

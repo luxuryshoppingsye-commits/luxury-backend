@@ -4,6 +4,7 @@ import uuid
 import secrets
 import asyncio
 import logging
+import re
 from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Any
@@ -492,6 +493,7 @@ async def _firebase_auth_payload(
             email=email,
             password=secrets.token_urlsafe(48),
             full_name=display_name,
+            extra_data={"social_profile_completion_required": True},
             phone=body.phone,
             city=body.city,
             role="customer",
@@ -972,6 +974,13 @@ async def update_me(
             profile_extra.pop(field, None)
         else:
             profile_extra[field] = _repair_mojibake(str(value).strip())
+    if profile_extra.get("social_profile_completion_required"):
+        phone = str(profile.phone or "").strip()
+        if (len(str(profile.full_name or "").strip()) >= 2
+                and re.fullmatch(r"\+?[0-9\s()-]+", phone)
+                and 7 <= len(re.sub(r"\D", "", phone)) <= 15
+                and len(str(profile.city or "").strip()) >= 3):
+            profile_extra["social_profile_completion_required"] = False
     profile.extra_data = profile_extra
     await session.commit()
     return await auth_payload(session, user, request=request, issue_tokens=False)

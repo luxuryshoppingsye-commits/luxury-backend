@@ -259,7 +259,29 @@ async def test_partner_order_list_detail_report_and_generic_resources_are_scoped
         report_body = report_a.json()
         assert report_body["ordersCount"] == 1
         assert report_body["revenue"] == "25000.00"
+        assert report_body["period"] == "month"
+        assert report_body["grossRevenue"] == "25000.00"
+        assert report_body["averageOrder"] == "25000.00"
+        assert report_body["salesSeries"]
+        assert any(row["revenue"] == "25000.00" for row in report_body["salesSeries"])
+        assert report_body["statusBreakdown"] == [
+            {"status": "processing", "orders": 1, "revenue": "25000.00"}
+        ]
+        assert report_body["topProducts"] == [
+            {
+                "name": seeded["product_a_name"],
+                "quantity": 2,
+                "revenue": "25000.00",
+            }
+        ]
+        assert report_body["customerSummary"] == {
+            "uniqueCustomers": 1,
+            "returningCustomers": 0,
+            "oneTimeCustomers": 1,
+            "averageOrdersPerCustomer": "1.00",
+        }
         assert report_body["aggregation"] == "own_order_items_successful_payments_minus_refunds"
+        _assert_no_cross_merchant_or_customer_leak(report_body, seeded)
 
         for table in ("orders", "order_items", "order_payments", "payment_receipts", "order_status_history", "order_shipping"):
             response = await client.post(

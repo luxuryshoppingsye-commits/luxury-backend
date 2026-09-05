@@ -176,6 +176,15 @@ def _chat_direct_guidance(message: str, language: str) -> str | None:
             if english
             else "افتح المفضلة واضغط القلب المعبأ على المنتج لإزالته."
         )
+    if _has_any_chat_term(
+        message,
+        ["اضافه منتج", "إضافة منتج", "اضيف منتج", "أضيف منتج", "اضف منتج", "أضف منتج", "add product"],
+    ):
+        return (
+            "Open the product details, choose the available options, then tap Add to cart."
+            if english
+            else "لإضافة منتج للشراء، افتح تفاصيله، اختر الخيارات المتاحة، ثم اضغط إضافة للسلة."
+        )
 
     normalized = _normalize_chat_text(message)
     if _has_any_chat_term(
@@ -211,7 +220,13 @@ def _chat_direct_guidance(message: str, language: str) -> str | None:
             if english
             else "تكلفة الشحن ووقت الوصول يظهران أثناء إتمام الطلب حسب العنوان وطريقة التوصيل."
         )
-    if _has_any_chat_term(message, ["ارجاع", "إرجاع", "استبدال", "refund", "return", "exchange"]):
+    if _has_any_chat_term(
+        message,
+        [
+            "ارجاع", "ارجع", "إرجاع", "استبدال", "استبدل", "الغاء طلب", "إلغاء طلب",
+            "refund", "return", "exchange", "cancel order",
+        ],
+    ):
         return (
             "Open the order from My Orders and contact support to request a return or exchange. Keep the order number and product details ready."
             if english
@@ -2194,15 +2209,21 @@ async def execute_function(
                 product.tags = [word for word in product.name.split()[:4]]
         await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
         return {"ok": True, "updated": len(products)}
-    if function_name in {"image-search", "product-images"}:
-        ai_ledger_id = await _reserve_ai_usage(
-            function_name=function_name,
-            body=body,
-            user=user,
-            roles=roles,
-            session=session,
-            request=request,
-        )
+    if function_name == "image-search":
+        from .image_search import search_catalog_image
+
+        return await search_catalog_image(body, session)
+    if function_name == "product-images":
+        ai_ledger_id = None
+        if user is not None or function_name != "image-search":
+            ai_ledger_id = await _reserve_ai_usage(
+                function_name=function_name,
+                body=body,
+                user=user,
+                roles=roles,
+                session=session,
+                request=request,
+            )
         products = list(
             (
                 await session.execute(
@@ -2213,7 +2234,8 @@ async def execute_function(
                 )
             ).scalars()
         )
-        await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
+        if ai_ledger_id is not None:
+            await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
         return {"matches": [serialize_record(item) for item in products], "configured": True, "request_id": current_request_id()}
     if function_name in {"ai-product-assistant", "ai-chat-support"}:
         ai_ledger_id = await _reserve_ai_usage(

@@ -202,8 +202,10 @@ PUBLIC_POST_PATHS = frozenset(
     {
         "/ai/chat",
         "/ai/product-assistant",
+        "/ai/image-search",
         "/api/ai/chat",
         "/api/ai/product-assistant",
+        "/api/ai/image-search",
         "/api/operations/ai/chat",
         "/api/operations/ai/product-assistant",
         "/api/catalog/cart/hydrate",
@@ -444,6 +446,8 @@ def policy_for_route(method: str, path: str) -> ApiProtectionPolicy:
     if method == "POST" and normalized == "/api/analytics/events":
         return _policy("public_write", auth=False, rate="public_read", public=True, audit=False)
     if method == "POST" and normalized == "/api/partnership/apply":
+        return _policy("public_write", auth=False, rate="support_write", public=True, sensitive=True, audit=True)
+    if method == "POST" and normalized == "/api/communication/contact":
         return _policy("public_write", auth=False, rate="support_write", public=True, sensitive=True, audit=True)
     if method == "POST" and normalized == "/api/loyalty/initialize":
         return _policy("customer_write", auth=True, rate="customer_write", sensitive=True, audit=True)

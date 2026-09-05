@@ -180,13 +180,20 @@ async def eligible_line(
     variant: ProductVariant | None = None,
     variant_id: uuid.UUID | None = None,
     quantity: int,
+    allow_out_of_stock: bool = False,
 ) -> EligibleLine:
     product = await validate_product_for_sale(session, product)
     variant = await validate_variant_for_sale(product=product, variant=variant, requested_variant_id=variant_id)
     unit = unit_price(product, variant)
     available = variant.stock_quantity if variant is not None else product.stock_quantity
     hard_limit = get_settings().cart_max_quantity_per_item
-    max_quantity = min(hard_limit, int(available)) if product.track_inventory else hard_limit
+    max_quantity = (
+        hard_limit
+        if allow_out_of_stock
+        else min(hard_limit, int(available))
+        if product.track_inventory
+        else hard_limit
+    )
     if quantity > max_quantity:
         raise HTTPException(status_code=409, detail="insufficient_stock" if product.track_inventory else "quantity_limit_exceeded")
     return EligibleLine(

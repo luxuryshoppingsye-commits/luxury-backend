@@ -62,6 +62,7 @@ from ...services.product_identifier import decode_compact_uuid
 from ...services.commerce_rules import (
     eligible_line,
     parse_strict_quantity,
+    validate_product_for_sale,
     validate_customer_checkout_address,
     validate_shipping_address,
 )
@@ -1431,10 +1432,8 @@ async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
                 count = int(local_product_counts.get(item.id, 0) or 0)
             else:
                 count = sum(int(partner_product_counts.get(value, 0) or 0) for value in partner_values)
-            # A local merchant is an explicit admin-managed storefront and
-            # should be discoverable before its first product is published.
-            if not is_local_merchant and count <= 0:
-                continue
+            # Each row above is an active storefront. Keep an approved partner
+            # discoverable before its first product is published as well.
             rows.append(
                 public_storefront_response(
                     item,
@@ -1613,7 +1612,14 @@ async def api_sync_cart(request: Request, user: User = Depends(current_user), se
             variant = (
                 await session.execute(select(ProductVariant).where(ProductVariant.id == variant_id).with_for_update())
             ).scalar_one_or_none()
-        await eligible_line(session, product=product, variant=variant, variant_id=variant_id, quantity=quantity)
+        await eligible_line(
+            session,
+            product=product,
+            variant=variant,
+            variant_id=variant_id,
+            quantity=quantity,
+            allow_out_of_stock=True,
+        )
         validated.append((product_id, variant_id, quantity))
     await session.execute(delete(UserCart).where(UserCart.user_id == user.id))
     rows = []
@@ -1691,7 +1697,14 @@ async def add_cart(
     )
     item = result.scalar_one_or_none()
     target_quantity = (item.quantity if item else 0) + quantity
-    await eligible_line(session, product=product, variant=variant, variant_id=variant_id, quantity=target_quantity)
+    await eligible_line(
+        session,
+        product=product,
+        variant=variant,
+        variant_id=variant_id,
+        quantity=target_quantity,
+        allow_out_of_stock=True,
+    )
     if item:
         item.quantity = target_quantity
     else:
@@ -1760,7 +1773,10 @@ async def add_wishlist(request: Request, response: Response, user: User = Depend
     body = await request.json()
     product_id = _uuid(body.get("productId"), "productId")
     product = await session.get(Product, product_id)
-    await eligible_line(session, product=product, quantity=1)
+    # A wishlist is a saved reference, not a purchase reservation. Keep the
+    # public-catalog checks, but do not reject products that are temporarily
+    # out of stock; stock is enforced by cart and checkout operations.
+    await validate_product_for_sale(session, product)
     existing = await session.execute(select(Wishlist).where(Wishlist.user_id == user.id, Wishlist.product_id == product_id))
     item = existing.scalar_one_or_none()
     if item is None:
@@ -1907,8 +1923,14 @@ def _partner_request_payload(row: Any) -> dict[str, Any]:
         **serialize_record(row),
         "request_type": payload.get("request_type") or "custom",
         "title": payload.get("title") or "طلب تاجر",
+        "product_name": payload.get("product_name") or "",
         "description": payload.get("description") or "",
+        "quantity": payload.get("quantity") or 1,
         "estimated_value": payload.get("estimated_value"),
+        "needed_by": payload.get("needed_by") or "",
+        "priority": payload.get("priority") or "normal",
+        "contact_phone": payload.get("contact_phone") or "",
+        "reference_url": payload.get("reference_url") or "",
     }
 
 
@@ -1940,19 +1962,7 @@ async def api_create_partner_request(
 ):
     if "partner" not in roles:
         raise HTTPException(status_code=403, detail="partner_required")
-    body = await request.json()
-    title = str(body.get("title") or "").strip()
-    if not title:
-        raise HTTPException(status_code=422, detail="title_required")
-    request_type = str(body.get("request_type") or "custom").strip() or "custom"
-    description = str(body.get("description") or "").strip()
-    estimated_value = body.get("estimated_value")
-    payload = {
-        "request_type": request_type,
-        "title": title,
-        "description": description,
-        "estimated_value": estimated_value,
-    }
+    payload = _partner_request_values(await request.json())
     model = MODEL_BY_TABLE["partner_order_requests"]
     async with session.begin_nested():
         row = model(
@@ -1965,6 +1975,106 @@ async def api_create_partner_request(
         await session.flush()
     await session.commit()
     return {"data": _partner_request_payload(row)}
+
+
+_PARTNER_REQUEST_TYPES = {"custom", "sourcing", "customization", "supply", "service", "other"}
+_PARTNER_REQUEST_PRIORITIES = {"low", "normal", "high", "urgent"}
+_PARTNER_REQUEST_EDITABLE_STATUSES = {"pending", "draft", "rejected"}
+
+
+def _partner_request_values(body: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = dict(existing or {})
+    request_type = str(body.get("request_type") if body.get("request_type") is not None else current.get("request_type") or "custom").strip().lower()
+    if request_type not in _PARTNER_REQUEST_TYPES:
+        raise HTTPException(status_code=422, detail="invalid_request_type")
+    title = str(body.get("title") if body.get("title") is not None else current.get("title") or "").strip()
+    product_name = str(body.get("product_name") if body.get("product_name") is not None else current.get("product_name") or title).strip()
+    description = str(body.get("description") if body.get("description") is not None else current.get("description") or "").strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="title_required")
+    if not product_name:
+        raise HTTPException(status_code=422, detail="product_name_required")
+    if not description:
+        raise HTTPException(status_code=422, detail="description_required")
+    raw_quantity = body.get("quantity") if body.get("quantity") is not None else current.get("quantity", 1)
+    try:
+        quantity = int(raw_quantity)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail="invalid_request_quantity") from error
+    if quantity <= 0:
+        raise HTTPException(status_code=422, detail="invalid_request_quantity")
+    raw_value = body.get("estimated_value") if body.get("estimated_value") is not None else current.get("estimated_value")
+    estimated_value = None if raw_value in (None, "") else str(money(raw_value))
+    needed_by = str(body.get("needed_by") if body.get("needed_by") is not None else current.get("needed_by") or "").strip()
+    if needed_by:
+        try:
+            datetime.strptime(needed_by, "%Y-%m-%d")
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="invalid_request_needed_by") from error
+    priority = str(body.get("priority") if body.get("priority") is not None else current.get("priority") or "normal").strip().lower()
+    if priority not in _PARTNER_REQUEST_PRIORITIES:
+        raise HTTPException(status_code=422, detail="invalid_request_priority")
+    return {
+        "request_type": request_type,
+        "title": title,
+        "product_name": product_name,
+        "description": description,
+        "quantity": quantity,
+        "estimated_value": estimated_value,
+        "needed_by": needed_by,
+        "priority": priority,
+        "contact_phone": str(body.get("contact_phone") if body.get("contact_phone") is not None else current.get("contact_phone") or "").strip(),
+        "reference_url": str(body.get("reference_url") if body.get("reference_url") is not None else current.get("reference_url") or "").strip(),
+    }
+
+
+async def _partner_request_row_or_404(
+    session: AsyncSession,
+    *,
+    record_id: uuid.UUID,
+    partner_id: uuid.UUID,
+) -> Any:
+    model = MODEL_BY_TABLE["partner_order_requests"]
+    row = await session.get(model, record_id, with_for_update=True)
+    if row is None or row.partner_id != partner_id or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="partner_request_not_found")
+    if str(row.status or "pending").lower() not in _PARTNER_REQUEST_EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="partner_request_locked")
+    return row
+
+
+@router.patch("/api/partner/requests/{record_id}")
+async def api_update_partner_request(
+    record_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_required")
+    row = await _partner_request_row_or_404(session, record_id=record_id, partner_id=user.id)
+    values = _partner_request_values(await request.json(), _partner_request_payload(row))
+    row.notes = json.dumps(values, ensure_ascii=False)
+    row.extra_data = values
+    await session.commit()
+    return {"data": _partner_request_payload(row)}
+
+
+@router.delete("/api/partner/requests/{record_id}")
+async def api_delete_partner_request(
+    record_id: uuid.UUID,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_required")
+    row = await _partner_request_row_or_404(session, record_id=record_id, partner_id=user.id)
+    row.deleted_at = datetime.now(timezone.utc)
+    row.status = "deleted"
+    await session.commit()
+    return {"ok": True}
 
 
 async def _create_notification(session: AsyncSession, table_name: str, **values: Any) -> None:
@@ -2098,6 +2208,7 @@ async def checkout_preview(
         user_id=user.id,
         subtotal=subtotal,
         product_discount=product_discount,
+        coupon_lines=[(product, item.quantity, unit) for item, product, _variant, unit in lines],
         body=body,
     )
     return {
@@ -2167,6 +2278,7 @@ async def checkout(
             user_id=user.id,
             subtotal=subtotal,
             product_discount=product_discount,
+            coupon_lines=[(product, item.quantity, unit) for item, product, _variant, unit in lines],
             body=body,
         )
         order = Order(
@@ -2319,6 +2431,7 @@ async def create_manual_order(
             user_id=customer.id,
             subtotal=subtotal,
             product_discount=product_discount,
+            coupon_lines=[(product, quantity, unit) for product, _variant, quantity, unit in lines],
             body=body,
         )
         order = Order(

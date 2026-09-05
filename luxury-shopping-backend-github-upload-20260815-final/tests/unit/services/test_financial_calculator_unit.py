@@ -165,3 +165,77 @@ async def test_sync_order_payment_status_maps_paid_and_refunded_totals(monkeypat
     await fc.sync_order_payment_status(object(), order)
 
     assert order.payment_status == "partially_refunded"
+
+
+class _CouponLookupResult:
+    def __init__(self, coupon: object) -> None:
+        self._coupon = coupon
+
+    def scalar_one_or_none(self) -> object:
+        return self._coupon
+
+
+@pytest.mark.asyncio
+async def test_partner_product_coupon_only_discounts_its_eligible_product() -> None:
+    coupon = SimpleNamespace(
+        id=uuid.uuid4(),
+        code="BACK20",
+        amount=Decimal("20.00"),
+        expires_at=None,
+        extra_data={
+            "partner_id": "merchant-1",
+            "scope": "products",
+            "product_ids": ["product-1"],
+            "discount_type": "percentage",
+            "discount_value": 20,
+            "minimum_order_amount": 100,
+        },
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=_CouponLookupResult(coupon)))
+    product = SimpleNamespace(id="product-1", partner_id="merchant-1", category_id="category-1")
+    unrelated_product = SimpleNamespace(id="product-2", partner_id="merchant-2", category_id="category-1")
+
+    discount, coupon_id, meta = await fc._coupon_discount(
+        session,
+        code="BACK20",
+        subtotal=Decimal("2500.00"),
+        user_id=uuid.uuid4(),
+        coupon_lines=[
+            (product, 1, Decimal("1000.00")),
+            (unrelated_product, 1, Decimal("1500.00")),
+        ],
+    )
+
+    assert discount == Decimal("200.00")
+    assert coupon_id == str(coupon.id)
+    assert meta["eligible_subtotal"] == "1000.00"
+
+
+@pytest.mark.asyncio
+async def test_partner_product_coupon_rejects_a_cart_without_its_product() -> None:
+    coupon = SimpleNamespace(
+        id=uuid.uuid4(),
+        code="BACK20",
+        amount=Decimal("20.00"),
+        expires_at=None,
+        extra_data={
+            "partner_id": "merchant-1",
+            "scope": "products",
+            "product_ids": ["product-1"],
+            "discount_type": "percentage",
+            "discount_value": 20,
+        },
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=_CouponLookupResult(coupon)))
+    unrelated_product = SimpleNamespace(id="product-2", partner_id="merchant-2", category_id="category-1")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await fc._coupon_discount(
+            session,
+            code="BACK20",
+            subtotal=Decimal("1500.00"),
+            user_id=uuid.uuid4(),
+            coupon_lines=[(unrelated_product, 1, Decimal("1500.00"))],
+        )
+
+    assert exc_info.value.detail == "coupon_not_applicable"

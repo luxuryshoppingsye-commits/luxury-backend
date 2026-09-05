@@ -142,10 +142,11 @@ async def _create_checkout_order(client: AsyncClient, headers: dict[str, str], p
     return checkout.json()
 
 
-async def test_cart_and_wishlist_reject_non_public_products_and_bad_quantities() -> None:
+async def test_cart_holds_out_of_stock_products_but_rejects_non_public_products_and_bad_quantities() -> None:
     suffix = uuid.uuid4().hex[:8]
     email, password, _ = await _seed_user(f"eligibility_{suffix}")
     approved_id = await _seed_product(f"approved_{suffix}")
+    out_of_stock_id = await _seed_product(f"out_of_stock_{suffix}", stock=0)
     pending_id = await _seed_product(f"pending_{suffix}", approval_status="pending")
     inactive_id = await _seed_product(f"inactive_{suffix}", active=False)
     deleted_id = await _seed_product(f"deleted_{suffix}", deleted=True)
@@ -155,6 +156,27 @@ async def test_cart_and_wishlist_reject_non_public_products_and_bad_quantities()
         headers = await _login(client, email, password)
         approved = await client.post("/cart", headers=headers, json={"productId": str(approved_id), "quantity": 1})
         assert approved.status_code == 201, approved.text
+
+        out_of_stock_cart = await client.post(
+            "/cart",
+            headers=headers,
+            json={"productId": str(out_of_stock_id), "quantity": 1},
+        )
+        assert out_of_stock_cart.status_code == 201, out_of_stock_cart.text
+        cart_read = await client.get("/cart", headers=headers)
+        held_line = next(
+            row for row in cart_read.json() if row["product_id"] == str(out_of_stock_id)
+        )
+        assert held_line["is_available_for_checkout"] is False
+        assert held_line["availability_error"] == "insufficient_stock"
+
+        out_of_stock_wishlist = await client.post(
+            "/wishlist",
+            headers=headers,
+            json={"productId": str(out_of_stock_id)},
+        )
+        assert out_of_stock_wishlist.status_code == 201, out_of_stock_wishlist.text
+        assert out_of_stock_wishlist.json()["product_id"] == str(out_of_stock_id)
 
         pending = await client.post("/cart", headers=headers, json={"productId": str(pending_id), "quantity": 1})
         assert pending.status_code == 409 and pending.json()["detail"] == "product_not_approved"

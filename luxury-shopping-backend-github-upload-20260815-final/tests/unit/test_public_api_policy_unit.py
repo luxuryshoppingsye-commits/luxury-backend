@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+from fastapi import HTTPException
+
+from backend.app.api.routes.operations import _validated_public_contact_message
 from backend.app.services.api_protection import policy_for_route
 
 
@@ -56,6 +60,11 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
     assert partner_application.authentication_required is False
     assert partner_application.rate_limit_policy == "support_write"
 
+    contact_message = policy_for_route("POST", "/api/communication/contact")
+    assert contact_message.authentication_required is False
+    assert contact_message.policy_name == "public_write"
+    assert contact_message.rate_limit_policy == "support_write"
+
     loyalty_initialize = policy_for_route("POST", "/api/loyalty/initialize")
     assert loyalty_initialize.authentication_required is True
     assert loyalty_initialize.rate_limit_policy == "customer_write"
@@ -78,3 +87,19 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
     for method, path in protected_writes:
         policy = policy_for_route(method, path)
         assert policy.authentication_required is True, (method, path)
+
+
+def test_public_contact_message_reports_the_short_message_requirement() -> None:
+    with pytest.raises(HTTPException) as error:
+        _validated_public_contact_message(
+            {
+                'name': 'عميل اختبار',
+                'email': 'customer@example.com',
+                'subject': 'طلب',
+                'message': 'قصير',
+            }
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.detail['code'] == 'contact_message_too_short'
+    assert '10 أحرف' in error.value.detail['message']

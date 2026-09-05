@@ -162,6 +162,7 @@ async def _coupon_discount(
     code: str | None,
     subtotal: Decimal,
     user_id: uuid.UUID,
+    coupon_lines: list[tuple[Product, int, Decimal]] | None = None,
 ) -> tuple[Decimal, str | None, dict[str, Any]]:
     if not code:
         return Decimal("0.00"), None, {"source": "none"}
@@ -183,6 +184,37 @@ async def _coupon_discount(
     if coupon.expires_at and coupon.expires_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=404, detail="coupon_expired")
     extra = dict(coupon.extra_data or {})
+    valid_from_text = extra.get("valid_from")
+    if valid_from_text:
+        try:
+            valid_from = datetime.fromisoformat(str(valid_from_text).replace("Z", "+00:00"))
+            if valid_from.tzinfo is None:
+                valid_from = valid_from.replace(tzinfo=timezone.utc)
+            if valid_from.astimezone(timezone.utc) > datetime.now(timezone.utc):
+                raise HTTPException(status_code=409, detail="coupon_not_started")
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail="coupon_not_started") from error
+    partner_id = str(extra.get("partner_id") or "").strip()
+    scope = str(extra.get("scope") or "all").lower().strip()
+    product_ids = {str(item) for item in extra.get("product_ids") or []}
+    category_ids = {str(item) for item in extra.get("category_ids") or []}
+    eligible_subtotal = subtotal
+    if partner_id or scope in {"products", "categories"}:
+        eligible_subtotal = Decimal("0.00")
+        for product, quantity, unit in coupon_lines or []:
+            if partner_id and str(product.partner_id or "") != partner_id:
+                continue
+            if scope == "products" and str(product.id) not in product_ids:
+                continue
+            if scope == "categories" and str(product.category_id or "") not in category_ids:
+                continue
+            eligible_subtotal += line_total(unit, quantity)
+        eligible_subtotal = money(eligible_subtotal)
+        if eligible_subtotal <= 0:
+            raise HTTPException(status_code=409, detail="coupon_not_applicable")
+    minimum_order = money_or_zero(extra.get("minimum_order_amount"))
+    if minimum_order > 0 and eligible_subtotal < minimum_order:
+        raise HTTPException(status_code=409, detail="coupon_minimum_not_met")
     usage_limit = int(extra.get("usage_limit") or extra.get("max_uses") or 0)
     if usage_limit > 0:
         used = int(
@@ -216,20 +248,49 @@ async def _coupon_discount(
         )
         if user_used >= per_user_limit:
             raise HTTPException(status_code=409, detail="coupon_user_usage_limit")
+    audience = str(extra.get("audience") or "all").lower().strip()
+    if audience == "new_customers":
+        prior_orders = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(Order).where(
+                        Order.user_id == user_id,
+                        Order.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one()
+        )
+        if prior_orders > 0:
+            raise HTTPException(status_code=409, detail="coupon_audience_not_eligible")
+    elif audience == "loyalty_members":
+        loyalty_model = MODEL_BY_TABLE["user_loyalty"]
+        loyalty = (
+            await session.execute(
+                select(loyalty_model).where(
+                    loyalty_model.user_id == user_id,
+                    loyalty_model.deleted_at.is_(None),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if loyalty is None:
+            raise HTTPException(status_code=409, detail="coupon_audience_not_eligible")
     discount_type = str(extra.get("discount_type") or extra.get("type") or "fixed").lower().strip()
     raw_value = extra.get("discount_value") if extra.get("discount_value") is not None else coupon.amount
     if discount_type in {"percentage", "percent"}:
         percentage = min(money(raw_value or 0), Decimal("100.00"))
-        discount = money(subtotal * percentage / Decimal("100"))
+        discount = money(eligible_subtotal * percentage / Decimal("100"))
     elif discount_type == "free_shipping":
         discount = Decimal("0.00")
     else:
-        discount = min(money(raw_value or 0), subtotal)
+        discount = min(money(raw_value or 0), eligible_subtotal)
     return discount, str(coupon.id), {
         "source": "coupon",
         "code": coupon.code,
         "coupon_id": str(coupon.id),
         "discount_type": discount_type,
+        "discount_value": str(raw_value or 0),
+        "eligible_subtotal": str(eligible_subtotal),
+        "minimum_order_amount": str(minimum_order),
         "free_shipping": discount_type == "free_shipping",
     }
 
@@ -306,13 +367,18 @@ async def calculate_checkout_financials(
     subtotal: Decimal,
     body: dict[str, Any],
     product_discount: Decimal = Decimal("0.00"),
+    coupon_lines: list[tuple[Product, int, Decimal]] | None = None,
 ) -> CheckoutFinancials:
     subtotal = money(subtotal)
     product_discount = min(money(product_discount), subtotal)
     merchandise_total = money(subtotal - product_discount)
     coupon_code = body.get("couponCode") or body.get("coupon_code")
     coupon_discount, coupon_id, coupon_meta = await _coupon_discount(
-        session, code=str(coupon_code).strip() if coupon_code else None, subtotal=merchandise_total, user_id=user_id
+        session,
+        code=str(coupon_code).strip() if coupon_code else None,
+        subtotal=merchandise_total,
+        user_id=user_id,
+        coupon_lines=coupon_lines,
     )
     after_coupon = max(merchandise_total - coupon_discount, Decimal("0.00"))
     loyalty_discount, loyalty_meta = await _loyalty_discount(
