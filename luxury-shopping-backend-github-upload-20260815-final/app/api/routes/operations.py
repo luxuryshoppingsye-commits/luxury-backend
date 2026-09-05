@@ -8978,6 +8978,32 @@ async def unread_notifications_count(user: User = Depends(current_user), session
     return {"unread": unread}
 
 
+@router.get("/api/partner/notifications")
+async def partner_notifications(
+    limit: int = Query(100, ge=1, le=500),
+    user: User = Depends(require_partner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return only notifications for customer orders that belong to this merchant."""
+    model = MODEL_BY_TABLE["notifications"]
+    partner_order_ids = select(OrderItem.order_id).where(OrderItem.partner_id == user.id)
+    where_clause = and_(
+        _notification_visible_clause(model, user.id),
+        model.order_id.in_(partner_order_ids),
+    )
+    try:
+        result = await session.execute(
+            select(model)
+            .where(where_clause)
+            .order_by(model.created_at.desc())
+            .limit(limit)
+        )
+        return {"data": [serialize_record(row) for row in result.scalars()]}
+    except Exception:
+        await session.rollback()
+        return {"data": []}
+
+
 @router.patch("/notifications/{notification_id}/read")
 @router.patch("/api/notifications/{notification_id}/read")
 async def read_notification(notification_id: uuid.UUID, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):

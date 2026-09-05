@@ -70,10 +70,15 @@ Background Worker باسم `luxury-shopping-message-worker` بنفس كود ال
 - `GEMINI_API_KEY`
 - `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`
 - `EMAIL_PROVIDER=resend`
-- `RESEND_API_KEY`, `RESEND_FROM_EMAIL` من نطاق موثّق في Resend
+- `RESEND_API_KEY`
+- `RESEND_FROM_EMAIL=no-reply@luxuryshoppings.com` من نطاق موثّق في Resend
 - بديل SMTP عند الحاجة: `EMAIL_PROVIDER=smtp` مع `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`
 
 القيم العامة الخاصة بالذكاء الاصطناعي والإشعارات موجودة في `render.yaml`. المتغيرات السرية لا تُحفظ في GitHub.
+
+### وصول رموز التفعيل إلى البريد الوارد
+
+رسائل التفعيل في الإنتاج تستخدم Resend فقط، ولا ترجع تلقائيًا إلى Gmail. من لوحة Resend أضف النطاق `luxuryshoppings.com`، ثم انسخ سجلات DNS التي تعرضها اللوحة كما هي إلى مزود النطاق: سجلات DKIM وSPF وMX الخاصة بـ Resend. لا تنشئ سجل SPF ثانياً؛ ادمج قيمة Resend في سجل SPF الوحيد للنطاق. بعد نجاح التحقق، حدّث DMARC تدريجيًا من `p=none` إلى `p=quarantine` بعد مراجعة تقارير `rua`، ثم أضف مفتاحي Resend في خدمة Render. لا تضع هذه القيم السرية في GitHub.
 
 ## التحقق بعد النشر
 

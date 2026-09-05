@@ -492,16 +492,19 @@ async def authenticate(session: AsyncSession, email: str, password: str, ip: str
     await check_login_rate_limit(session, normalized, ip)
     result = await session.execute(select(User).where(func.lower(User.email) == normalized))
     user = result.scalar_one_or_none()
-    if user is None or user.deleted_at is not None:
+    if user is None:
         await record_login_attempt(session, normalized, ip, False, "unknown_or_inactive_user")
-        raise HTTPException(status_code=401, detail="invalid_login")
+        raise HTTPException(status_code=401, detail="email_not_registered")
+    if user.deleted_at is not None:
+        await record_login_attempt(session, normalized, ip, False, "unknown_or_inactive_user")
+        raise HTTPException(status_code=401, detail="account_unavailable")
     account_state = await account_security_for(session, user.id)
     if account_state.account_status != ACTIVE_ACCOUNT_STATUS:
         await record_login_attempt(session, normalized, ip, False, "account_not_active")
         raise HTTPException(status_code=403, detail=account_state.account_status or "account_not_active")
     if not user.is_active:
         await record_login_attempt(session, normalized, ip, False, "unknown_or_inactive_user")
-        raise HTTPException(status_code=401, detail="invalid_login")
+        raise HTTPException(status_code=401, detail="account_unavailable")
     try:
         valid, needs_rehash = await asyncio.wait_for(
             asyncio.to_thread(verify_password, password, user.password_hash, user.password_salt),
@@ -512,7 +515,7 @@ async def authenticate(session: AsyncSession, email: str, password: str, ip: str
         raise HTTPException(status_code=503, detail="auth_temporarily_unavailable") from error
     if not valid:
         await record_login_attempt(session, normalized, ip, False, "bad_password")
-        raise HTTPException(status_code=401, detail="invalid_login")
+        raise HTTPException(status_code=401, detail="invalid_password")
     if needs_rehash:
         user.password_hash = await asyncio.to_thread(hash_password, password)
         user.password_salt = None

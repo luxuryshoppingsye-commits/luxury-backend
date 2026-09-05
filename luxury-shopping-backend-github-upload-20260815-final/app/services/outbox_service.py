@@ -146,7 +146,18 @@ def _email_provider_mode(settings: Any) -> str:
         return "resend"
     if requested == "smtp":
         return "smtp"
-    return "resend" if getattr(settings, "resend_api_key", "") and getattr(settings, "resend_from_email", "") else "smtp"
+    if getattr(settings, "resend_api_key", "") and getattr(settings, "resend_from_email", ""):
+        return "resend"
+    # Transactional security mail sent by a production storefront must come
+    # from a verified sending domain. Do not silently fall back to a generic
+    # mailbox when Resend has not been configured: that fallback is prone to
+    # spam placement and makes the sender identity inconsistent.
+    if str(getattr(settings, "app_env", "") or "").strip().lower() in {
+        "production",
+        "staging",
+    }:
+        return "resend"
+    return "smtp"
 
 
 def email_delivery_configured(settings: Any | None = None) -> bool:

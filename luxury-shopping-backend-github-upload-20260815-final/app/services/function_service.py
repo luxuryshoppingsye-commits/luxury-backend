@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..models import MODEL_BY_TABLE
-from ..models.domain import Category, LoginAttempt, Order, Product, Profile, User, UserRole
+from ..models.domain import Category, LoginAttempt, Order, OrderItem, Product, Profile, User, UserRole
 from ..repositories.resources import serialize_record
 from ..security.passwords import hash_password
 from .api_protection import (
@@ -1980,18 +1980,66 @@ async def execute_function(
         order = await session.get(Order, order_id)
         if order is None or (order.user_id != actor.id and not roles.intersection(STAFF_ROLES)):
             raise HTTPException(status_code=404, detail="order_not_found")
-        model = MODEL_BY_TABLE["support_tickets"]
-        target = _text(body, "target", "p_target", default="admin")
+        target = _text(body, "target", "p_target", default="admin").lower()
+        if target not in {"admin", "partner"}:
+            raise HTTPException(status_code=422, detail="delay_ticket_target_invalid")
         message = _text(body, "message", "p_message")
+        if len(message) < 3:
+            raise HTTPException(status_code=422, detail="delay_ticket_message_required")
+        partner_ids: list[uuid.UUID] = []
+        if target == "partner":
+            partner_rows = await session.execute(
+                select(OrderItem.partner_id)
+                .where(OrderItem.order_id == order.id, OrderItem.partner_id.is_not(None))
+                .distinct()
+            )
+            partner_ids = list(partner_rows.scalars())
+            if not partner_ids:
+                raise HTTPException(status_code=422, detail="merchant_contact_unavailable")
+        model = MODEL_BY_TABLE["support_tickets"]
         row = model(
             user_id=actor.id,
             subject=f"بلاغ تأخير الطلب {order.order_number}",
             status="open",
             description=message,
-            extra_data={"order_id": str(order.id), "target": target},
+            extra_data={
+                "order_id": str(order.id),
+                "target": target,
+                "partner_ids": [str(partner_id) for partner_id in partner_ids],
+            },
         )
         session.add(row)
         await session.flush()
+        message_model = MODEL_BY_TABLE["ticket_messages"]
+        session.add(
+            message_model(
+                ticket_id=row.id,
+                sender_id=actor.id,
+                message=message,
+                is_staff=False,
+                extra_data={"created_from": "order_delay_ticket", "target": target},
+            )
+        )
+        if partner_ids:
+            notifications = NotificationService(session)
+            for partner_id in partner_ids:
+                await notifications.create_notification(
+                    NotificationPayload(
+                        user_id=partner_id,
+                        title="رسالة عميل بخصوص طلب",
+                        body=f"لديك رسالة بخصوص الطلب {order.order_number}.",
+                        notification_type="support_ticket",
+                        category="support",
+                        priority="high",
+                        entity_type="support_ticket",
+                        entity_id=str(row.id),
+                        order_id=order.id,
+                        payload={"ticket_id": str(row.id), "target": "partner"},
+                        created_by=actor.id,
+                        source="order_delay_ticket",
+                        deduplication_key=f"order-delay-ticket:{row.id}:{partner_id}",
+                    )
+                )
         return serialize_record(row)
     if function_name in {"create_user_notification", "create_user_notifications"}:
         actor = _require_user(user)

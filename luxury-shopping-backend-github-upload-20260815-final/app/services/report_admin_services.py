@@ -1234,15 +1234,35 @@ class SupportWorkflowService:
             raise HTTPException(status_code=422, detail="support_description_required")
 
     @staticmethod
+    def _partner_recipient_ids(row: Any) -> set[str]:
+        extra = row.extra_data or {}
+        values = extra.get("partner_ids") if isinstance(extra, dict) else None
+        if not isinstance(values, (list, tuple, set)):
+            return set()
+        return {str(value).strip() for value in values if str(value).strip()}
+
+    @classmethod
+    def _is_target_partner(cls, row: Any, user: User, roles: set[str]) -> bool:
+        return "partner" in roles and str(user.id) in cls._partner_recipient_ids(row)
+
+    @staticmethod
     def _can_view(row: Any, user: User, roles: set[str]) -> bool:
-        return bool(roles.intersection(SUPPORT_STAFF_ROLES) or row.user_id == user.id)
+        return bool(
+            roles.intersection(SUPPORT_STAFF_ROLES)
+            or row.user_id == user.id
+            or SupportWorkflowService._is_target_partner(row, user, roles)
+        )
 
     async def list(self, session: AsyncSession, *, user: User, roles: set[str], limit: int = 500) -> list[dict[str, Any]]:
         model = MODEL_BY_TABLE["support_tickets"]
         statement = select(model).where(model.deleted_at.is_(None)).order_by(model.created_at.desc()).limit(min(limit, 500))
-        if not roles.intersection(SUPPORT_STAFF_ROLES):
+        if not roles.intersection(SUPPORT_STAFF_ROLES) and "partner" not in roles:
             statement = statement.where(model.user_id == user.id)
-        return [serialize_record(row) for row in (await session.execute(statement)).scalars()]
+        return [
+            serialize_record(row)
+            for row in (await session.execute(statement)).scalars()
+            if self._can_view(row, user, roles)
+        ]
 
     async def get(self, session: AsyncSession, *, ticket_id: uuid.UUID, user: User, roles: set[str]) -> Any:
         row = await session.get(MODEL_BY_TABLE["support_tickets"], ticket_id)
@@ -1307,28 +1327,43 @@ class SupportWorkflowService:
         if len(message) < 2 or message.lower() in PLACEHOLDER_TEXT:
             raise HTTPException(status_code=422, detail="support_message_required")
         is_staff = bool(roles.intersection(SUPPORT_STAFF_ROLES))
+        is_target_partner = self._is_target_partner(ticket, user, roles)
+        is_responder = is_staff or is_target_partner
         model = MODEL_BY_TABLE["ticket_messages"]
-        row = model(ticket_id=ticket.id, sender_id=user.id, message=message, is_staff=is_staff, extra_data={"customer_visible": not bool(body.get("internal"))})
+        row = model(
+            ticket_id=ticket.id,
+            sender_id=user.id,
+            message=message,
+            is_staff=is_responder,
+            extra_data={
+                "customer_visible": not bool(body.get("internal")),
+                "sender_role": "partner" if is_target_partner else "staff" if is_staff else "customer",
+            },
+        )
         session.add(row)
         extra = dict(ticket.extra_data or {})
         workflow = list(extra.get("workflow") or [])
-        workflow.append({"status": "staff_reply" if is_staff else "customer_reply", "at": _now().isoformat(), "by": str(user.id)})
+        workflow.append({
+            "status": "partner_reply" if is_target_partner else "staff_reply" if is_staff else "customer_reply",
+            "at": _now().isoformat(),
+            "by": str(user.id),
+        })
         extra["workflow"] = workflow
-        if is_staff:
+        if is_responder:
             sla = dict(extra.get("sla") or {})
             sla.setdefault("first_response_at", _now().isoformat())
             extra["sla"] = sla
             await NotificationService(session).create_notification(
                 NotificationPayload(
                     user_id=ticket.user_id,
-                    title="Support reply",
+                    title="رد من التاجر" if is_target_partner else "رد من الدعم",
                     body=message[:240],
-                    notification_type="support_reply",
+                    notification_type="merchant_reply" if is_target_partner else "support_reply",
                     category="support",
                     priority="normal",
                     entity_type="support_ticket",
                     entity_id=str(ticket.id),
-                    payload={"ticket_id": str(ticket.id)},
+                    payload={"ticket_id": str(ticket.id), "sender": "partner" if is_target_partner else "support"},
                     created_by=user.id,
                     source="support",
                     deduplication_key=f"support-ticket-reply:{ticket.id}:{row.id}",

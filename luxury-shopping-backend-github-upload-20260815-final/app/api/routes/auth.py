@@ -466,18 +466,27 @@ async def _firebase_auth_payload(
     session: AsyncSession,
 ) -> dict[str, Any]:
     claims = await verify_firebase_id_token(body.id_token)
-    # Never bind a Firebase identity to a local account using an unverified
-    # email claim. Google/Apple social sign-in must prove ownership of the
-    # address before the backend can create or resume a local session.
-    if claims.get("email_verified") is not True:
-        raise HTTPException(status_code=403, detail="firebase_email_not_verified")
+    firebase_meta = claims.get("firebase") if isinstance(claims.get("firebase"), dict) else {}
+    firebase_uid = str(claims.get("uid") or claims.get("sub") or "").strip()
+    token_provider = str(firebase_meta.get("sign_in_provider") or "").strip()
+    requested_provider = str(body.provider or "").strip()
+    # The provider is a claim in the Firebase-signed token. Do not let a
+    # caller label a credential from one provider as another provider.
+    if token_provider and requested_provider and token_provider != requested_provider:
+        raise HTTPException(status_code=401, detail="firebase_provider_mismatch")
+    provider = (token_provider or requested_provider or "firebase")[:80]
+
     email = str(claims.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(status_code=422, detail="firebase_email_required")
 
-    firebase_meta = claims.get("firebase") if isinstance(claims.get("firebase"), dict) else {}
-    firebase_uid = str(claims.get("uid") or claims.get("sub") or "").strip()
-    provider = str(body.provider or firebase_meta.get("sign_in_provider") or "firebase").strip()[:80]
+    email_verified = claims.get("email_verified") is True
+    # Apple can supply a private relay address and omit email_verified from a
+    # Firebase token. The token itself has already been verified above, and
+    # this exception is limited to the provider claim signed by Firebase.
+    trusted_apple_identity = provider == "apple.com" and bool(firebase_uid)
+    if not email_verified and not trusted_apple_identity:
+        raise HTTPException(status_code=403, detail="firebase_email_not_verified")
     now = datetime.now(timezone.utc)
 
     result = await session.execute(select(User).where(func.lower(User.email) == email))
@@ -507,7 +516,7 @@ async def _firebase_auth_payload(
         raise HTTPException(status_code=403, detail=account_state.account_status or "account_not_active")
 
     account_state.account_status = "active"
-    if claims.get("email_verified") is True and account_state.email_verified_at is None:
+    if (email_verified or trusted_apple_identity) and account_state.email_verified_at is None:
         account_state.email_verified_at = now
     user.is_active = True
     user.last_login_at = now
