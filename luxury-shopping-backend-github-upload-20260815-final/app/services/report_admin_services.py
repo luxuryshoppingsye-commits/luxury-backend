@@ -925,12 +925,18 @@ class CampaignService:
                 if exists:
                     continue
                 status = "sent"
-                if settings.app_env != "test" and channel in {"email", "whatsapp", "push"}:
+                if settings.app_env != "test" and channel in {"email", "whatsapp"}:
                     status = "blocked_credentials"
                     blocked_credentials += 1
                 else:
-                    sent += 1
-                    if channel in {"in_app", "push"}:
+                    pref = await notification.preferences_for(recipient_id)
+                    enabled = pref.promotional_notifications and (
+                        pref.mobile_push_enabled if channel == "push" else pref.in_app_enabled
+                    )
+                    if channel in {"in_app", "push"} and not enabled:
+                        status = "suppressed_by_preference"
+                    elif channel in {"in_app", "push"}:
+                        sent += 1
                         await notification.create_notification(
                             NotificationPayload(
                                 user_id=recipient_id,
@@ -942,9 +948,12 @@ class CampaignService:
                                 payload={"campaign_id": str(row.id), "channel": channel},
                                 created_by=row.created_by,
                                 source="campaign_worker",
+                                delivery_channels=("mobile_push",) if channel == "push" else ("in_app",),
                                 deduplication_key=dedupe,
                             )
                         )
+                    else:
+                        sent += 1
                 session.add(
                     event_model(
                         user_id=recipient_id,
