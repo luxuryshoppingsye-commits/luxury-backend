@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -26,12 +27,22 @@ class MessageWorker:
         self.worker_id = worker_id or f"message-worker-{uuid.uuid4()}"
         self.poll_seconds = poll_seconds
         self._stop = asyncio.Event()
+        self._next_cart_scan = 0.0
 
     def stop(self) -> None:
         self._stop.set()
 
     async def run_once(self) -> dict[str, Any]:
         settings = get_settings()
+        if time.monotonic() >= self._next_cart_scan:
+            self._next_cart_scan = time.monotonic() + 60
+            try:
+                from ..services.cart_recovery_service import process_cart_recovery
+                async with SessionFactory() as recovery_session:
+                    await process_cart_recovery(recovery_session, limit=settings.message_batch_size)
+                    await recovery_session.commit()
+            except Exception as exc:
+                logger.warning("Cart recovery scan failed: %s", exc.__class__.__name__)
         async with SessionFactory() as session:
             # Publish liveness before touching any provider or outbox row. This
             # keeps the health endpoint useful even when an external provider

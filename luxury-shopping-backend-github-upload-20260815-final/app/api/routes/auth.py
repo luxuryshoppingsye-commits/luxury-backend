@@ -77,6 +77,16 @@ EMAIL_OUTBOX = MODEL_BY_TABLE["email_outbox"]
 WHATSAPP_OUTBOX = MODEL_BY_TABLE["whatsapp_outbox"]
 
 
+async def _welcome_customer(session: AsyncSession, user_id: uuid.UUID) -> None:
+    await NotificationService(session).create_notification(NotificationPayload(
+        user_id=user_id, title="مرحبًا بك في رفاهية التسوق",
+        body="أهلًا بك في رفاهية التسوق. نتمنى لك تجربة تسوق مميزة.",
+        notification_type="customer_welcome", category="system", action_url="/",
+        deduplication_key=f"customer-welcome:{user_id}",
+        delivery_channels=("in_app", "mobile_push", "web_push"),
+    ))
+
+
 async def _queue_email_push_mirror(
     session: AsyncSession,
     *,
@@ -435,6 +445,9 @@ def _web_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+REMEMBER_ME_COOKIE = "luxury_remember_me"
+
+
 def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent: bool = True) -> None:
     secure_cookie = get_settings().app_env in {"production", "staging"}
     cookie_options: dict[str, Any] = {
@@ -455,6 +468,12 @@ def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent:
         if persistent:
             refresh_cookie_options["max_age"] = 60 * 60 * 24 * 30
         response.set_cookie("rt", str(token), **refresh_cookie_options)
+    if persistent:
+        remember_cookie_options = dict(cookie_options)
+        remember_cookie_options["max_age"] = 60 * 60 * 24 * 30
+        response.set_cookie(REMEMBER_ME_COOKIE, "1", **remember_cookie_options)
+    else:
+        response.delete_cookie(REMEMBER_ME_COOKIE, path="/")
 
 
 BLOCKED_FIREBASE_ACCOUNT_STATUSES = {"disabled", "deleted", "anonymized", "deletion_pending", "merchant_rejected"}
@@ -509,6 +528,7 @@ async def _firebase_auth_payload(
             account_status="active",
             is_active=True,
         )
+        await _welcome_customer(session, user.id)
 
     account_state = await account_security_for(session, user.id, for_update=True)
     if account_state.account_status in BLOCKED_FIREBASE_ACCOUNT_STATUSES:
@@ -776,6 +796,7 @@ async def web_refresh(
     session: AsyncSession = Depends(get_session),
 ):
     token = request.cookies.get("rt")
+    persistent = request.cookies.get(REMEMBER_ME_COOKIE) == "1"
     try:
         body = await request.json()
         if isinstance(body, dict):
@@ -790,7 +811,7 @@ async def web_refresh(
         await session.commit()
         raise
     await session.commit()
-    _set_refresh_cookie(response, payload)
+    _set_refresh_cookie(response, payload, persistent=persistent)
     return _web_auth_payload(payload)
 
 
@@ -816,6 +837,7 @@ async def web_logout(request: Request, response: Response, session: AsyncSession
     result = {"ok": True}
     response.delete_cookie("at", path="/")
     response.delete_cookie("rt", path="/")
+    response.delete_cookie(REMEMBER_ME_COOKIE, path="/")
     return result
 
 
@@ -1089,6 +1111,7 @@ async def verify_email_alias(
         account_state.account_status = "active"
         user.is_active = True
         account_state.disabled_at = None
+        await _welcome_customer(session, user.id)
     await bump_security_version(session, user, reason="email_verified", request=request)
     await record_security_event(
         session,

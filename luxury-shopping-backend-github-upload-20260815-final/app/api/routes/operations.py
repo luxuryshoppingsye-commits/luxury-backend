@@ -5232,6 +5232,14 @@ async def api_create_store_review(request: Request, user: User = Depends(current
 async def api_update_store_review_status(review_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = _normalize_store_review_status_payload(await request.json())
     row = await _api_update(session, "store_reviews", review_id, body, staff)
+    if row.get("user_id") and (row.get("is_approved") is True or row.get("status") in {"approved", "active", "published"}):
+        await NotificationService(session).create_notification(NotificationPayload(
+            user_id=uuid.UUID(str(row["user_id"])), title="تم قبول تقييمك",
+            body="شكرًا لمشاركتنا تجربتك. تمت الموافقة على تقييمك في رفاهية التسوق.",
+            notification_type="store_review_approved", category="system", action_url="/",
+            deduplication_key=f"store-review-approved:{review_id}",
+            delivery_channels=("in_app", "mobile_push", "web_push"),
+        ))
     await session.commit()
     return {"data": row}
 

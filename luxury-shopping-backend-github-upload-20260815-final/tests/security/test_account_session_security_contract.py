@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse, urlsplit
@@ -9,6 +10,8 @@ from urllib.parse import parse_qs, urlparse, urlsplit
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
+from starlette.requests import Request
+from starlette.responses import Response
 
 from app.api.routes import auth as auth_routes
 from app.config import get_settings
@@ -62,6 +65,45 @@ async def _login(client: AsyncClient, email: str, password: str) -> dict[str, st
     }
 
 
+async def test_web_refresh_keeps_a_remembered_session_persistent(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def rotate(_session: object, token: str, _request: Request) -> dict[str, object]:
+        assert token == "old-refresh-token"
+        return {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+            "roles": [],
+        }
+
+    class Session:
+        async def commit(self) -> None:
+            return None
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    monkeypatch.setattr(auth_routes, "rotate_refresh_token", rotate)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/auth/refresh",
+            "headers": [
+                (b"cookie", b"rt=old-refresh-token; luxury_remember_me=1"),
+                (b"content-type", b"application/json"),
+            ],
+        },
+        receive,
+    )
+    response = Response()
+
+    await auth_routes.web_refresh(request, response, Session())
+
+    cookies = response.headers.getlist("set-cookie")
+    assert any("rt=new-refresh-token" in header and "Max-Age=2592000" in header for header in cookies)
+    assert any("luxury_remember_me=1" in header and "Max-Age=2592000" in header for header in cookies)
+
+
 async def _latest_email_token(user_id: uuid.UUID, purpose_key: str) -> str:
     async with SessionFactory() as session:
         outbox = MODEL_BY_TABLE["email_outbox"]
@@ -80,6 +122,28 @@ async def _latest_email_token(user_id: uuid.UUID, purpose_key: str) -> str:
                 if token:
                     return token
     raise AssertionError(f"missing email token for {purpose_key}")
+
+
+async def _latest_password_reset_otp(user_id: uuid.UUID) -> str:
+    async with SessionFactory() as session:
+        outbox = MODEL_BY_TABLE["email_outbox"]
+        rows = (
+            await session.execute(
+                select(outbox)
+                .where(outbox.user_id == user_id)
+                .order_by(outbox.created_at.desc())
+            )
+        ).scalars().all()
+        for row in rows:
+            extra = row.extra_data or {}
+            if extra.get("delivery_method") != "otp":
+                continue
+            assert "reset_url" not in extra
+            assert "http" not in row.message.lower()
+            match = re.search(r"(?<!\d)(\d{6})(?!\d)", row.message)
+            if match:
+                return match.group(1)
+    raise AssertionError("missing password reset OTP")
 
 
 async def _latest_email_verification_code(user_id: uuid.UUID) -> str:
@@ -267,6 +331,40 @@ async def test_password_reset_latest_only_and_invalidates_old_access_and_refresh
                 )
             )
             assert int(active_resets.scalar_one()) <= 1
+
+
+async def test_web_password_reset_uses_otp_and_new_password_can_log_in() -> None:
+    _assert_safe_database()
+    user, _ = await _seed_user(f"reset-otp-{uuid.uuid4().hex[:8]}")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        requested = await client.post(
+            "/api/auth/forgot-password",
+            json={"email": user.email, "client_type": "web"},
+        )
+        assert requested.status_code == 200, requested.text
+        assert requested.json()["delivery_method"] == "otp"
+        assert requested.json()["expires_in_minutes"] == 10
+
+        otp = await _latest_password_reset_otp(user.id)
+        verified = await client.post(
+            "/api/auth/password-reset-verify",
+            json={"email": user.email, "code": otp},
+        )
+        assert verified.status_code == 200, verified.text
+        reset_ticket = verified.json()["reset_token"]
+
+        changed = await client.post(
+            "/api/auth/reset-password",
+            json={"token": reset_ticket, "new_password": "OtpResetPass123"},
+        )
+        assert changed.status_code == 200, changed.text
+
+        signed_in = await client.post(
+            "/auth/login",
+            json={"email": user.email, "password": "OtpResetPass123"},
+        )
+        assert signed_in.status_code == 200, signed_in.text
 
 
 async def test_refresh_reuse_revokes_session_family_and_sessions_api_is_owner_scoped() -> None:

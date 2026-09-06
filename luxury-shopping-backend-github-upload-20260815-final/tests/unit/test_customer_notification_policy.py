@@ -8,12 +8,12 @@ from backend.app.models import MODEL_BY_TABLE
 from backend.app.services import notification_service as ns
 
 
-@pytest.mark.parametrize("kind", ["order_status_changed", "order_created", "shipping_update", "payment_reminder", "cart_discount", "coupon", "marketing_campaign"])
+@pytest.mark.parametrize("kind", ["order_status_changed", "order_created", "shipping_update", "payment_reminder", "cart_discount", "coupon", "marketing_campaign", "cart_reminder", "customer_welcome", "ticket_opened", "support_reply", "partner_application_approved", "store_review_approved", "friday_greeting", "message", "info"])
 def test_customer_allowed_categories(kind):
     assert ns.customer_notification_allowed(kind)
 
 
-@pytest.mark.parametrize("kind", ["password_reset_requested", "email_verification_requested", "login", "support_reply", "system", "message", "partner_application_approved", "order_invoice_ready", "payment_receipt", "unknown"])
+@pytest.mark.parametrize("kind", ["password_reset_requested", "email_verification_requested", "login", "system", "order_invoice_ready", "payment_receipt", "unknown"])
 def test_unrelated_customer_notifications_are_hidden(kind):
     assert not ns.customer_notification_allowed(kind)
 

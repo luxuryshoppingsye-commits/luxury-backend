@@ -438,6 +438,8 @@ async def _coupon_payload(
         )
     )
     extra = dict(coupon.extra_data or {})
+    if extra.get("exclusive_user_id") and str(extra["exclusive_user_id"]) != str(user.id):
+        return {"valid": False, "reason": "coupon_audience_not_eligible"}
     per_user = int(extra.get("uses_per_user") or 1)
     if int(prior.scalar_one()) >= per_user:
         return {"valid": False, "reason": "coupon_usage_limit"}

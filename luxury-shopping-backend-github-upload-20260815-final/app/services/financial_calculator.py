@@ -184,6 +184,8 @@ async def _coupon_discount(
     if coupon.expires_at and coupon.expires_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=404, detail="coupon_expired")
     extra = dict(coupon.extra_data or {})
+    if extra.get("exclusive_user_id") and str(extra["exclusive_user_id"]) != str(user_id):
+        raise HTTPException(status_code=409, detail="coupon_audience_not_eligible")
     valid_from_text = extra.get("valid_from")
     if valid_from_text:
         try:

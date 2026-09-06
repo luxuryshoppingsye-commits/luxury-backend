@@ -1318,6 +1318,13 @@ class SupportWorkflowService:
                 extra_data={"roles": ["admin", "manager", "staff"], "ticket_id": str(ticket.id)},
             )
         )
+        await NotificationService(session).create_notification(NotificationPayload(
+            user_id=ticket.user_id, title="تم فتح تذكرة الدعم",
+            body="استلمنا تذكرتك وسيتابع فريق الدعم طلبك.", notification_type="ticket_opened",
+            category="support", entity_type="support_ticket", entity_id=str(ticket.id),
+            action_url="/support", deduplication_key=f"customer-ticket-opened:{ticket.id}",
+            delivery_channels=("in_app", "mobile_push", "web_push"),
+        ))
         await session.commit()
         return serialize_record(ticket)
 

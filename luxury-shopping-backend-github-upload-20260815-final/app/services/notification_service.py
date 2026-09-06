@@ -34,7 +34,65 @@ except ImportError:  # pragma: no cover - exercised when optional dependency is 
     webpush = None
 
 
-CUSTOMER_NOTIFICATION_TYPES = frozenset(['order_created', 'order_update', 'order_status', 'order_status_changed', 'order_status_rolled_back', 'customer_order_cancelled', 'partner_order_status_changed', 'order_confirmed', 'order_processing', 'order_shipped', 'order_delivered', 'order_cancelled', 'order_canceled', 'order_completed', 'order_returned', 'shipping_update', 'shipping_status_changed', 'delivery_update', 'delivery_status_changed', 'payment_reminder', 'payment_due', 'payment_pending', 'payment_due_reminder', 'cart_discount', 'cart_coupon', 'cart_offer', 'cart_discount_available', 'promo', 'promotion', 'promotional', 'marketing', 'marketing_campaign', 'offer', 'offer_published', 'coupon', 'discount'])
+CUSTOMER_NOTIFICATION_TYPES = frozenset([
+    'order_created',
+    'order_update',
+    'order_status',
+    'order_status_changed',
+    'order_status_rolled_back',
+    'customer_order_cancelled',
+    'partner_order_status_changed',
+    'order_confirmed',
+    'order_processing',
+    'order_shipped',
+    'order_delivered',
+    'order_cancelled',
+    'order_canceled',
+    'order_completed',
+    'order_returned',
+    'shipping_update',
+    'shipping_status_changed',
+    'delivery_update',
+    'delivery_status_changed',
+    'payment_reminder',
+    'payment_due',
+    'payment_pending',
+    'payment_due_reminder',
+    'cart_discount',
+    'cart_coupon',
+    'cart_offer',
+    'cart_discount_available',
+    'promo',
+    'promotion',
+    'promotional',
+    'marketing',
+    'marketing_campaign',
+    'offer',
+    'offer_published',
+    'coupon',
+    'discount',
+    'cart_reminder',
+    'order_approved',
+    'welcome',
+    'welcome_message',
+    'customer_welcome',
+    'greeting',
+    'holiday_greeting',
+    'eid_greeting',
+    'friday_greeting',
+    'support_reply',
+    'support_ticket',
+    'ticket_opened',
+    'ticket_status_changed',
+    'contact_reply',
+    'merchant_reply',
+    'partner_application_approved',
+    'review_approved',
+    'store_review_approved',
+    'product_review_approved',
+    'message',
+    'info',
+])
 STAFF_NOTIFICATION_ROLES = {"admin", "manager", "finance", "logistics", "staff", "employee", "courier", "delivery"}
 
 
@@ -566,6 +624,10 @@ class NotificationService:
         }
 
     async def _deliver_outbox(self, row: Any) -> dict[str, Any]:
+        if row.type in {"cart_reminder", "cart_discount"} and (row.payload or {}).get("cart_activity"):
+            from .cart_recovery_service import cart_recovery_is_current
+            if not await cart_recovery_is_current(self.session, row.user_id, row.payload):
+                return {"ok": True, "blocked": False, "suppressed": True, "error": "cart_already_changed_or_ordered"}
         notification_id = (row.payload or {}).get("notification_id")
         configured_channels = _extra(row).get("delivery_channels")
         channels = await self._allowed_channels(
