@@ -13,6 +13,20 @@ def test_customer_allowed_categories(kind):
     assert ns.customer_notification_allowed(kind)
 
 
+@pytest.mark.asyncio
+async def test_merchant_rejection_can_reach_customer_app_and_push(monkeypatch):
+    monkeypatch.setattr(ns, "email_delivery_configured", lambda _: False)
+    monkeypatch.setattr(ns, "get_settings", lambda: SimpleNamespace())
+    service = ns.NotificationService(Session())
+    service.preferences_for = AsyncMock(return_value=SimpleNamespace(
+        in_app_enabled=True, mobile_push_enabled=True, web_push_enabled=True,
+        system_notifications=True,
+    ))
+    assert await service._allowed_channels(uuid.uuid4(), "partner_application_rejected") == [
+        "in_app", "mobile_push", "web_push",
+    ]
+
+
 @pytest.mark.parametrize("kind", ["password_reset_requested", "email_verification_requested", "login", "system", "order_invoice_ready", "payment_receipt", "unknown"])
 def test_unrelated_customer_notifications_are_hidden(kind):
     assert not ns.customer_notification_allowed(kind)

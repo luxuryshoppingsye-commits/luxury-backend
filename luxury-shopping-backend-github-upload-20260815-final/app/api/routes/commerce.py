@@ -77,6 +77,30 @@ router = APIRouter(tags=["commerce"])
 storage = FileStorage()
 
 
+ORDER_STATUS_NOTIFICATION_LABELS = {
+    "pending": "قيد الانتظار",
+    "confirmed": "تم تأكيد الطلب",
+    "approved": "تم اعتماد الطلب",
+    "accepted": "تم اعتماد الطلب",
+    "processing": "قيد التجهيز",
+    "preparing": "قيد التجهيز",
+    "ready_for_shipment": "الطلب جاهز للشحن",
+    "shipped": "تم شحن الطلب",
+    "out_for_delivery": "الطلب خرج للتوصيل",
+    "delivered": "تم تسليم الطلب",
+    "completed": "اكتمل الطلب",
+    "cancelled": "تم إلغاء الطلب",
+    "canceled": "تم إلغاء الطلب",
+    "rejected": "تم رفض الطلب",
+    "returned": "تم إرجاع الطلب",
+}
+
+
+def _order_status_notification_label(status: str) -> str:
+    normalized = str(status or "").strip().lower().replace(" ", "_")
+    return ORDER_STATUS_NOTIFICATION_LABELS.get(normalized, str(status or "").strip())
+
+
 IDEMPOTENCY_RESPONSE_INTERNAL_FIELDS = {
     "idempotency_actor_id",
     "idempotency_endpoint",
@@ -2716,8 +2740,8 @@ async def api_partner_order_status(
         recipient_id=order.user_id,
         order_id=order.id,
         title="تحديث حالة الطلب",
-        body=f"تم تحديث حالة الطلب إلى {next_status}",
-        message=f"تم تحديث حالة الطلب إلى {next_status}",
+        body=f"{_order_status_notification_label(next_status)}.",
+        message=f"{_order_status_notification_label(next_status)}.",
         type="order_status",
         status="new",
         is_read=False,
@@ -2778,8 +2802,10 @@ async def change_order_status(
     ))
     await _create_notification(
         session, "notifications", user_id=order.user_id, recipient_id=order.user_id,
-        order_id=order.id, title="تحديث حالة الطلب", body=f"تم تحديث حالة الطلب إلى {next_status}",
-        message=f"تم تحديث حالة الطلب إلى {next_status}", type="order_status", status="new", is_read=False,
+        order_id=order.id, title="تحديث حالة الطلب",
+        body=f"{_order_status_notification_label(next_status)}.",
+        message=f"{_order_status_notification_label(next_status)}.",
+        type="order_status", status="new", is_read=False,
     )
     await session.commit()
     return serialize_record(order)

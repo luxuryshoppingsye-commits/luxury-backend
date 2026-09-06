@@ -87,6 +87,7 @@ CUSTOMER_NOTIFICATION_TYPES = frozenset([
     'contact_reply',
     'merchant_reply',
     'partner_application_approved',
+    'partner_application_rejected',
     'review_approved',
     'store_review_approved',
     'product_review_approved',
@@ -637,16 +638,29 @@ class NotificationService:
         )
         if not channels:
             return {"ok": True, "blocked": False, "suppressed": True, "error": "communication_suppressed"}
-        ok = True
+        # Keep successful channels across retries so email or a popup is not
+        # sent again merely because a different delivery channel failed.
+        delivered = dict(_extra(row).get("delivered_channels") or {})
         blocked = False
+        retryable = False
         errors = []
         for channel in channels:
+            if delivered.get(channel) in {"sent", "provider_accepted"}:
+                continue
             status = await self._deliver_channel(row, notification_id, channel)
-            blocked = blocked or status == "blocked_configuration"
-            ok = ok and status in {"sent", "provider_accepted", "blocked_configuration"}
-            if status not in {"sent", "provider_accepted", "blocked_configuration"}:
+            if status in {"sent", "provider_accepted"}:
+                delivered[channel] = status
+                _set_extra(row, {"delivered_channels": delivered})
+            else:
+                blocked = blocked or status == "blocked_configuration"
+                retryable = retryable or status != "blocked_configuration"
                 errors.append(f"{channel}:{status}")
-        return {"ok": ok, "blocked": blocked and not ok, "suppressed": False, "error": None if ok or blocked else ",".join(errors) or "delivery_failed"}
+        return {
+            "ok": not errors,
+            "blocked": blocked and not retryable,
+            "suppressed": False,
+            "error": ",".join(errors) or None,
+        }
 
     async def _allowed_channels(
         self,
@@ -770,7 +784,7 @@ class NotificationService:
             )
         ).scalars().all()
         if not tokens:
-            return await self._record_delivery(row.user_id, notification_id, "mobile_push", "firebase_admin", "blocked_configuration", error_code="no_active_tokens")
+            return await self._record_delivery(row.user_id, notification_id, "mobile_push", "firebase_admin", "failed_retryable", error_code="no_active_tokens")
         notification = self._notification_payload(row, notification_id)
         notification_data = {
             key: str(value)
@@ -817,7 +831,7 @@ class NotificationService:
                     notification=android_notification,
                 ),
                 apns=messaging.APNSConfig(
-                    headers={"apns-priority": "10"},
+                    headers={"apns-priority": "10", "apns-push-type": "alert"},
                     payload=messaging.APNSPayload(
                         aps=messaging.Aps(
                             badge=1,

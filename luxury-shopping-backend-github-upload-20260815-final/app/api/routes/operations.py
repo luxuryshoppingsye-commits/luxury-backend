@@ -1911,11 +1911,11 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
                     await session.delete(role)
             await bump_security_version(session, rejected_user, reason="merchant_rejected", request=request)
     if application.user_id:
-        title = "تمت الموافقة على طلب متجرك" if status == "approved" else "تم رفض طلب المتجر"
+        title = "تمت الموافقة على طلب متجرك" if status == "approved" else "نعتذر عن عدم الموافقة على طلب متجرك"
         message = (
             "تمت الموافقة على طلب متجرك ويمكنك الآن تجهيز المنتجات للمراجعة."
             if status == "approved"
-            else f"سبب الرفض: {reason}"
+            else f"نعتذر، تعذرت الموافقة على طلب متجرك. السبب: {reason}"
         )
         await NotificationService(session).create_notification(
             NotificationPayload(
