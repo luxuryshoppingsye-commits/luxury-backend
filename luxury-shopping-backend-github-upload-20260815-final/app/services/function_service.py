@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..models import MODEL_BY_TABLE
-from ..models.domain import Category, LoginAttempt, Order, OrderItem, Product, Profile, User, UserRole
+from ..models.domain import Brand, Category, LoginAttempt, Order, OrderItem, Product, Profile, User, UserRole
 from ..repositories.resources import serialize_record
 from ..security.passwords import hash_password
 from .api_protection import (
@@ -51,6 +51,26 @@ def _text(body: dict[str, Any], *names: str, default: str = "") -> str:
     return default
 
 
+def _product_image_url(product: Product) -> str | None:
+    """Select the first stored product image without accepting request-supplied URLs."""
+    candidates: list[Any] = [product.image_url]
+    candidates.extend(product.images or [])
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate = candidate.get("url") or candidate.get("image_url") or candidate.get("imageUrl")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _needs_image_generated_description(product: Product) -> bool:
+    description = (product.description or "").strip()
+    # Replace only the old deterministic placeholder. Human-written content is
+    # deliberately preserved even when a product has a photo.
+    legacy_placeholder = f"اكتشف {product.name} ضمن منتجات رفاهية التسوق."
+    return not description or description == legacy_placeholder
+
+
 def _normalize_chat_text(value: str) -> str:
     return (
         value.strip()
@@ -77,6 +97,44 @@ def _has_any_whole_chat_term(value: str, terms: list[str]) -> bool:
         re.search(rf"(?<!\w){re.escape(_normalize_chat_text(term))}(?!\w)", normalized)
         for term in terms
     )
+
+
+def _is_chat_product_request(message: str) -> bool:
+    """Recognize natural shopping requests before routing to app instructions."""
+    return _has_any_chat_term(
+        message,
+        [
+            "ملابس", "لبس", "طفل", "اطفال", "أطفال", "طفلي", "طفلتي",
+            "ولدي", "ابني", "بنتي", "بنت", "بنات", "ولاد", "رجالي", "نسائي",
+            "عطر", "عطور", "حذاء", "احذية", "أحذية", "شنطة", "حقيبة", "اكسسوار",
+            "إكسسوار", "ساعة", "ساعات", "جوال", "الكترونيات", "إلكترونيات",
+            "clothes", "clothing", "kids", "child", "children", "boys", "girls",
+            "men", "women", "perfume", "shoes", "bag", "watch", "electronics",
+        ],
+    )
+
+
+def _expand_chat_catalog_terms(terms: list[str]) -> list[str]:
+    """Add stable category synonyms for everyday Arabic shopping phrases."""
+    aliases = {
+        "طفل": ("اطفال",),
+        "طفلي": ("اطفال",),
+        "طفلتي": ("اطفال",),
+        "ولدي": ("اطفال",),
+        "ابني": ("اطفال",),
+        "بنتي": ("اطفال",),
+        "ولاد": ("اطفال",),
+        "بنات": ("اطفال",),
+        "clothes": ("clothing",),
+        "kids": ("children",),
+        "child": ("children",),
+    }
+    expanded = list(terms)
+    for term in terms:
+        for alias in aliases.get(_normalize_chat_text(term), ()):
+            if alias not in expanded:
+                expanded.append(alias)
+    return expanded[:8]
 
 
 def _chat_direct_guidance(message: str, language: str) -> str | None:
@@ -202,7 +260,10 @@ def _chat_direct_guidance(message: str, language: str) -> str | None:
             if english
             else "سجّل دخولك، افتح طلباتي، اختر الطلب، ثم راجع حالته وتحديثات التتبع."
         )
-    if _has_any_chat_term(message, ["شراء", "اشتري", "أشتري", "اكمل الطلب", "إتمام الطلب", "checkout", "buy now"]):
+    if (
+        _has_any_chat_term(message, ["شراء", "اشتري", "أشتري", "اكمل الطلب", "إتمام الطلب", "checkout", "buy now"])
+        and not _is_chat_product_request(message)
+    ):
         return (
             "Open the product, choose its options, add it to cart, then sign in and complete checkout with your address and payment method."
             if english
@@ -1476,14 +1537,20 @@ async def _chat_site_context(
     language: str,
     user: User | None,
 ) -> tuple[str, bool]:
-    terms = _extract_chat_search_terms(message)
+    terms = _expand_chat_catalog_terms(_extract_chat_search_terms(message))
     wants_offers = _has_any_chat_term(message, ["عرض", "عروض", "خصم", "كوبون", "offer", "discount", "coupon"])
     wants_categories = _has_any_whole_chat_term(
         message,
         ["تصنيف", "تصنيفات", "قسم", "اقسام", "category", "categories"],
     )
     wants_stores = _has_any_chat_term(message, ["متجر", "متاجر", "تاجر", "partner", "merchant", "store", "stores"])
-    wants_orders = _has_any_chat_term(message, ["طلب", "تتبع", "رقم الطلب", "order", "tracking"])
+    wants_orders = _has_any_chat_term(
+        message,
+        [
+            "طلباتي", "تتبع", "رقم الطلب", "حالة الطلب", "وين طلبي", "وصل طلبي",
+            "my orders", "track order", "order status", "tracking",
+        ],
+    )
     wants_shipping = _has_any_chat_term(
         message,
         [
@@ -1552,6 +1619,7 @@ async def _chat_site_context(
             wants_gift,
             wants_featured,
             budget is not None,
+            _is_chat_product_request(message),
             _has_any_chat_term(
                 message,
                 [
@@ -1595,6 +1663,8 @@ async def _chat_site_context(
         product_filters.append(Product.price <= budget)
     if terms:
         term_filters = []
+        category_filters = []
+        brand_filters = []
         for term in terms:
             pattern = f"%{term}%"
             term_filters.extend(
@@ -1606,7 +1676,35 @@ async def _chat_site_context(
                     Product.sku.ilike(pattern),
                 ]
             )
-        product_filters.append(or_(*term_filters))
+            category_filters.extend(
+                [
+                    Category.name.ilike(pattern),
+                    Category.name_en.ilike(pattern),
+                    Category.slug.ilike(pattern),
+                    Category.description_ar.ilike(pattern),
+                    Category.description_en.ilike(pattern),
+                ]
+            )
+            brand_filters.extend(
+                [Brand.name.ilike(pattern), Brand.name_en.ilike(pattern), Brand.slug.ilike(pattern)]
+            )
+        matching_category_ids = select(Category.id).where(
+            Category.deleted_at.is_(None),
+            Category.is_active.is_(True),
+            or_(*category_filters),
+        )
+        matching_brand_ids = select(Brand.id).where(
+            Brand.deleted_at.is_(None),
+            Brand.is_active.is_(True),
+            or_(*brand_filters),
+        )
+        product_filters.append(
+            or_(
+                *term_filters,
+                Product.category_id.in_(matching_category_ids),
+                Product.brand_id.in_(matching_brand_ids),
+            )
+        )
 
     statement = (
         select(Product)
@@ -2252,13 +2350,68 @@ async def execute_function(
         if user and "partner" in roles and not roles.intersection(ADMIN_ROLES):
             statement = statement.where(Product.partner_id == user.id)
         products = list((await session.execute(statement.limit(1000))).scalars())
+        if function_name == "categorize-products":
+            for product in products:
+                if not product.tags:
+                    product.tags = [word for word in product.name.split()[:4]]
+            await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
+            return {"ok": True, "updated": len(products)}
+
+        # The description generator is intentionally image-grounded. It never
+        # substitutes a canned sentence when Gemini cannot inspect the product.
+        from .image_search import describe_product_image
+
+        generated = 0
+        skipped = 0
+        failed = 0
+        generated_tokens = 0
+        error_codes: set[str] = set()
         for product in products:
-            if function_name == "generate-product-descriptions" and not product.description:
-                product.description = f"اكتشف {product.name} ضمن منتجات رفاهية التسوق."
-            if function_name == "categorize-products" and not product.tags:
-                product.tags = [word for word in product.name.split()[:4]]
-        await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
-        return {"ok": True, "updated": len(products)}
+            if not _needs_image_generated_description(product):
+                skipped += 1
+                continue
+            image_url = _product_image_url(product)
+            if image_url is None:
+                skipped += 1
+                continue
+            try:
+                content = await describe_product_image(image_url, product.name)
+            except HTTPException as exc:
+                failed += 1
+                detail = exc.detail
+                error_codes.add(str(detail.get("code") if isinstance(detail, dict) else detail))
+                continue
+            description = str(content.get("description") or "").strip()
+            if not description:
+                failed += 1
+                error_codes.add("product_description_analysis_failed")
+                continue
+            product.description = description
+            if not product.tags:
+                product.tags = list(content.get("tags") or [])
+            generated += 1
+            generated_tokens += max(1, len(description) // 4)
+
+        if generated == 0 and failed:
+            await AIQuotaService(session).fail(
+                ai_ledger_id,
+                error_code_safe=sorted(error_codes)[0] if error_codes else "product_description_analysis_failed",
+            )
+            return {
+                "ok": False,
+                "updated": 0,
+                "skipped": skipped,
+                "failed": failed,
+                "errorCodes": sorted(error_codes),
+            }
+        await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=generated_tokens)
+        return {
+            "ok": True,
+            "updated": generated,
+            "skipped": skipped,
+            "failed": failed,
+            "errorCodes": sorted(error_codes),
+        }
     if function_name == "image-search":
         from .image_search import search_catalog_image
 

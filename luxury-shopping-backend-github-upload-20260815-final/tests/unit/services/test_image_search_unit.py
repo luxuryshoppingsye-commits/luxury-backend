@@ -82,3 +82,35 @@ async def test_provider_receives_actual_image_bytes(monkeypatch):
     monkeypatch.setattr(service.httpx, "AsyncClient", Client)
     result = await service._describe_image(service._image_data(image_body()))
     assert result["typeTerms"] == ["bag"]
+
+
+@pytest.mark.asyncio
+async def test_product_description_is_grounded_in_the_actual_product_image(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(
+        gemini_api_key="test-key", google_api_key="", ai_api_key="", ai_default_model="gemini-2.5-flash", ai_request_timeout_seconds=10))
+    encoded = service._image_data(image_body())
+    monkeypatch.setattr(service, "_image_data_from_public_url", AsyncMock(return_value=encoded))
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, headers, json):
+            assert "actual product image" in json["contents"][0]["parts"][0]["text"]
+            inline = json["contents"][0]["parts"][1]["inlineData"]
+            assert inline["mimeType"] == "image/jpeg"
+            assert base64.b64decode(inline["data"]).startswith(bytes([255, 216]))
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+                "candidates": [{"content": {"parts": [{"text": '{"description": "حقيبة حمراء صغيرة بتصميم بسيط ومقبض علوي واضح في الصورة، مناسبة للاستخدام اليومي وحمل الأغراض الأساسية.", "tags": ["حقيبة", "حمراء"]}'}]}}]})
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", Client)
+    result = await service.describe_product_image("https://images.example.test/product.jpg", "حقيبة")
+    assert result["description"].startswith("حقيبة حمراء")
+    assert result["tags"] == ["حقيبة", "حمراء"]
+
+
+@pytest.mark.asyncio
+async def test_product_description_rejects_non_https_image_urls():
+    with pytest.raises(HTTPException) as exc:
+        await service._assert_public_https_url("http://example.test/product.jpg")
+    assert exc.value.status_code == 422

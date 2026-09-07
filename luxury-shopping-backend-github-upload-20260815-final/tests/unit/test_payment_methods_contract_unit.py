@@ -5,6 +5,8 @@ from backend.app.services.payment_methods import (
     _default_method_rows,
     normalize_payment_method_key,
     normalize_payment_method_rows,
+    payment_account_options,
+    payment_method_has_recipient,
     payment_methods_payload,
 )
 
@@ -37,3 +39,38 @@ def test_admin_update_preserves_unmentioned_methods_and_changes_toggle() -> None
     assert cash["is_active"] is True
     assert haseb["is_active"] is True
     assert payment_methods_payload(rows)["cod_enabled"] is True
+
+
+def test_payment_account_options_excludes_unconfigured_transfer_methods() -> None:
+    rows = normalize_payment_method_rows(
+        [
+            {
+                "provider_key": "JAIB",
+                "is_active": True,
+                "merchant_number": "700123456",
+            },
+            {
+                "provider_key": "JAWALI",
+                "is_active": True,
+            },
+        ],
+        base_rows=_default_method_rows(),
+    )
+
+    jaib = next(row for row in rows if row["provider_key"] == "JAIB")
+    jawali = next(row for row in rows if row["provider_key"] == "JAWALI")
+    assert payment_method_has_recipient(jaib) is True
+    assert payment_method_has_recipient(jawali) is False
+    assert payment_account_options(rows) == [
+        {
+            "id": "jaib",
+            "payment_method": "JAIB",
+            "display_name": "جيب",
+            "account_name": "جيب",
+            "account_number": "700123456",
+            "merchant_number": "700123456",
+            "phone_number": None,
+            "type": "wallet",
+            "is_active": True,
+        }
+    ]

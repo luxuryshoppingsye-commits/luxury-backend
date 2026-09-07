@@ -50,6 +50,7 @@ from ...services.catalog_policy import (
     _public_upload_url,
 )
 from ...services.financial_calculator import (
+    award_loyalty_points_for_fulfilled_order,
     calculate_checkout_financials,
     line_total,
     money,
@@ -880,6 +881,24 @@ async def _apply_public_product_filters(
         statement = statement.where(new_product_clause(Product))
     if search and search.strip():
         term = f"%{search.strip()}%"
+        matching_category_ids = select(Category.id).where(
+            Category.deleted_at.is_(None),
+            Category.is_active.is_(True),
+            or_(
+                Category.name.ilike(term),
+                Category.name_en.ilike(term),
+                Category.slug.ilike(term),
+            ),
+        )
+        matching_brand_ids = select(Brand.id).where(
+            Brand.deleted_at.is_(None),
+            Brand.is_active.is_(True),
+            or_(
+                Brand.name.ilike(term),
+                Brand.name_en.ilike(term),
+                Brand.slug.ilike(term),
+            ),
+        )
         statement = statement.where(
             or_(
                 Product.name.ilike(term),
@@ -887,6 +906,8 @@ async def _apply_public_product_filters(
                 Product.description.ilike(term),
                 Product.sku.ilike(term),
                 Product.short_code.ilike(term),
+                Product.category_id.in_(matching_category_ids),
+                Product.brand_id.in_(matching_brand_ids),
             )
         )
     selected_category_ids: set[uuid.UUID] = set()
@@ -960,7 +981,8 @@ def _apply_public_product_sort(statement, sort: str):
     if sort in {"name", "name_asc", "name-asc"}:
         return statement.order_by(Product.name.asc())
     if sort in {"discount", "best_discount"}:
-        return statement.order_by((Product.original_price - Product.price).desc().nullslast(), Product.created_at.desc())
+        discount_rate = (Product.original_price - Product.price) / func.nullif(Product.original_price, 0)
+        return statement.order_by(discount_rate.desc().nullslast(), Product.created_at.desc())
     return statement.order_by(Product.created_at.desc())
 
 
@@ -1150,10 +1172,9 @@ async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dic
     rows = [serialize_record(row) for row in result.scalars()]
     if rows:
         return {"data": rows}
-    # Keep international shopping usable on a fresh deployment before the
-    # administrator has populated the currency table. USD intentionally has
-    # no invented rate; the customer may submit the foreign-currency estimate
-    # and the final conversion is confirmed before purchase.
+    # Keep the customer currency selector usable on a fresh deployment before
+    # the administrator has populated the currency table. These defaults match
+    # the project's built-in currency configuration.
     return {
         "data": [
             {
@@ -1173,10 +1194,21 @@ async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dic
                 "name": "الدولار الأمريكي",
                 "name_en": "US Dollar",
                 "symbol": "$",
-                "exchange_rate": None,
+                "exchange_rate": 0.0019,
                 "is_default": False,
                 "is_active": True,
                 "sort_order": 1,
+            },
+            {
+                "id": "default-SAR",
+                "code": "SAR",
+                "name": "ريال سعودي",
+                "name_en": "Saudi Riyal",
+                "symbol": "ر.س",
+                "exchange_rate": 0.0071,
+                "is_default": False,
+                "is_active": True,
+                "sort_order": 2,
             },
         ][: max(int(limit), 1)],
     }
@@ -1764,7 +1796,16 @@ async def update_cart(
         variant = (
             await session.execute(select(ProductVariant).where(ProductVariant.id == item.variant_id).with_for_update())
         ).scalar_one_or_none()
-    await eligible_line(session, product=product, variant=variant, variant_id=item.variant_id, quantity=quantity)
+    # A cart line may become unavailable after it was added. Let the customer
+    # reduce that held line, while retaining the stock limit for an increase.
+    await eligible_line(
+        session,
+        product=product,
+        variant=variant,
+        variant_id=item.variant_id,
+        quantity=quantity,
+        allow_out_of_stock=quantity < item.quantity,
+    )
     item.quantity = quantity
     await session.commit()
     return serialize_record(item)
@@ -2364,6 +2405,8 @@ async def checkout(
             session, "notifications", user_id=user.id, recipient_id=user.id,
             order_id=order.id, title="تم استلام طلبك", body=f"تم إنشاء الطلب {order.order_number}",
             message=f"تم إنشاء الطلب {order.order_number}", type="order_created", status="new", is_read=False,
+            category="order", priority="high", payload={"deep_link": f"/orders/{order.id}"},
+            deduplication_key=f"order-created:{order.id}",
         )
         await _create_notification(
             session, "admin_notifications", title="طلب جديد",
@@ -2539,6 +2582,10 @@ async def create_manual_order(
             type="order_created",
             status="new",
             is_read=False,
+            category="order",
+            priority="high",
+            payload={"deep_link": f"/orders/{order.id}"},
+            deduplication_key=f"order-created:{order.id}",
         )
         audit_model = MODEL_BY_TABLE["audit_logs"]
         session.add(audit_model(
@@ -2715,6 +2762,7 @@ async def api_partner_order_status(
     previous, next_status = assert_allowed_transition(order.status, next_status)
     assert_delivery_proof(next_status, body)
     order.status = next_status
+    await award_loyalty_points_for_fulfilled_order(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
     session.add(
         history_model(
@@ -2745,6 +2793,10 @@ async def api_partner_order_status(
         type="order_status",
         status="new",
         is_read=False,
+        category="order",
+        priority="high",
+        payload={"deep_link": f"/orders/{order.id}", "order_status": next_status},
+        deduplication_key=f"order-status:{order.id}:{next_status}",
     )
     await session.commit()
     return {"data": await merchant_order_detail(session, partner_id=user.id, order_id=order_id)}
@@ -2791,6 +2843,7 @@ async def change_order_status(
     if courier_actor:
         assert_delivery_proof(next_status, body)
     order.status = next_status
+    await award_loyalty_points_for_fulfilled_order(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
     session.add(history_model(order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status}))
     audit_model = MODEL_BY_TABLE["audit_logs"]
@@ -2806,6 +2859,9 @@ async def change_order_status(
         body=f"{_order_status_notification_label(next_status)}.",
         message=f"{_order_status_notification_label(next_status)}.",
         type="order_status", status="new", is_read=False,
+        category="order", priority="high",
+        payload={"deep_link": f"/orders/{order.id}", "order_status": next_status},
+        deduplication_key=f"order-status:{order.id}:{next_status}",
     )
     await session.commit()
     return serialize_record(order)

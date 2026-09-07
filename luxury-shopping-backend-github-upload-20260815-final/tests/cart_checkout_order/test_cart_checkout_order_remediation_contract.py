@@ -160,7 +160,7 @@ async def test_cart_holds_out_of_stock_products_but_rejects_non_public_products_
         out_of_stock_cart = await client.post(
             "/cart",
             headers=headers,
-            json={"productId": str(out_of_stock_id), "quantity": 1},
+            json={"productId": str(out_of_stock_id), "quantity": 2},
         )
         assert out_of_stock_cart.status_code == 201, out_of_stock_cart.text
         cart_read = await client.get("/cart", headers=headers)
@@ -169,6 +169,21 @@ async def test_cart_holds_out_of_stock_products_but_rejects_non_public_products_
         )
         assert held_line["is_available_for_checkout"] is False
         assert held_line["availability_error"] == "insufficient_stock"
+
+        reduced_held_line = await client.patch(
+            f"/cart/{held_line['id']}",
+            headers=headers,
+            json={"quantity": 1},
+        )
+        assert reduced_held_line.status_code == 200, reduced_held_line.text
+        assert reduced_held_line.json()["quantity"] == 1
+        held_line_increase = await client.patch(
+            f"/cart/{held_line['id']}",
+            headers=headers,
+            json={"quantity": 2},
+        )
+        assert held_line_increase.status_code == 409
+        assert held_line_increase.json()["detail"] == "insufficient_stock"
 
         out_of_stock_wishlist = await client.post(
             "/wishlist",

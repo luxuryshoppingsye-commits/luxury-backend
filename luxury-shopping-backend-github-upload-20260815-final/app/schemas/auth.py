@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -17,6 +18,25 @@ def normalize_phone_number(value: str | None) -> str | None:
     if not digits.isdigit() or not 8 <= len(digits) <= 15:
         raise ValueError("invalid phone number")
     return compact
+
+
+def normalize_yemen_mobile_phone(value: str | None) -> str | None:
+    """Keep profile phones compatible with local 9-digit Yemeni mobiles."""
+    if value is None or not value.strip():
+        return None
+    compact = value.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    digits = compact[1:] if compact.startswith("+") else compact
+    local_number = digits[3:] if digits.startswith("967") and len(digits) == 12 else digits
+    if not local_number.isdigit() or not re.fullmatch(r"7\d{8}", local_number):
+        raise ValueError("invalid_yemen_mobile_phone")
+    return compact
+
+
+def is_valid_yemen_mobile_phone(value: str | None) -> bool:
+    try:
+        return normalize_yemen_mobile_phone(value) is not None
+    except ValueError:
+        return False
 
 
 class LoginRequest(BaseModel):
@@ -223,7 +243,7 @@ class ProfileUpdateRequest(BaseModel):
     @field_validator("phone")
     @classmethod
     def validate_phone(cls, value: str | None) -> str | None:
-        return normalize_phone_number(value)
+        return normalize_yemen_mobile_phone(value)
 
     @field_validator("avatar_url")
     @classmethod

@@ -610,7 +610,19 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
             application = (
                 await session.execute(select(application_model).where(application_model.user_id == user.id))
             ).scalar_one()
+            # Older records may already have moved from pending to reviewing.
+            # They must still prevent a duplicate merchant submission.
+            application.status = "reviewing"
+            await session.commit()
             application_id = application.id
+
+        duplicate_pending = await client.post(
+            "/auth/register-merchant",
+            headers={"Authorization": merchant_headers},
+            json={"storeName": "Second Pending Store"},
+        )
+        assert duplicate_pending.status_code == 409, duplicate_pending.text
+        assert duplicate_pending.json()["detail"] == "merchant_application_exists"
 
         admin_tokens = await _login(client, admin.email, admin_password)
         approved = await client.post(

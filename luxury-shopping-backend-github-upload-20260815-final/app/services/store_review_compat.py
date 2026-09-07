@@ -34,6 +34,29 @@ ORDER BY sr.created_at DESC
 LIMIT 1
 """
 
+_HANDOVER_CREATE_SQL = """
+INSERT INTO public.store_reviews (
+    user_id, rating, comment, customer_name, status, is_approved, is_rejected
+)
+VALUES (
+    :user_id, :rating, :comment, :customer_name, 'pending', FALSE, FALSE
+)
+RETURNING id, user_id, rating, comment, customer_name,
+          is_approved, is_rejected, admin_notes, status, created_at, updated_at
+"""
+
+_HANDOVER_STATUS_UPDATE_SQL = """
+UPDATE public.store_reviews
+SET status = :status,
+    is_approved = :is_approved,
+    is_rejected = :is_rejected,
+    admin_notes = COALESCE(:admin_notes, admin_notes),
+    updated_at = NOW()
+WHERE id = :review_id
+RETURNING id, user_id, rating, comment, customer_name,
+          is_approved, is_rejected, admin_notes, status, created_at, updated_at
+"""
+
 _GENERIC_PUBLIC_SQL = """
 SELECT sr.id, sr.user_id,
        COALESCE(NULLIF(sr.extra_data ->> 'rating', ''), '0') AS rating,
@@ -122,6 +145,7 @@ def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
         "rating": max(0, min(5, rating)),
         "comment": str(comment).strip() if comment not in (None, "") else None,
         "customer_name": customer_name or None,
+        "status": status or "pending",
         "is_approved": bool(is_approved),
         "is_rejected": bool(is_rejected),
         "admin_notes": row.get("admin_notes"),
@@ -157,3 +181,61 @@ async def fetch_user_store_review(session: AsyncSession, user_id: uuid.UUID) -> 
     if not rows:
         return None
     return normalize_store_review_row(rows[0])
+
+
+async def create_handover_store_review(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    rating: int,
+    comment: str,
+    customer_name: str | None,
+) -> dict[str, Any] | None:
+    """Create a review against the legacy table when its direct columns exist.
+
+    Some deployed databases predate the resource-table layout and have no
+    ``extra_data`` column. Returning ``None`` on that schema mismatch lets the
+    route continue with the resource-table writer for newer installations.
+    """
+    try:
+        result = await session.execute(
+            text(_HANDOVER_CREATE_SQL),
+            {
+                "user_id": user_id,
+                "rating": rating,
+                "comment": comment,
+                "customer_name": customer_name,
+            },
+        )
+        return normalize_store_review_row(dict(result.mappings().one()))
+    except ProgrammingError:
+        await session.rollback()
+        return None
+
+
+async def update_handover_store_review_status(
+    session: AsyncSession,
+    *,
+    review_id: uuid.UUID,
+    status: str,
+    is_approved: bool,
+    is_rejected: bool,
+    admin_notes: str | None,
+) -> dict[str, Any] | None:
+    """Update moderation fields in the direct-column store-review schema."""
+    try:
+        result = await session.execute(
+            text(_HANDOVER_STATUS_UPDATE_SQL),
+            {
+                "review_id": review_id,
+                "status": status,
+                "is_approved": is_approved,
+                "is_rejected": is_rejected,
+                "admin_notes": admin_notes,
+            },
+        )
+        row = result.mappings().one_or_none()
+        return normalize_store_review_row(dict(row)) if row is not None else {}
+    except ProgrammingError:
+        await session.rollback()
+        return None

@@ -40,7 +40,12 @@ from ...services.auth_service import (
     roles_for,
 )
 from ...services.staff_permissions import require_staff_permission
-from ...services.store_review_compat import fetch_public_store_reviews, fetch_user_store_review
+from ...services.store_review_compat import (
+    create_handover_store_review,
+    fetch_public_store_reviews,
+    fetch_user_store_review,
+    update_handover_store_review_status,
+)
 from ...services.catalog_policy import (
     build_public_product_rows,
     new_product_clause,
@@ -64,7 +69,9 @@ from ...services.financial_calculator import (
     approved_payment_total,
     financial_response_row,
     find_idempotent_refund,
+    loyalty_program_settings,
     money,
+    reconcile_loyalty_for_user,
     receipt_amount_for_order,
     refunded_total,
     request_hash,
@@ -87,6 +94,7 @@ from ...services.payment_refund_security import (
 from ...services.payment_methods import (
     PAYMENT_METHODS_SETTING_KEY,
     normalize_payment_method_rows,
+    payment_account_options,
     payment_methods_payload,
     read_payment_method_rows,
 )
@@ -124,6 +132,15 @@ from .commerce import _delete_product_file_assets, _serialize_orders_with_financ
 router = APIRouter(tags=["operations"])
 storage = FileStorage()
 SEED_UPLOADS_ZIP = BACKEND_DIR / "seed_data" / "uploads_seed.zip"
+MERCHANT_APPLICATION_REVIEW_STATUSES = (
+    "pending",
+    "reviewing",
+    "under_review",
+    "pending_review",
+    "pending_merchant_review",
+    "submitted",
+)
+MERCHANT_APPLICATION_ACTIVE_STATUSES = ("approved", "active")
 
 
 async def _queue_email_push_mirror(
@@ -707,35 +724,6 @@ def _partner_option_from_storefront(row: dict[str, Any]) -> dict[str, Any]:
         "full_name": store_name,
     }
 
-
-def _payment_account_options() -> list[dict[str, Any]]:
-    allowed = {method.strip().lower() for method in get_settings().payment_method_allowlist}
-    methods = [
-        ("cash_on_delivery", "cash_on_delivery", "الدفع عند الاستلام", "cash"),
-        ("wallet_transfer", "wallet_transfer", "تحويل محفظة", "wallet"),
-        ("bank_transfer", "bank_transfer", "تحويل بنكي", "bank"),
-        ("jaib", "JAIB", "محفظة جيب", "wallet"),
-        ("jawali", "JAWALI", "جوالي", "wallet"),
-        ("yemen_wallet", "YEMEN_WALLET", "يمن والت", "wallet"),
-        ("one_cash", "ONE_CASH", "ون كاش", "wallet"),
-        ("haseb_kuraimi", "HASEB_KURAIMI", "حاسب الكريمي", "bank"),
-    ]
-    accounts: list[dict[str, Any]] = []
-    for account_id, method, label, account_type in methods:
-        if method.lower() not in allowed and account_id.lower() not in allowed:
-            continue
-        accounts.append(
-            {
-                "id": account_id,
-                "payment_method": method,
-                "display_name": label,
-                "account_name": label,
-                "account_number": method,
-                "type": account_type,
-                "is_active": True,
-            }
-        )
-    return accounts
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (uuid.UUID, datetime)):
@@ -3084,8 +3072,8 @@ async def api_partnership_applications(staff: User = Depends(require_staff), ses
 
 
 @router.get("/api/payments/accounts")
-async def api_public_payment_accounts():
-    return {"data": _payment_account_options()}
+async def api_public_payment_accounts(session: AsyncSession = Depends(get_session)):
+    return {"data": payment_account_options(await read_payment_method_rows(session))}
 
 
 @router.get("/api/payment-methods")
@@ -5223,7 +5211,35 @@ async def api_delete_product_review(
 @router.post("/api/reviews/store", status_code=201)
 async def api_create_store_review(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     body = await request.json()
-    row = await _api_create(session, "store_reviews", {"user_id": user.id, "title": body.get("title") or "Review", "body": body.get("body") or body.get("comment") or "", "status": "pending", **body}, user)
+    values = _review_input_values(body, request)
+    if not values["comment"]:
+        raise HTTPException(status_code=422, detail="review_comment_required")
+    customer_name = _review_text(body.get("customer_name") or body.get("customerName"))
+    if len(customer_name) > 160:
+        raise HTTPException(status_code=422, detail="review_customer_name_limit_exceeded")
+
+    row = await create_handover_store_review(
+        session,
+        user_id=user.id,
+        rating=values["rating"],
+        comment=values["comment"],
+        customer_name=customer_name or None,
+    )
+    if row is None:
+        row = await _api_create(
+            session,
+            "store_reviews",
+            {
+                "user_id": user.id,
+                "title": customer_name or "Review",
+                "body": values["comment"],
+                "rating": values["rating"],
+                "comment": values["comment"],
+                "customer_name": customer_name,
+                "status": "pending",
+            },
+            user,
+        )
     await session.commit()
     return {"data": row}
 
@@ -5231,7 +5247,21 @@ async def api_create_store_review(request: Request, user: User = Depends(current
 @router.patch("/api/reviews/store/{review_id}/status")
 async def api_update_store_review_status(review_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = _normalize_store_review_status_payload(await request.json())
-    row = await _api_update(session, "store_reviews", review_id, body, staff)
+    status = str(body.get("status") or "pending").strip().lower()
+    is_rejected = status in {"rejected", "declined", "denied", "hidden", "blocked", "inactive", "disabled"}
+    is_approved = not is_rejected and status in REVIEW_APPROVED_STATUSES
+    row = await update_handover_store_review_status(
+        session,
+        review_id=review_id,
+        status=status,
+        is_approved=is_approved,
+        is_rejected=is_rejected,
+        admin_notes=_review_text(body.get("admin_notes")) or None,
+    )
+    if row == {}:
+        raise HTTPException(status_code=404, detail="review_not_found")
+    if row is None:
+        row = await _api_update(session, "store_reviews", review_id, body, staff)
     if row.get("user_id") and (row.get("is_approved") is True or row.get("status") in {"approved", "active", "published"}):
         await NotificationService(session).create_notification(NotificationPayload(
             user_id=uuid.UUID(str(row["user_id"])), title="تم قبول تقييمك",
@@ -5294,7 +5324,10 @@ async def api_public_create_partner_application(
         duplicate_matchers.append(application_model.user_id == user.id)
     duplicate_clauses = [
         application_model.deleted_at.is_(None),
-        application_model.status.in_(["pending", "reviewing", "approved"]),
+        func.lower(application_model.status).in_(
+            MERCHANT_APPLICATION_REVIEW_STATUSES
+            + MERCHANT_APPLICATION_ACTIVE_STATUSES
+        ),
         or_(*duplicate_matchers),
     ]
     duplicate = (
@@ -9966,12 +9999,49 @@ async def initialize_loyalty(user: User = Depends(current_user), session: AsyncS
 
 @router.get("/loyalty/me")
 async def loyalty_me(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    settings = await loyalty_program_settings(session)
+    awarded = await reconcile_loyalty_for_user(session, user.id)
+    if awarded:
+        await session.commit()
+
     model = MODEL_BY_TABLE["user_loyalty"]
     result = await session.execute(select(model).where(model.user_id == user.id).limit(1))
     row = result.scalar_one_or_none()
     transactions_model = MODEL_BY_TABLE["points_transactions"]
-    tx = await session.execute(select(transactions_model).where(transactions_model.user_id == user.id).order_by(transactions_model.created_at.desc()).limit(100))
-    return {"user_id": str(user.id), "points": str(money(row.balance or 0)) if row else "0.00", "transactions": [serialize_record(item) for item in tx.scalars()]}
+    tx = await session.execute(
+        select(transactions_model)
+        .where(
+            transactions_model.user_id == user.id,
+            transactions_model.deleted_at.is_(None),
+        )
+        .order_by(transactions_model.created_at.desc())
+        .limit(100)
+    )
+    transactions = list(tx.scalars())
+    available_points = int(money(row.balance or 0)) if row else 0
+    credited_types = {"earned", "opening_balance", "adjustment", "refund_reversal"}
+    total_earned = sum(
+        (
+            max(Decimal("0"), Decimal(str(item.amount or 0)))
+            for item in transactions
+            if str(item.type or "").strip().lower() in credited_types
+        ),
+        Decimal("0"),
+    )
+    total_points = max(available_points, int(total_earned))
+    return {
+        "user_id": str(user.id),
+        "points": available_points,
+        "availablePoints": available_points,
+        "totalPoints": total_points,
+        "pointsPerCurrency": settings.points_per_currency,
+        "pointValueYer": settings.point_value_yer,
+        "minRedeemPoints": settings.min_redeem_points,
+        "maxRedeemPercentage": settings.max_redeem_percentage,
+        "isActive": settings.is_active,
+        "awardedPoints": awarded,
+        "transactions": [serialize_record(item) for item in transactions],
+    }
 
 
 @router.get("/me/store-credit")

@@ -182,6 +182,18 @@ async def test_public_catalog_filters_visibility_pagination_count_and_dto() -> N
             str(ids["imported"]),
         }
 
+        for search_term in (f"Category {suffix}", f"Brand {suffix}"):
+            matched = await client.get(
+                "/api/catalog/products",
+                params={"search": search_term, "page_size": 20},
+            )
+            assert matched.status_code == 200, matched.text
+            assert {row["id"] for row in matched.json()["items"]} == {
+                str(ids["new"]),
+                str(ids["old"]),
+                str(ids["imported"]),
+            }
+
         legacy_public = await client.get(
             "/products",
             params={"limit": 1000, "categorySlug": f"luxury-category-{suffix}"},

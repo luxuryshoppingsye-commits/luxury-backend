@@ -231,6 +231,40 @@ def payment_methods_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def payment_method_has_recipient(row: dict[str, Any]) -> bool:
+    return any(
+        _text(row.get(field)) is not None
+        for field in ("merchant_number", "account_number", "phone_number")
+    )
+
+
+def payment_account_options(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    accounts: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("is_active") is not True or not payment_method_has_recipient(row):
+            continue
+        account_number = (
+            _text(row.get("merchant_number"))
+            or _text(row.get("account_number"))
+            or _text(row.get("phone_number"))
+        )
+        assert account_number is not None
+        accounts.append(
+            {
+                "id": str(row["provider_key"]).lower(),
+                "payment_method": row["provider_key"],
+                "display_name": row.get("name_ar") or row["provider_key"],
+                "account_name": row.get("name_ar") or row["provider_key"],
+                "account_number": account_number,
+                "merchant_number": _text(row.get("merchant_number")),
+                "phone_number": _text(row.get("phone_number")),
+                "type": "cash" if row["provider_key"] == COD_PAYMENT_METHOD else "wallet",
+                "is_active": True,
+            }
+        )
+    return accounts
+
+
 async def validate_payment_method_for_checkout(
     session: AsyncSession,
     value: Any,
@@ -242,6 +276,16 @@ async def validate_payment_method_for_checkout(
     if method not in allowed:
         raise HTTPException(status_code=422, detail="invalid_payment_method")
     rows = await read_payment_method_rows(session)
-    if not any(row.get("provider_key") == method and row.get("is_active") is True for row in rows):
+    configured_method = next(
+        (
+            row
+            for row in rows
+            if row.get("provider_key") == method and row.get("is_active") is True
+        ),
+        None,
+    )
+    if configured_method is None:
         raise HTTPException(status_code=409, detail="payment_method_disabled")
+    if method != COD_PAYMENT_METHOD and not payment_method_has_recipient(configured_method):
+        raise HTTPException(status_code=409, detail="payment_method_recipient_unconfigured")
     return method

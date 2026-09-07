@@ -140,6 +140,32 @@ def test_public_ai_direct_guidance_answers_the_requested_app_action(message, exp
     assert "خيارات مناسبة" not in answer
 
 
+def test_public_ai_natural_product_request_does_not_become_order_tracking_or_checkout():
+    assert _chat_direct_guidance("شراء ملابس طفل ولدي بعمر 12", "ar") is None
+
+
+@pytest.mark.asyncio
+async def test_public_ai_natural_product_request_uses_catalog_context_without_order_tracking():
+    class EmptyResult:
+        def scalars(self):
+            return []
+
+    class EmptyCatalogSession:
+        async def execute(self, _statement):
+            return EmptyResult()
+
+    context, has_products = await _chat_site_context(
+        EmptyCatalogSession(),
+        "ملابس لطفلي ولدي",
+        language="ar",
+        user=None,
+    )
+
+    assert has_products is False
+    assert "ما لقيت نتيجة" in context
+    assert "طلباتي" not in context
+
+
 @pytest.mark.asyncio
 async def test_public_ai_app_guidance_does_not_query_catalog():
     class NoQuerySession:

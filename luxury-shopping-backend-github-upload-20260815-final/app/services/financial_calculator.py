@@ -5,7 +5,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any
 
 from fastapi import HTTPException
@@ -38,6 +38,158 @@ def money_or_zero(value: Any) -> Decimal:
 
 
 LOCAL_PAYMENT_SUCCESS_STATUSES = ("confirmed", "approved", "paid", "completed")
+LOYALTY_EARNING_ORDER_STATUSES = frozenset({"delivered", "completed"})
+
+
+@dataclass(frozen=True)
+class LoyaltyProgramSettings:
+    is_active: bool = True
+    points_per_currency: int = 1000
+    point_value_yer: int = 100
+    min_redeem_points: int = 5
+    max_redeem_percentage: int = 50
+
+
+def _positive_whole_number(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(Decimal(str(value)))
+    except Exception:
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+async def loyalty_program_settings(session: AsyncSession) -> LoyaltyProgramSettings:
+    """Load the published loyalty policy while retaining safe defaults."""
+
+    model = MODEL_BY_TABLE["loyalty_settings"]
+    row = (
+        await session.execute(
+            select(model)
+            .where(model.deleted_at.is_(None), model.name == "default")
+            .order_by(model.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return LoyaltyProgramSettings()
+
+    data = dict(getattr(row, "extra_data", {}) or {})
+    status = str(getattr(row, "status", "active") or "active").strip().lower()
+    return LoyaltyProgramSettings(
+        is_active=bool(getattr(row, "is_active", True)) and status in {"active", "enabled", "published"},
+        points_per_currency=_positive_whole_number(
+            data.get("points_per_currency", data.get("pointsPerCurrency")),
+            1000,
+        ),
+        point_value_yer=_positive_whole_number(
+            data.get("point_value_yer", data.get("pointValueYer")),
+            100,
+        ),
+        min_redeem_points=_positive_whole_number(
+            data.get("min_redeem_points", data.get("minRedeemPoints")),
+            5,
+        ),
+        max_redeem_percentage=_positive_whole_number(
+            data.get("max_redeem_percentage", data.get("maxRedeemPercentage")),
+            50,
+        ),
+    )
+
+
+async def award_loyalty_points_for_fulfilled_order(
+    session: AsyncSession,
+    order: Order,
+) -> int:
+    """Credit an eligible fulfilled order exactly once and return its points."""
+
+    if str(order.status or "").strip().lower() not in LOYALTY_EARNING_ORDER_STATUSES:
+        return 0
+    settings = await loyalty_program_settings(session)
+    if not settings.is_active:
+        return 0
+
+    transactions_model = MODEL_BY_TABLE["points_transactions"]
+    existing = await session.execute(
+        select(transactions_model.id)
+        .where(
+            transactions_model.order_id == order.id,
+            transactions_model.deleted_at.is_(None),
+            transactions_model.type == "earned",
+        )
+        .limit(1)
+    )
+    if existing.scalar_one_or_none() is not None:
+        return 0
+
+    subtotal = money_or_zero(order.subtotal)
+    discount = money_or_zero(order.discount_total)
+    eligible_amount = max(Decimal("0.00"), subtotal - discount)
+    points = int(
+        (eligible_amount / Decimal(settings.points_per_currency)).to_integral_value(
+            rounding=ROUND_FLOOR,
+        )
+    )
+    if points <= 0:
+        return 0
+
+    loyalty_model = MODEL_BY_TABLE["user_loyalty"]
+    loyalty = (
+        await session.execute(
+            select(loyalty_model)
+            .where(loyalty_model.user_id == order.user_id)
+            .with_for_update()
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if loyalty is None:
+        loyalty = loyalty_model(
+            user_id=order.user_id,
+            status="active",
+            balance=Decimal("0.00"),
+            extra_data={},
+        )
+        session.add(loyalty)
+        await session.flush()
+
+    loyalty.balance = money_or_zero(loyalty.balance) + Decimal(points)
+    session.add(
+        transactions_model(
+            user_id=order.user_id,
+            order_id=order.id,
+            type="earned",
+            amount=Decimal(points),
+            description=f"نقاط مكتسبة من الطلب {order.order_number}",
+            extra_data={
+                "points_per_currency": settings.points_per_currency,
+                "eligible_amount": str(eligible_amount),
+            },
+        )
+    )
+    return points
+
+
+async def reconcile_loyalty_for_user(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> int:
+    """Backfill missing points for previously fulfilled customer orders."""
+
+    orders = (
+        await session.execute(
+            select(Order)
+            .where(
+                Order.user_id == user_id,
+                Order.deleted_at.is_(None),
+                Order.status.in_(tuple(LOYALTY_EARNING_ORDER_STATUSES)),
+            )
+            .order_by(Order.created_at)
+            .with_for_update()
+        )
+    ).scalars()
+    awarded = 0
+    for order in orders:
+        awarded += await award_loyalty_points_for_fulfilled_order(session, order)
+    return awarded
 
 
 def local_request_total(payload: dict[str, Any]) -> Decimal:

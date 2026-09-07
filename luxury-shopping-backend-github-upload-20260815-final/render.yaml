@@ -29,6 +29,8 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      - key: JWT_REFRESH_TOKEN_DAYS
+        value: "365"
       - key: RENDER_PUBLIC_URL
         # Render exposes the real public service URL automatically. Map it to
         # the setting name used by the FastAPI application instead of keeping

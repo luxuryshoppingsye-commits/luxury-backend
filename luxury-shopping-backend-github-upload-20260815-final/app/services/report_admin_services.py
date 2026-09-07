@@ -1100,6 +1100,28 @@ class CourierLocationService:
                     order.status = order_status
                     history_model = MODEL_BY_TABLE["order_status_history"]
                     session.add(history_model(order_id=order.id, status=order_status, notes=f"Courier assignment {assignment.id} changed to {status}", extra_data={"changed_by": str(user.id), "assignment_id": str(assignment.id)}))
+                    message = {
+                        "shipped": "تم شحن طلبك.",
+                        "out_for_delivery": "طلبك في الطريق للتوصيل.",
+                        "delivered": "تم تسليم طلبك.",
+                        "delivery_failed": "تعذر إتمام التوصيل وسيتم التواصل معك.",
+                    }.get(order_status, "تم تحديث حالة شحن طلبك.")
+                    await NotificationService(session).create_notification(
+                        NotificationPayload(
+                            user_id=order.user_id,
+                            title="تحديث شحن الطلب",
+                            body=message,
+                            notification_type="shipping_status_changed",
+                            category="shipping",
+                            priority="high",
+                            action_url=f"/orders/{order.id}",
+                            entity_type="order",
+                            entity_id=str(order.id),
+                            order_id=order.id,
+                            payload={"deep_link": f"/orders/{order.id}", "order_status": order_status},
+                            deduplication_key=f"courier-order-status:{assignment.id}:{status}",
+                        )
+                    )
         await session.commit()
         return serialize_record(assignment)
 

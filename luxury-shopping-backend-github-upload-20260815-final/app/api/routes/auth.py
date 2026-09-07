@@ -37,6 +37,7 @@ from ...schemas.auth import (
     ProfileUpdateRequest,
     RefreshRequest,
     RegisterRequest,
+    is_valid_yemen_mobile_phone,
 )
 from ...security.passwords import get_password_policy, hash_password, validate_password, verify_password
 from ...security.tokens import create_password_reset_ticket, decode_token, token_hash
@@ -75,6 +76,19 @@ PartnerApplication = MODEL_BY_TABLE["partner_applications"]
 AccountDeletionRequest = MODEL_BY_TABLE["account_deletion_requests"]
 EMAIL_OUTBOX = MODEL_BY_TABLE["email_outbox"]
 WHATSAPP_OUTBOX = MODEL_BY_TABLE["whatsapp_outbox"]
+
+# These states are all still awaiting a final merchant-review outcome.  Older
+# records used more than one spelling, so every in-progress state must prevent
+# a customer from submitting a second request for the same account.
+MERCHANT_APPLICATION_REVIEW_STATUSES = (
+    "pending",
+    "reviewing",
+    "under_review",
+    "pending_review",
+    "pending_merchant_review",
+    "submitted",
+)
+MERCHANT_APPLICATION_ACTIVE_STATUSES = ("approved", "active")
 
 
 async def _welcome_customer(session: AsyncSession, user_id: uuid.UUID) -> None:
@@ -466,11 +480,15 @@ def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent:
     if token:
         refresh_cookie_options = dict(cookie_options)
         if persistent:
-            refresh_cookie_options["max_age"] = 60 * 60 * 24 * 30
+            refresh_cookie_options["max_age"] = (
+                get_settings().jwt_refresh_token_days * 24 * 60 * 60
+            )
         response.set_cookie("rt", str(token), **refresh_cookie_options)
     if persistent:
         remember_cookie_options = dict(cookie_options)
-        remember_cookie_options["max_age"] = 60 * 60 * 24 * 30
+        remember_cookie_options["max_age"] = (
+            get_settings().jwt_refresh_token_days * 24 * 60 * 60
+        )
         response.set_cookie(REMEMBER_ME_COOKIE, "1", **remember_cookie_options)
     else:
         response.delete_cookie(REMEMBER_ME_COOKIE, path="/")
@@ -719,7 +737,10 @@ async def register_merchant(
             .where(
                 PartnerApplication.user_id == user.id,
                 PartnerApplication.deleted_at.is_(None),
-                PartnerApplication.status.in_(["pending", "approved"]),
+                func.lower(PartnerApplication.status).in_(
+                    MERCHANT_APPLICATION_REVIEW_STATUSES
+                    + MERCHANT_APPLICATION_ACTIVE_STATUSES
+                ),
             )
             .order_by(PartnerApplication.created_at.desc())
             .limit(1)
@@ -730,7 +751,8 @@ async def register_merchant(
             status_code=409,
             detail=(
                 "merchant_already_active"
-                if existing.status == "approved"
+                if str(existing.status or "").lower()
+                in MERCHANT_APPLICATION_ACTIVE_STATUSES
                 else "merchant_application_exists"
             ),
         )
@@ -1008,8 +1030,7 @@ async def update_me(
     if profile_extra.get("social_profile_completion_required"):
         phone = str(profile.phone or "").strip()
         if (len(str(profile.full_name or "").strip()) >= 2
-                and re.fullmatch(r"\+?[0-9\s()-]+", phone)
-                and 7 <= len(re.sub(r"\D", "", phone)) <= 15
+                and is_valid_yemen_mobile_phone(phone)
                 and len(str(profile.city or "").strip()) >= 3):
             profile_extra["social_profile_completion_required"] = False
     profile.extra_data = profile_extra
