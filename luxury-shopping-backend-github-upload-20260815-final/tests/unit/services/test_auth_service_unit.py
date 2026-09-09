@@ -272,7 +272,7 @@ def test_extract_client_ip_trusts_forwarded_for_only_from_trusted_proxy(
 
 
 @pytest.mark.asyncio
-async def test_authenticate_records_bad_password_and_reports_password_reason(
+async def test_authenticate_records_bad_password_and_reports_generic_credentials_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user = _user(email="user@example.test")
@@ -287,7 +287,7 @@ async def test_authenticate_records_bad_password_and_reports_password_reason(
         await auth_service.authenticate(session, " USER@example.test ", "bad", "127.0.0.1")
 
     assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "invalid_password"
+    assert exc_info.value.detail == "invalid_credentials"
     attempt = _only_added(session, LoginAttempt)
     assert attempt.email == "user@example.test"
     assert attempt.succeeded is False
@@ -366,12 +366,12 @@ async def test_authenticate_succeeds_when_optional_security_tables_are_missing(
 
 
 @pytest.mark.asyncio
-async def test_authenticate_reports_unknown_or_unavailable_accounts(
+async def test_authenticate_reports_generic_credentials_for_unknown_accounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(auth_service, "get_settings", lambda: SimpleNamespace(login_rate_limit=5))
     for candidate, expected_detail in [
-        (None, "email_not_registered"),
+        (None, "invalid_credentials"),
         (_user(active=False), "account_unavailable"),
         (_user(deleted=True), "account_unavailable"),
     ]:
@@ -631,7 +631,11 @@ async def test_register_merchant_preserves_current_customer_session(monkeypatch)
             pass
     class Request:
         async def json(self):
-            return {"storeName": "Test Store"}
+            return {
+                "storeName": "Test Store",
+                "businessType": "fashion",
+                "storeCategories": ["fashion", "beauty"],
+            }
     session = Session([_Result(scalar=_profile(user)), _Result(), _Result()])
     async def security(*args, **kwargs):
         return state
@@ -651,3 +655,8 @@ async def test_register_merchant_preserves_current_customer_session(monkeypatch)
     assert result["roles"] == ["customer"]
     assert result["merchant_portal_enabled"] is False
     assert result["application_status"] == "pending"
+    application = next(
+        item for item in session.added
+        if getattr(item, "name", None) == "Test Store"
+    )
+    assert application.extra_data["store_categories"] == ["fashion", "beauty"]

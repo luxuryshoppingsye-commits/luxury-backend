@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..models import MODEL_BY_TABLE
 from ..models.domain import Order, OrderItem
 from .financial_calculator import money
 
@@ -20,7 +21,6 @@ MERCHANT_FORBIDDEN_FIELDS = frozenset(
         "discount_total",
         "shipping_total",
         "payment_method",
-        "payment_status",
         "shipping_address",
         "billing_address",
         "notes",
@@ -90,6 +90,7 @@ def _order_projection(row: dict[str, Any], items: list[OrderItem]) -> dict[str, 
         "merchant_order_id": f"{row['id']}:{row['partner_id']}",
         "order_number": row.get("order_number"),
         "status": row.get("status"),
+        "payment_status": row.get("payment_status"),
         "currency_code": currency,
         "created_at": _iso(row.get("created_at")),
         "updated_at": _iso(row.get("updated_at")),
@@ -99,6 +100,41 @@ def _order_projection(row: dict[str, Any], items: list[OrderItem]) -> dict[str, 
         "merchant_total": str(total),
         "financial": _financial_payload(total, currency),
         "items": item_payloads,
+    }
+
+
+async def _merchant_payment_receipt(
+    session: AsyncSession,
+    *,
+    order_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Return only the receipt reference a merchant needs for this order.
+
+    The customer and finance fields stay out of the merchant projection. The
+    reference is resolved through the signed-receipt endpoint before it is
+    rendered by the app.
+    """
+    model = MODEL_BY_TABLE["payment_receipts"]
+    row = (
+        await session.execute(
+            select(model)
+            .where(model.order_id == order_id, model.deleted_at.is_(None))
+            .order_by(model.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if row is None:
+        return None
+    receipt_ref = str(getattr(row, "image_url", "") or f"receipt:{row.id}").strip()
+    if not receipt_ref:
+        receipt_ref = f"receipt:{row.id}"
+    extra = dict(getattr(row, "extra_data", {}) or {})
+    return {
+        "receipt_path": receipt_ref,
+        "receiptPath": receipt_ref,
+        "status": str(getattr(row, "status", "") or ""),
+        "mime_type": str(extra.get("mime_type") or ""),
+        "created_at": _iso(getattr(row, "created_at", None)),
     }
 
 
@@ -135,6 +171,7 @@ async def merchant_order_list(
             Order.id.label("id"),
             Order.order_number.label("order_number"),
             Order.status.label("status"),
+            Order.payment_status.label("payment_status"),
             Order.currency_code.label("currency_code"),
             Order.created_at.label("created_at"),
             Order.updated_at.label("updated_at"),
@@ -152,6 +189,7 @@ async def merchant_order_list(
             Order.id,
             Order.order_number,
             Order.status,
+            Order.payment_status,
             Order.currency_code,
             Order.created_at,
             Order.updated_at,
@@ -176,6 +214,7 @@ async def merchant_order_detail(
             Order.id.label("id"),
             Order.order_number.label("order_number"),
             Order.status.label("status"),
+            Order.payment_status.label("payment_status"),
             Order.currency_code.label("currency_code"),
             Order.created_at.label("created_at"),
             Order.updated_at.label("updated_at"),
@@ -194,6 +233,7 @@ async def merchant_order_detail(
             Order.id,
             Order.order_number,
             Order.status,
+            Order.payment_status,
             Order.currency_code,
             Order.created_at,
             Order.updated_at,
@@ -209,6 +249,7 @@ async def merchant_order_detail(
     return {
         "order": order_payload,
         "items": order_payload["items"],
+        "payment_receipt": await _merchant_payment_receipt(session, order_id=order_id),
         "history": [
             {
                 "status": order_payload["status"],

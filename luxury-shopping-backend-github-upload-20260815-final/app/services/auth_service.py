@@ -383,6 +383,39 @@ async def auth_payload(
     account_state = await account_security_for(session, user.id)
     profile_result = await session.execute(select(Profile).where(Profile.user_id == user.id))
     profile = profile_result.scalar_one_or_none()
+    partner_agreement_accepted: bool | None = None
+    if "partner" in roles:
+        try:
+            contract_model = MODEL_BY_TABLE["partner_contracts"]
+            contract = (
+                await session.execute(
+                    select(contract_model)
+                    .where(
+                        contract_model.partner_id == user.id,
+                        contract_model.deleted_at.is_(None),
+                    )
+                    .order_by(contract_model.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            contract_extra = (
+                contract.extra_data
+                if contract is not None and isinstance(contract.extra_data, dict)
+                else {}
+            )
+            partner_agreement_accepted = bool(
+                contract_extra.get("accepted") is True
+                or (
+                    contract is not None
+                    and str(contract.status or "").strip().lower()
+                    in {"accepted", "active"}
+                    and contract_extra.get("accepted_at")
+                )
+            )
+        except SQLAlchemyError:
+            # A missing optional agreement table must not prevent login.  The
+            # client treats an unknown state as requiring the agreement.
+            partner_agreement_accepted = False
     payload: dict[str, Any] = {
         "user": {
             "id": str(user.id),
@@ -398,6 +431,8 @@ async def auth_payload(
         "profile": serialize_record(profile) if profile else None,
         "roles": roles,
     }
+    if partner_agreement_accepted is not None:
+        payload["partner_agreement_accepted"] = partner_agreement_accepted
     if issue_tokens:
         payload.update({
             "access_token": create_access_token(
@@ -494,7 +529,7 @@ async def authenticate(session: AsyncSession, email: str, password: str, ip: str
     user = result.scalar_one_or_none()
     if user is None:
         await record_login_attempt(session, normalized, ip, False, "unknown_or_inactive_user")
-        raise HTTPException(status_code=401, detail="email_not_registered")
+        raise HTTPException(status_code=401, detail="invalid_credentials")
     if user.deleted_at is not None:
         await record_login_attempt(session, normalized, ip, False, "unknown_or_inactive_user")
         raise HTTPException(status_code=401, detail="account_unavailable")
@@ -515,7 +550,7 @@ async def authenticate(session: AsyncSession, email: str, password: str, ip: str
         raise HTTPException(status_code=503, detail="auth_temporarily_unavailable") from error
     if not valid:
         await record_login_attempt(session, normalized, ip, False, "bad_password")
-        raise HTTPException(status_code=401, detail="invalid_password")
+        raise HTTPException(status_code=401, detail="invalid_credentials")
     if needs_rehash:
         user.password_hash = await asyncio.to_thread(hash_password, password)
         user.password_salt = None

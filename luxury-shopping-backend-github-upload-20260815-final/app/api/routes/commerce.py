@@ -26,6 +26,7 @@ from ...models.domain import (
     FileAsset,
     Order,
     OrderItem,
+    Profile,
     Product,
     ProductVariant,
     User,
@@ -51,9 +52,11 @@ from ...services.catalog_policy import (
 )
 from ...services.financial_calculator import (
     award_loyalty_points_for_fulfilled_order,
+    approved_payment_total,
     calculate_checkout_financials,
     line_total,
     money,
+    refunded_total,
     serialize_local_shopping_requests,
     unit_price,
 )
@@ -96,10 +99,61 @@ ORDER_STATUS_NOTIFICATION_LABELS = {
     "returned": "تم إرجاع الطلب",
 }
 
+ORDER_STATUS_NOTIFICATION_LABELS_EN = {
+    "pending": "Pending",
+    "confirmed": "Confirmed",
+    "approved": "Approved",
+    "accepted": "Accepted",
+    "processing": "Being prepared",
+    "preparing": "Being prepared",
+    "ready_for_shipment": "Ready for shipment",
+    "shipped": "Shipped",
+    "out_for_delivery": "Out for delivery",
+    "delivered": "Delivered",
+    "completed": "Completed",
+    "cancelled": "Cancelled",
+    "canceled": "Cancelled",
+    "rejected": "Rejected",
+    "returned": "Returned",
+}
+
+RETURN_STATUS_LABELS = {
+    "requested": "طلب الإرجاع مرسل",
+    "approved": "تمت الموافقة على الإرجاع",
+    "rejected": "تم رفض الإرجاع",
+    "pickup_scheduled": "تم تحديد استلام المرتجع",
+    "in_transit": "المرتجع في الطريق للمستودع",
+    "received_at_warehouse": "وصل المرتجع للمستودع",
+    "inspection_passed": "اجتاز المرتجع الفحص",
+    "inspection_failed": "لم يجتز المرتجع الفحص",
+    "refund_pending": "بانتظار تنفيذ رد المبلغ",
+    "refunded": "تم رد المبلغ",
+    "cancelled": "تم إلغاء طلب الإرجاع",
+}
+RETURN_STATUS_TRANSITIONS = {
+    "requested": {"approved", "rejected", "cancelled"},
+    "approved": {"pickup_scheduled", "rejected", "cancelled"},
+    "pickup_scheduled": {"in_transit", "cancelled"},
+    "in_transit": {"received_at_warehouse"},
+    "received_at_warehouse": {"inspection_passed", "inspection_failed"},
+    "inspection_passed": {"refund_pending"},
+    "refund_pending": {"refunded"},
+    "inspection_failed": {"rejected"},
+}
+RETURN_BLOCKED_TERMS = (
+    "ملابس داخلية", "ملابس داخليه", "لانجري", "lingerie", "underwear", "brief", "panty",
+)
+RETURN_CLEARANCE_TERMS = ("تصفية", "clearance", "final sale", "final-sale", "غير قابل للإرجاع", "non returnable")
+
 
 def _order_status_notification_label(status: str) -> str:
     normalized = str(status or "").strip().lower().replace(" ", "_")
     return ORDER_STATUS_NOTIFICATION_LABELS.get(normalized, str(status or "").strip())
+
+
+def _order_status_notification_label_en(status: str) -> str:
+    normalized = str(status or "").strip().lower().replace(" ", "_")
+    return ORDER_STATUS_NOTIFICATION_LABELS_EN.get(normalized, normalized.replace("_", " ").title() or "Pending")
 
 
 IDEMPOTENCY_RESPONSE_INTERNAL_FIELDS = {
@@ -130,6 +184,17 @@ def _line_original_unit(product: Product, variant: ProductVariant | None, sale_u
     except HTTPException:
         return sale_unit
     return original if original > sale_unit else sale_unit
+
+
+def _return_policy_snapshot(product: Product, unit_price: Decimal) -> dict[str, Any]:
+    """Keep the return policy that applied when the order was placed."""
+    extra = dict(getattr(product, "extra_data", {}) or {})
+    return {
+        "returnable": extra.get("returnable", extra.get("is_returnable", True)) is not False,
+        "clearance": bool(extra.get("clearance") or extra.get("is_clearance") or extra.get("clearance_sale")),
+        "policy_source": "checkout_snapshot",
+        "unit_price": str(money(unit_price)),
+    }
 
 
 def _normalize_idempotency_key(value: Any) -> str | None:
@@ -716,6 +781,51 @@ async def _product_payload(session: AsyncSession, product: Product) -> dict[str,
     if brand:
         row["brand_name"] = brand.name
     return row
+
+
+def _return_status_label(status: Any) -> str:
+    normalized = str(status or "requested").strip().lower()
+    return RETURN_STATUS_LABELS.get(normalized, normalized.replace("_", " "))
+
+
+def _return_policy_reason(item: OrderItem, product: Product | None, category: Category | None) -> str | None:
+    item_extra = getattr(item, "extra_data", {}) or {}
+    snapshot_value = item_extra.get("return_policy") if isinstance(item_extra, dict) else None
+    snapshot = dict(snapshot_value) if isinstance(snapshot_value, dict) else {}
+    if snapshot.get("returnable") is False:
+        return "هذا المنتج غير قابل للإرجاع حسب سياسة المنتج."
+    raw_product_extra = (getattr(product, "extra_data", {}) or {}) if product is not None else {}
+    product_extra = dict(raw_product_extra) if isinstance(raw_product_extra, dict) else {}
+    category_text = str(getattr(category, "name", "") or "")
+    product_text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(item, "product_name", ""),
+            getattr(product, "name", "") if product is not None else "",
+            getattr(product, "promotional_title", "") if product is not None else "",
+            category_text,
+            " ".join(str(tag or "") for tag in (getattr(product, "tags", []) or [])) if product is not None else "",
+        )
+    ).strip().lower()
+    if any(term in product_text for term in RETURN_BLOCKED_TERMS):
+        return "الملابس الداخلية والمنتجات المشابهة غير قابلة للإرجاع."
+    clearance = bool(
+        snapshot.get("clearance")
+        or product_extra.get("clearance")
+        or product_extra.get("is_clearance")
+        or product_extra.get("clearance_sale")
+        or any(term in product_text for term in RETURN_CLEARANCE_TERMS)
+    )
+    if clearance:
+        return "منتجات التصفية والبيع النهائي غير قابلة للإرجاع."
+    return None
+
+
+def _serialize_return(row: Any, items: list[Any] | None = None) -> dict[str, Any]:
+    payload = serialize_record(row)
+    payload["status_label"] = _return_status_label(getattr(row, "status", None))
+    payload["items"] = [serialize_record(item) for item in (items or [])]
+    return payload
 
 
 async def _product_payloads(
@@ -1421,7 +1531,7 @@ async def catalog_product_detail(identifier: str, session: AsyncSession = Depend
 @router.get("/partner-storefronts")
 async def partner_storefronts(limit: int = Query(80, ge=1, le=5000), session: AsyncSession = Depends(get_session)):
     return await public_read_cache.get_or_set(
-        cache_key("catalog-stores", limit=limit),
+        cache_key("catalog-stores-v2", limit=limit),
         lambda: _partner_storefronts_uncached(limit=limit, session=session),
     )
 
@@ -1674,7 +1784,6 @@ async def api_sync_cart(request: Request, user: User = Depends(current_user), se
             variant=variant,
             variant_id=variant_id,
             quantity=quantity,
-            allow_out_of_stock=True,
         )
         validated.append((product_id, variant_id, quantity))
     await session.execute(delete(UserCart).where(UserCart.user_id == user.id))
@@ -1759,7 +1868,6 @@ async def add_cart(
         variant=variant,
         variant_id=variant_id,
         quantity=target_quantity,
-        allow_out_of_stock=True,
     )
     if item:
         item.quantity = target_quantity
@@ -1996,6 +2104,9 @@ def _partner_request_payload(row: Any) -> dict[str, Any]:
         "priority": payload.get("priority") or "normal",
         "contact_phone": payload.get("contact_phone") or "",
         "reference_url": payload.get("reference_url") or "",
+        "reviewed_at": payload.get("reviewed_at") or "",
+        "reviewed_by": payload.get("reviewed_by") or "",
+        "review_reason": payload.get("review_reason") or "",
     }
 
 
@@ -2016,6 +2127,65 @@ async def api_partner_requests(
         .limit(limit)
     )
     return {"data": [_partner_request_payload(row) for row in result.scalars()]}
+
+
+def _partner_request_admin_payload(
+    row: Any,
+    *,
+    partner_email: str,
+    partner_name: str | None,
+    partner_store_name: str | None,
+) -> dict[str, Any]:
+    return {
+        **_partner_request_payload(row),
+        "partner_email": partner_email,
+        "partner_name": partner_name or partner_store_name or partner_email,
+        "partner_store_name": partner_store_name or "",
+    }
+
+
+@router.get("/api/admin/partner-requests")
+async def api_admin_partner_requests(
+    status: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    del staff
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status and normalized_status not in {
+        "pending",
+        "approved",
+        "rejected",
+        "draft",
+        "processing",
+        "completed",
+        "cancelled",
+    }:
+        raise HTTPException(status_code=422, detail="invalid_partner_request_status")
+    model = MODEL_BY_TABLE["partner_order_requests"]
+    statement = (
+        select(model, User.email, Profile.full_name, Profile.store_name)
+        .join(User, model.partner_id == User.id)
+        .outerjoin(Profile, Profile.user_id == model.partner_id)
+        .where(model.deleted_at.is_(None))
+        .order_by(model.created_at.desc())
+        .limit(limit)
+    )
+    if normalized_status:
+        statement = statement.where(func.lower(model.status) == normalized_status)
+    result = await session.execute(statement)
+    return {
+        "data": [
+            _partner_request_admin_payload(
+                row,
+                partner_email=email,
+                partner_name=full_name,
+                partner_store_name=store_name,
+            )
+            for row, email, full_name, store_name in result.all()
+        ]
+    }
 
 
 @router.post("/api/partner/requests")
@@ -2126,6 +2296,75 @@ async def api_update_partner_request(
     return {"data": _partner_request_payload(row)}
 
 
+@router.patch("/api/admin/partner-requests/{record_id}/review")
+async def api_review_partner_request(
+    record_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="invalid_review_payload")
+    review_status = str(body.get("status") or "").strip().lower()
+    if review_status not in {"approved", "rejected"}:
+        raise HTTPException(status_code=422, detail="invalid_partner_request_review_status")
+    review_reason = str(body.get("reason") or "").strip()
+    if review_status == "rejected" and not review_reason:
+        raise HTTPException(status_code=422, detail="partner_request_rejection_reason_required")
+
+    model = MODEL_BY_TABLE["partner_order_requests"]
+    row = await session.get(model, record_id, with_for_update=True)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="partner_request_not_found")
+    if str(row.status or "pending").lower() != "pending":
+        raise HTTPException(status_code=409, detail="partner_request_already_reviewed")
+
+    request_payload = _partner_request_payload(row)
+    raw_payload = (
+        dict(row.extra_data)
+        if isinstance(getattr(row, "extra_data", None), dict)
+        else {}
+    )
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    raw_payload.update(
+        {
+            "reviewed_at": reviewed_at,
+            "reviewed_by": str(staff.id),
+            "review_reason": review_reason,
+        }
+    )
+    row.extra_data = raw_payload
+    row.status = review_status
+    decision_label = "اعتمدت" if review_status == "approved" else "رُفضت"
+    message = f"{decision_label} الإدارة طلبك الخاص: {request_payload['title']}"
+    if review_reason:
+        message = f"{message}. السبب: {review_reason}"
+    await _create_notification(
+        session,
+        "notifications",
+        user_id=row.partner_id,
+        title="تحديث طلبك الخاص",
+        body=message,
+        notification_type=f"partner_request_{review_status}",
+        category="partner",
+        priority="high",
+        action_type="open_partner_requests",
+        url="/partner/requests",
+        entity_type="partner_order_requests",
+        entity_id=str(row.id),
+        payload={
+            "partner_request_id": str(row.id),
+            "status": review_status,
+            "review_reason": review_reason,
+        },
+        created_by=staff.id,
+        deduplication_key=f"partner-request-review:{row.id}:{review_status}",
+    )
+    await session.commit()
+    return {"data": _partner_request_payload(row)}
+
+
 @router.delete("/api/partner/requests/{record_id}")
 async def api_delete_partner_request(
     record_id: uuid.UUID,
@@ -2135,7 +2374,14 @@ async def api_delete_partner_request(
 ):
     if "partner" not in roles:
         raise HTTPException(status_code=403, detail="partner_required")
-    row = await _partner_request_row_or_404(session, record_id=record_id, partner_id=user.id)
+    model = MODEL_BY_TABLE["partner_order_requests"]
+    row = await session.get(model, record_id, with_for_update=True)
+    if row is None or row.partner_id != user.id:
+        raise HTTPException(status_code=404, detail="partner_request_not_found")
+    if row.deleted_at is not None or str(row.status or "").lower() == "deleted":
+        return {"ok": True, "already_deleted": True}
+    if str(row.status or "pending").lower() not in _PARTNER_REQUEST_EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="partner_request_locked")
     row.deleted_at = datetime.now(timezone.utc)
     row.status = "deleted"
     await session.commit()
@@ -2390,7 +2636,10 @@ async def checkout(
                 unit_price=calculated_unit_price,
                 total_price=line_total(calculated_unit_price, item.quantity),
                 partner_id=product.partner_id,
-                extra_data={"pricing_snapshot": {"unit_price": str(money(calculated_unit_price)), "quantity": item.quantity}},
+                extra_data={
+                    "pricing_snapshot": {"unit_price": str(money(calculated_unit_price)), "quantity": item.quantity},
+                    "return_policy": _return_policy_snapshot(product, calculated_unit_price),
+                },
             ))
             if product.track_inventory:
                 if variant:
@@ -2668,6 +2917,20 @@ async def api_user_international_shopping_orders(
     return {"data": [serialize_record(row) for row in result.scalars()]}
 
 
+@router.get("/api/orders/international-shopping/{order_id}")
+async def api_user_international_shopping_order_detail(
+    order_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return one international-shopping request owned by the customer."""
+    model = MODEL_BY_TABLE["international_orders"]
+    row = await session.get(model, order_id)
+    if row is None or row.deleted_at is not None or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="international_order_not_found")
+    return {"data": serialize_record(row)}
+
+
 @router.get("/orders/{order_id}")
 @router.get("/api/orders/{order_id}")
 async def order_detail(
@@ -2697,7 +2960,23 @@ async def order_detail(
         raise HTTPException(status_code=404, detail="order_not_found")
     if order.user_id != user.id and not is_staff:
         raise HTTPException(status_code=404, detail="order_not_found")
-    items = await session.execute(select(OrderItem).where(OrderItem.order_id == order_id))
+    item_rows = list(
+        (
+            await session.execute(
+                select(OrderItem).where(OrderItem.order_id == order_id)
+            )
+        ).scalars()
+    )
+    serialized_items: list[dict[str, Any]] = []
+    for item in item_rows:
+        product = await session.get(Product, item.product_id) if item.product_id else None
+        category = await session.get(Category, product.category_id) if product and product.category_id else None
+        policy_reason = _return_policy_reason(item, product, category)
+        item_payload = serialize_record(item)
+        item_payload["returnable"] = policy_reason is None
+        if policy_reason:
+            item_payload["return_policy_reason"] = policy_reason
+        serialized_items.append(item_payload)
     history_model = MODEL_BY_TABLE["order_status_history"]
     history = await session.execute(select(history_model).where(history_model.order_id == order_id).order_by(history_model.created_at))
     payment_model = MODEL_BY_TABLE["order_payments"]
@@ -2705,16 +2984,408 @@ async def order_detail(
     shipping_model = MODEL_BY_TABLE["order_shipping"]
     shipping = await session.execute(select(shipping_model).where(shipping_model.order_id == order_id).limit(1))
     shipping_row = shipping.scalar_one_or_none()
+    returns_model = MODEL_BY_TABLE["returns"]
+    return_rows = list(
+        (
+            await session.execute(
+                select(returns_model)
+                .where(returns_model.order_id == order_id, returns_model.deleted_at.is_(None))
+                .order_by(returns_model.created_at.desc())
+            )
+        ).scalars()
+    )
+    return_items_model = MODEL_BY_TABLE["return_items"]
+    return_item_rows = list(
+        (
+            await session.execute(
+                select(return_items_model)
+                .where(return_items_model.order_id == order_id, return_items_model.deleted_at.is_(None))
+                .order_by(return_items_model.created_at)
+            )
+        ).scalars()
+    )
+    items_by_return: dict[str, list[Any]] = {}
+    for return_item in return_item_rows:
+        items_by_return.setdefault(str(return_item.return_id), []).append(return_item)
     payload = {
         "order": _serialize_order(order),
-        "items": [serialize_record(row) for row in items.scalars()],
+        "items": serialized_items,
         "payments": [serialize_record(row) for row in payments.scalars()],
         "history": [serialize_record(row) for row in history.scalars()],
         "shipping": serialize_record(shipping_row) if shipping_row is not None else None,
         "shippingHistory": [],
         "notes": order.notes,
+        "customerReceived": bool((order.extra_data or {}).get("customer_received_at")),
+        "returns": [_serialize_return(row, items_by_return.get(str(row.id), [])) for row in return_rows],
     }
     return {"data": payload} if False else payload
+
+
+@router.post("/orders/{order_id}/received")
+@router.post("/api/orders/{order_id}/received")
+async def confirm_customer_order_received(
+    order_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Record the customer's explicit delivery confirmation once the order is delivered."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    order = (
+        await session.execute(
+            select(Order)
+            .where(Order.id == order_id, Order.user_id == user.id, Order.deleted_at.is_(None))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    if normalize_status(order.status) not in {"delivered", "completed"}:
+        raise HTTPException(status_code=409, detail="order_not_delivered")
+    extra = dict(order.extra_data or {})
+    already_confirmed = bool(extra.get("customer_received_at"))
+    if not already_confirmed:
+        now = datetime.now(timezone.utc).isoformat()
+        extra.update({
+            "customer_received_at": now,
+            "customer_received_by": str(user.id),
+            "customer_confirmed_received": True,
+        })
+        order.extra_data = extra
+        history_model = MODEL_BY_TABLE["order_status_history"]
+        session.add(history_model(
+            order_id=order.id,
+            status="customer_received",
+            notes=body.get("note") or "أكد العميل استلام الطلب.",
+            extra_data={
+                "actor": "customer",
+                "confirmed_at": now,
+                "previous_status": order.status,
+                "new_status": "customer_received",
+            },
+        ))
+        await _create_notification(
+            session,
+            "admin_notifications",
+            title="تأكيد استلام طلب",
+            body=f"أكد العميل استلام الطلب {order.order_number}.",
+            message=f"أكد العميل استلام الطلب {order.order_number}.",
+            type="customer_order_received",
+            status="new",
+            is_read=False,
+            category="order",
+            priority="normal",
+            entity_type="order",
+            entity_id=str(order.id),
+            payload={"order_id": str(order.id), "customer_id": str(user.id)},
+            deduplication_key=f"customer-order-received:{order.id}",
+        )
+        await session.commit()
+    return {"order": _serialize_order(order), "customerReceived": True, "idempotent": already_confirmed}
+
+
+@router.post("/orders/{order_id}/returns", status_code=201)
+@router.post("/api/orders/{order_id}/returns", status_code=201)
+async def create_customer_return_request(
+    order_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a whole-order or item-level return request after delivery confirmation."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    if body.get("confirmedReceived") is not True and body.get("confirmed_received") is not True:
+        raise HTTPException(status_code=409, detail="return_requires_received_confirmation")
+    order = (
+        await session.execute(
+            select(Order)
+            .where(Order.id == order_id, Order.user_id == user.id, Order.deleted_at.is_(None))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    if normalize_status(order.status) not in {"delivered", "completed"}:
+        raise HTTPException(status_code=409, detail="order_not_delivered")
+    order_extra = dict(order.extra_data or {})
+    if not order_extra.get("customer_received_at"):
+        now = datetime.now(timezone.utc).isoformat()
+        order_extra.update({
+            "customer_received_at": now,
+            "customer_received_by": str(user.id),
+            "customer_confirmed_received": True,
+        })
+        order.extra_data = order_extra
+
+    order_items = list((await session.execute(select(OrderItem).where(OrderItem.order_id == order.id))).scalars())
+    if not order_items:
+        raise HTTPException(status_code=409, detail="order_has_no_items")
+    requested_rows = body.get("items")
+    if not isinstance(requested_rows, list) or not requested_rows:
+        requested_rows = [{"orderItemId": str(item.id), "quantity": item.quantity} for item in order_items]
+    by_id = {str(item.id): item for item in order_items}
+    active_return_items_model = MODEL_BY_TABLE["return_items"]
+    active_return_statuses = {"requested", "approved", "pickup_scheduled", "in_transit", "received_at_warehouse", "inspection_passed", "refund_pending", "refunded"}
+    active_rows = list(
+        (
+            await session.execute(
+                select(active_return_items_model).where(
+                    active_return_items_model.order_id == order.id,
+                    active_return_items_model.deleted_at.is_(None),
+                    active_return_items_model.status.in_(tuple(active_return_statuses)),
+                )
+            )
+        ).scalars()
+    )
+    used_quantity: dict[str, int] = {}
+    for row in active_rows:
+        key = str(row.order_item_id)
+        used_quantity[key] = used_quantity.get(key, 0) + int(row.quantity or 0)
+
+    selected: list[tuple[OrderItem, int, Product | None, Category | None]] = []
+    blocked: list[dict[str, Any]] = []
+    seen_item_ids: set[str] = set()
+    for raw in requested_rows:
+        if not isinstance(raw, dict):
+            continue
+        item_id = str(raw.get("orderItemId") or raw.get("order_item_id") or raw.get("id") or "").strip()
+        item = by_id.get(item_id)
+        if item is None or item_id in seen_item_ids:
+            raise HTTPException(status_code=422, detail="invalid_return_item")
+        seen_item_ids.add(item_id)
+        try:
+            quantity = int(raw.get("quantity") or item.quantity)
+        except (TypeError, ValueError):
+            quantity = 0
+        available = int(item.quantity or 0) - used_quantity.get(item_id, 0)
+        if quantity < 1 or quantity > available:
+            raise HTTPException(status_code=409, detail="return_quantity_exceeds_available")
+        product = await session.get(Product, item.product_id) if item.product_id else None
+        category = await session.get(Category, product.category_id) if product and product.category_id else None
+        reason = _return_policy_reason(item, product, category)
+        if reason:
+            blocked.append({"order_item_id": item_id, "product_name": item.product_name, "reason": reason})
+            continue
+        selected.append((item, quantity, product, category))
+    if blocked:
+        raise HTTPException(status_code=422, detail={"code": "return_items_not_eligible", "items": blocked})
+    if not selected:
+        raise HTTPException(status_code=422, detail="return_items_required")
+
+    amount = money(sum((money(item.unit_price) * quantity for item, quantity, _product, _category in selected), Decimal("0.00")))
+    configured_fee = order_extra.get("return_fee_amount")
+    fee = money(configured_fee) if configured_fee is not None else money(order.shipping_total)
+    fee = min(fee, amount)
+    refund_amount = money(max(amount - fee, Decimal("0.00")))
+    reason = str(body.get("reason") or "تغيير رغبة العميل").strip()[:500]
+    refund_method = str(body.get("refundMethod") or body.get("refund_method") or "original_payment").strip().lower()
+    if refund_method not in {"original_payment", "store_credit", "wallet_transfer", "cash"}:
+        raise HTTPException(status_code=422, detail="invalid_refund_method")
+    returns_model = MODEL_BY_TABLE["returns"]
+    return_row = returns_model(
+        order_id=order.id,
+        user_id=user.id,
+        status="requested",
+        amount=amount,
+        fee=fee,
+        refund_amount=refund_amount,
+        reason=reason,
+        refund_method=refund_method,
+        requested_by=user.id,
+        extra_data={
+            "fee_policy": "shipping_total_capped_at_selected_items" if configured_fee is None else "order_configured_return_fee",
+            "currency_code": order.currency_code,
+            "confirmed_received_at": order_extra.get("customer_received_at"),
+            "history": [{"status": "requested", "at": datetime.now(timezone.utc).isoformat(), "actor": "customer"}],
+        },
+    )
+    session.add(return_row)
+    await session.flush()
+    for item, quantity, _product, _category in selected:
+        session.add(active_return_items_model(
+            return_id=return_row.id,
+            order_id=order.id,
+            user_id=user.id,
+            order_item_id=item.id,
+            product_id=item.product_id,
+            product_name=item.product_name,
+            quantity=quantity,
+            unit_price=money(item.unit_price),
+            amount=money(item.unit_price) * quantity,
+            status="requested",
+            reason=reason,
+        ))
+    await _create_notification(
+        session,
+        "admin_notifications",
+        title="طلب إرجاع جديد",
+        body=f"طلب العميل إرجاع {len(selected)} منتج من الطلب {order.order_number}.",
+        message=f"طلب العميل إرجاع {len(selected)} منتج من الطلب {order.order_number}.",
+        type="order_return_requested",
+        status="new",
+        is_read=False,
+        category="order",
+        priority="high",
+        entity_type="return",
+        entity_id=str(return_row.id),
+        payload={"return_id": str(return_row.id), "order_id": str(order.id), "refund_amount": str(refund_amount)},
+        deduplication_key=f"return-request:{return_row.id}",
+    )
+    await session.commit()
+    return _serialize_return(return_row, [])
+
+
+@router.get("/api/admin/returns")
+async def list_admin_returns(
+    status_filter: str | None = Query(None, alias="status"),
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if not roles.intersection({"admin", "manager", "logistics", "finance", "staff"}):
+        raise HTTPException(status_code=403, detail="returns_permission_required")
+    model = MODEL_BY_TABLE["returns"]
+    statement = select(model).where(model.deleted_at.is_(None)).order_by(model.created_at.desc()).limit(500)
+    if status_filter:
+        statement = statement.where(model.status == status_filter.strip().lower())
+    rows = list((await session.execute(statement)).scalars())
+    item_model = MODEL_BY_TABLE["return_items"]
+    item_rows = list((await session.execute(select(item_model).where(item_model.deleted_at.is_(None), item_model.return_id.in_([row.id for row in rows])))).scalars()) if rows else []
+    items_by_return: dict[str, list[Any]] = {}
+    for item in item_rows:
+        items_by_return.setdefault(str(item.return_id), []).append(item)
+    return {"data": [_serialize_return(row, items_by_return.get(str(row.id), [])) for row in rows]}
+
+
+@router.patch("/api/admin/returns/{return_id}/status")
+async def update_return_status(
+    return_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if not roles.intersection({"admin", "manager", "logistics", "finance", "staff"}):
+        raise HTTPException(status_code=403, detail="returns_permission_required")
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    next_status = str(body.get("status") or "").strip().lower()
+    model = MODEL_BY_TABLE["returns"]
+    row = (await session.execute(select(model).where(model.id == return_id, model.deleted_at.is_(None)).with_for_update())).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="return_not_found")
+    current = str(row.status or "requested").strip().lower()
+    if current == next_status:
+        return {"data": _serialize_return(row)}
+    if next_status not in RETURN_STATUS_TRANSITIONS.get(current, set()):
+        raise HTTPException(status_code=409, detail="invalid_return_transition")
+    order = await session.get(Order, row.order_id, with_for_update=True)
+    if order is None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    extra = dict(row.extra_data or {})
+    if next_status == "refund_pending":
+        paid = await approved_payment_total(session, order.id)
+        already_refunded = await refunded_total(session, order.id)
+        amount = money(row.refund_amount)
+        if amount > money(max(paid - already_refunded, Decimal("0.00"))):
+            raise HTTPException(status_code=409, detail="refund_exceeds_paid_amount")
+        refunds_model = MODEL_BY_TABLE["refunds"]
+        existing_refund = (
+            await session.execute(select(refunds_model).where(refunds_model.extra_data["return_id"].astext == str(row.id), refunds_model.deleted_at.is_(None)).limit(1))
+        ).scalar_one_or_none()
+        if existing_refund is None and amount > 0:
+            refund = refunds_model(
+                order_id=order.id,
+                user_id=order.user_id,
+                status="requires_manual_action",
+                amount=amount,
+                reason=f"Return {return_id}: {row.reason or 'customer return'}",
+                extra_data={
+                    "return_id": str(row.id),
+                    "refund_method": row.refund_method,
+                    "requires_manual_action": True,
+                    "manual_completion_required": True,
+                    "provider_status": "blocked_credentials",
+                    "requested_by": str(staff.id),
+                },
+            )
+            session.add(refund)
+            await session.flush()
+            extra["refund_id"] = str(refund.id)
+        extra["refund_created_at"] = datetime.now(timezone.utc).isoformat()
+        await _create_notification(
+            session,
+            "admin_notifications",
+            title="استرداد جاهز للتنفيذ",
+            body=f"اجتاز طلب الإرجاع للطلب {order.order_number} الفحص وأصبح جاهزاً للصرف.",
+            message=f"اجتاز طلب الإرجاع للطلب {order.order_number} الفحص وأصبح جاهزاً للصرف.",
+            type="order_return_refund_pending",
+            status="new",
+            is_read=False,
+            category="finance",
+            priority="high",
+            extra_data={
+                "return_id": str(row.id),
+                "order_id": str(order.id),
+                "refund_id": extra.get("refund_id"),
+                "refund_amount": str(amount),
+            },
+        )
+    if next_status == "refunded":
+        refund_id = extra.get("refund_id")
+        if not refund_id and money(row.refund_amount) > 0:
+            raise HTTPException(status_code=409, detail="return_refund_not_created")
+        if refund_id:
+            refunds_model = MODEL_BY_TABLE["refunds"]
+            refund = await session.get(refunds_model, _uuid(refund_id, "refund_id"))
+            if refund is None or str(refund.status or "").lower() not in {"completed", "succeeded", "provider_succeeded", "manual_completed"}:
+                raise HTTPException(status_code=409, detail="return_refund_not_completed")
+    extra["history"] = [*(extra.get("history") or []), {"status": next_status, "at": datetime.now(timezone.utc).isoformat(), "actor": str(staff.id), "note": body.get("note")}]
+    if body.get("note"):
+        extra["review_note"] = str(body.get("note"))[:500]
+    row.status = next_status
+    row.reviewed_by = staff.id
+    row.reviewed_at = datetime.now(timezone.utc)
+    row.extra_data = extra
+    item_model = MODEL_BY_TABLE["return_items"]
+    item_rows = list(
+        (
+            await session.execute(
+                select(item_model).where(
+                    item_model.return_id == row.id,
+                    item_model.deleted_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+    for item_row in item_rows:
+        item_row.status = next_status
+    await _create_notification(
+        session,
+        "notifications",
+        user_id=order.user_id,
+        recipient_id=order.user_id,
+        order_id=order.id,
+        title="تحديث طلب الإرجاع",
+        body=f"{_return_status_label(next_status)} للطلب {order.order_number}.",
+        message=f"{_return_status_label(next_status)} للطلب {order.order_number}.",
+        type="order_return_update",
+        status="new",
+        is_read=False,
+        category="order",
+        priority="high",
+        entity_type="return",
+        entity_id=str(row.id),
+        payload={"return_id": str(row.id), "order_id": str(order.id), "return_status": next_status},
+        deduplication_key=f"return-status:{row.id}:{next_status}",
+    )
+    await session.commit()
+    return {"data": _serialize_return(row, item_rows)}
 
 
 @router.get("/api/partner/orders/{order_id}")
@@ -2737,69 +3408,10 @@ async def api_partner_order_status(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    """Change only the merchant-visible status of an order owned by this partner."""
+    """Partners can view only their order rows; fulfillment is staff-owned."""
     if "partner" not in roles:
         raise HTTPException(status_code=403, detail="partner_required")
-    body = await request.json()
-    next_status = str(body.get("nextStatus") or body.get("status") or "").strip()
-    if not next_status:
-        raise HTTPException(status_code=400, detail="order_status_required")
-
-    result = await session.execute(
-        select(Order)
-        .join(OrderItem, OrderItem.order_id == Order.id)
-        .where(
-            Order.id == order_id,
-            Order.deleted_at.is_(None),
-            OrderItem.partner_id == user.id,
-        )
-        .with_for_update()
-    )
-    order = result.unique().scalar_one_or_none()
-    if order is None:
-        raise HTTPException(status_code=404, detail="order_not_found")
-
-    previous, next_status = assert_allowed_transition(order.status, next_status)
-    assert_delivery_proof(next_status, body)
-    order.status = next_status
-    await award_loyalty_points_for_fulfilled_order(session, order)
-    history_model = MODEL_BY_TABLE["order_status_history"]
-    session.add(
-        history_model(
-            order_id=order.id,
-            status=next_status,
-            notes=body.get("note"),
-            extra_data={"previous_status": previous, "new_status": next_status, "scope": "partner"},
-        )
-    )
-    audit_model = MODEL_BY_TABLE["audit_logs"]
-    session.add(
-        audit_model(
-            user_id=user.id,
-            type="partner_order_status_changed",
-            description=f"Changed merchant order {order.order_number} status from {previous} to {next_status}",
-            extra_data={"order_id": str(order.id), "previous_status": previous, "new_status": next_status},
-        )
-    )
-    await _create_notification(
-        session,
-        "notifications",
-        user_id=order.user_id,
-        recipient_id=order.user_id,
-        order_id=order.id,
-        title="تحديث حالة الطلب",
-        body=f"{_order_status_notification_label(next_status)}.",
-        message=f"{_order_status_notification_label(next_status)}.",
-        type="order_status",
-        status="new",
-        is_read=False,
-        category="order",
-        priority="high",
-        payload={"deep_link": f"/orders/{order.id}", "order_status": next_status},
-        deduplication_key=f"order-status:{order.id}:{next_status}",
-    )
-    await session.commit()
-    return {"data": await merchant_order_detail(session, partner_id=user.id, order_id=order_id)}
+    raise HTTPException(status_code=403, detail="partner_order_status_read_only")
 
 
 @router.post("/orders/{order_id}/status")
@@ -2860,7 +3472,12 @@ async def change_order_status(
         message=f"{_order_status_notification_label(next_status)}.",
         type="order_status", status="new", is_read=False,
         category="order", priority="high",
-        payload={"deep_link": f"/orders/{order.id}", "order_status": next_status},
+        payload={
+            "deep_link": f"/orders/{order.id}",
+            "order_status": next_status,
+            "title_en": "Order status updated",
+            "body_en": f"Your order status is now {_order_status_notification_label_en(next_status)}.",
+        },
         deduplication_key=f"order-status:{order.id}:{next_status}",
     )
     await session.commit()
@@ -3119,6 +3736,10 @@ async def manage_create_supplier(
     session: AsyncSession = Depends(get_session),
 ):
     _require_manage_catalog_roles(roles)
+    if "partner" in roles and not roles.intersection(
+        {"admin", "manager", "staff", "employee", "logistics"}
+    ):
+        raise HTTPException(status_code=403, detail="supplier_management_admin_only")
     body = await request.json()
     name = str(body.get("name") or body.get("business_name") or "").strip()
     if len(name) < 2:

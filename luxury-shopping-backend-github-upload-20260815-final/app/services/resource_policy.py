@@ -245,6 +245,7 @@ GENERIC_WRITE_BLOCKED_FOR_NON_STAFF = frozenset(
         "payment_receipts",
         "refunds",
         "returns",
+        "return_items",
         "order_financials",
         "financial_vouchers",
         "cash_transactions",

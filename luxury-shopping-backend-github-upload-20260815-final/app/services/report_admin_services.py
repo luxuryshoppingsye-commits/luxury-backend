@@ -753,11 +753,17 @@ class CampaignService:
         if len(message) < 3:
             raise HTTPException(status_code=422, detail="campaign_message_required")
         scheduled_at = _parse_datetime(body.get("scheduledAt") or body.get("scheduled_at"), "scheduled_at")
-        channels = body.get("channels") or [body.get("channel") or "in_app"]
+        channels = body.get("channels")
+        if channels is None:
+            requested_channel = body.get("channel")
+            channels = [requested_channel] if requested_channel else ["in_app", "push"]
         if not isinstance(channels, list):
             channels = [channels]
         allowed_channels = {"in_app", "push", "email", "whatsapp"}
         clean_channels = sorted({str(item).strip().lower() for item in channels if str(item).strip().lower() in allowed_channels})
+        # Every new announcement is also visible inside the app and as a
+        # device alert. Any selected external channel is kept alongside it.
+        clean_channels = sorted({*clean_channels, "in_app", "push"})
         if not clean_channels:
             raise HTTPException(status_code=422, detail="campaign_channel_required")
         audience = str(body.get("audience") or body.get("targetAudience") or "all_active_users").strip()
@@ -843,7 +849,7 @@ class CampaignService:
                 "campaign_id": str(row.id),
                 "status": row.status,
                 "audience_count": len(recipient_ids),
-                "channels": (row.extra_data or {}).get("channels") or ["in_app"],
+                "channels": (row.extra_data or {}).get("channels") or ["in_app", "push"],
                 "payload": {"title": row.title, "message": row.message},
             }
         }
@@ -878,7 +884,11 @@ class CampaignService:
         for row in campaigns:
             row.status = "processing"
             recipient_ids = await self._audience(session, row)
-            channels = (row.extra_data or {}).get("channels") or ["in_app"]
+            channels = list(dict.fromkeys([
+                *((row.extra_data or {}).get("channels") or []),
+                "in_app",
+                "push",
+            ]))
             sent = await self._deliver_batch(session, row, recipient_ids, channels)
             processed += 1
             delivered += sent["sent"]
@@ -929,13 +939,7 @@ class CampaignService:
                     status = "blocked_credentials"
                     blocked_credentials += 1
                 else:
-                    pref = await notification.preferences_for(recipient_id)
-                    enabled = pref.promotional_notifications and (
-                        pref.mobile_push_enabled if channel == "push" else pref.in_app_enabled
-                    )
-                    if channel in {"in_app", "push"} and not enabled:
-                        status = "suppressed_by_preference"
-                    elif channel in {"in_app", "push"}:
+                    if channel in {"in_app", "push"}:
                         sent += 1
                         await notification.create_notification(
                             NotificationPayload(

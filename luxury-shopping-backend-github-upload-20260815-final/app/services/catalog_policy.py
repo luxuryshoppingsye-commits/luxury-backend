@@ -72,6 +72,10 @@ MERCHANT_BLOCKED_PRODUCT_FIELDS = frozenset(
         "sponsored",
         "featured_rank",
         "featuredRank",
+        "supplier_id",
+        "supplierId",
+        "supplier_name",
+        "supplierName",
     }
 )
 MERCHANT_SENSITIVE_PRODUCT_FIELDS = frozenset(
@@ -314,6 +318,22 @@ def public_storefront_response(
     resolved_id = public_id or _storefront_value(row, "partner_id") or _storefront_value(row, "user_id") or _storefront_value(row, "id") or ""
     resolved_store_type = store_type or "partner"
     resolved_partner_id = _storefront_value(row, "partner_id") or _storefront_value(row, "user_id")
+    category_value = _storefront_value(row, "category")
+    raw_categories = _storefront_value(row, "store_categories") or _storefront_value(row, "categories")
+    if isinstance(raw_categories, str):
+        raw_categories = [raw_categories]
+    if not isinstance(raw_categories, (list, tuple, set)):
+        raw_categories = []
+    categories = []
+    seen_categories = set()
+    for value in raw_categories:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if text and key not in seen_categories:
+            seen_categories.add(key)
+            categories.append(text)
+    if not categories and category_value:
+        categories.append(str(category_value).strip())
     logo_value = (
         _storefront_value(row, "logo_url")
         or _storefront_value(row, "store_logo_url")
@@ -344,7 +364,8 @@ def public_storefront_response(
         "description": _storefront_value(row, "description"),
         "public_city": _storefront_value(row, "city"),
         "city": _storefront_value(row, "city"),
-        "category": _storefront_value(row, "category"),
+        "category": category_value,
+        "categories": categories,
         "rating": _json_value(_storefront_value(row, "rating") or 0),
         "reviews_count": int(_storefront_value(row, "reviews_count") or 0),
         "products_count": int(products_count if products_count is not None else (_storefront_value(row, "product_count") or 0)),
@@ -370,6 +391,7 @@ def public_main_storefront_response(*, products_count: int = 0) -> dict[str, Any
         "public_city": None,
         "city": None,
         "category": "main",
+        "categories": ["main"],
         "rating": 0,
         "reviews_count": 0,
         "products_count": int(products_count or 0),

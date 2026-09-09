@@ -43,6 +43,7 @@ def test_public_product_response_exposes_variant_options() -> None:
 def test_product_details_mutations_require_authentication_policy() -> None:
     for method, path in (
         ("POST", "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e"),
+        ("PATCH", "/api/reviews/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/status"),
         ("PATCH", "/api/reviews/11afafe1-dc42-42ee-b3d1-0bd0f871655e"),
         ("DELETE", "/api/reviews/11afafe1-dc42-42ee-b3d1-0bd0f871655e"),
         ("PUT", "/api/engagement/products/11afafe1-dc42-42ee-b3d1-0bd0f871655e/like"),

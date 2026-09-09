@@ -11,6 +11,7 @@ from backend.app.services.function_service import (
     _chat_direct_guidance,
     _chat_site_context,
     _answer_matches_chat_intent,
+    _chat_requested_catalog_audiences,
     _customer_safe_site_context_v2,
     _extract_chat_budget,
     _fallback_chat_answer,
@@ -85,6 +86,67 @@ def test_public_ai_chat_requires_answer_to_match_customer_intent():
         "ايش العروض؟",
         "عندنا عروض مختارة وأسعار مخفضة.",
     )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("طلب ملابس نسائية صيفية", ("women",)),
+        ("summer clothes for women", ("women",)),
+        ("أبغى ملابس رجالية", ("men",)),
+        ("أحتاج ملابس أطفال", ("kids",)),
+        ("أبغى ملابس نسائية وأطفال", ("women", "kids")),
+    ],
+)
+def test_public_ai_catalog_audience_uses_only_the_explicit_requested_department(message, expected):
+    assert _chat_requested_catalog_audiences(message) == expected
+
+
+def test_public_ai_chat_rejects_products_from_another_explicit_department():
+    assert not _answer_matches_chat_intent(
+        "طلب ملابس نسائية صيفية",
+        "خيارات مناسبة: فستان نسائي؛ بنطلون أطفال. افتح المنتجات لمشاهدة التوفر.",
+    )
+    assert _answer_matches_chat_intent(
+        "طلب ملابس نسائية صيفية",
+        "خيارات مناسبة: فستان نسائي صيفي. افتح المنتجات لمشاهدة التوفر.",
+    )
+    assert _answer_matches_chat_intent(
+        "summer clothes for women",
+        "Suitable options: a summer dress for women.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_ai_catalog_query_filters_out_unrequested_departments():
+    class EmptyResult:
+        def scalars(self):
+            return []
+
+    class CaptureSession:
+        def __init__(self):
+            self.statements = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return EmptyResult()
+
+    session = CaptureSession()
+    _context, has_products = await _chat_site_context(
+        session,
+        "طلب ملابس نسائية صيفية",
+        language="ar",
+        user=None,
+    )
+
+    product_query = session.statements[0].compile()
+    query_text = str(product_query).upper()
+    parameter_values = {str(value) for value in product_query.params.values()}
+
+    assert has_products is False
+    assert "NOT" in query_text
+    assert "%نسائي%" in parameter_values
+    assert "%طفل%" in parameter_values
 
 
 def test_public_ai_chat_detects_unusable_encoding_excuse():

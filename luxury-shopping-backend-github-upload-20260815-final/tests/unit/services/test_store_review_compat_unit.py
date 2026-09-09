@@ -84,6 +84,8 @@ def test_handover_create_uses_direct_review_columns() -> None:
 
     assert "INSERT INTO public.store_reviews" in session.statement
     assert "rating, comment, customer_name" in session.statement
+    assert "ON CONFLICT (user_id) DO UPDATE" in session.statement
+    assert "status = 'pending'" in session.statement
     assert "extra_data" not in session.statement
     assert session.params["rating"] == 5
     assert result is not None

@@ -14,7 +14,7 @@ from email.utils import parseaddr
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -135,6 +135,97 @@ def _email_valid(value: str) -> bool:
     return bool(value and EMAIL_RE.match(value)) and "\r" not in value and "\n" not in value
 
 
+def _is_password_reset_email(row: Any) -> bool:
+    """Password-reset mail intentionally stays out of the app notification feed."""
+    extra = _extra(row)
+    markers = (
+        extra.get("purpose"),
+        extra.get("template"),
+        extra.get("notification_type"),
+        getattr(row, "title", None),
+    )
+    normalized = " ".join(str(marker or "").strip().lower() for marker in markers)
+    return any(
+        marker in normalized
+        for marker in (
+            "password_reset",
+            "reset_password",
+            "password reset",
+            "استعادة كلمة المرور",
+        )
+    )
+
+
+def _email_popup_mirror_skipped(row: Any) -> bool:
+    extra = _extra(row)
+    return bool(
+        extra.get("app_popup_created")
+        or extra.get("notification_id")
+        or _is_password_reset_email(row)
+    )
+
+
+async def _mirror_delivered_email_in_app(
+    session: AsyncSession,
+    *,
+    row: Any,
+    recipient: str,
+) -> bool:
+    """Create one device-visible alert for a delivered, non-sensitive email.
+
+    The email body can contain links, receipts, or one-time codes, so the app
+    alert only confirms that a message was sent and directs the customer to
+    their inbox. Notification-generated email rows carry ``notification_id``
+    and are skipped to avoid an email/push loop.
+    """
+    if _email_popup_mirror_skipped(row):
+        return False
+
+    user_model = MODEL_BY_TABLE["users"]
+    recipient_user_id = (
+        await session.execute(
+            select(user_model.id)
+            .where(
+                user_model.deleted_at.is_(None),
+                func.lower(user_model.email) == recipient.lower(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if recipient_user_id is None:
+        return False
+
+    # Import here because notification delivery itself can enqueue an email.
+    from .notification_service import NotificationPayload, NotificationService
+
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=recipient_user_id,
+            title=str(getattr(row, "title", None) or "رسالة جديدة من رفاهية التسوق"),
+            body="تم إرسال رسالة إلى بريدك الإلكتروني. افتح بريدك لمراجعة التفاصيل.",
+            notification_type="email_message",
+            category="system",
+            action_type="open_link",
+            action_url="/notifications",
+            entity_type="email_outbox",
+            entity_id=str(getattr(row, "id", "")) or None,
+            payload={"email_delivery": True},
+            source="email_outbox_mirror",
+            deduplication_key=f"email-popup:{row.id}",
+            delivery_channels=("in_app", "mobile_push", "web_push"),
+        )
+    )
+    _set_extra(
+        row,
+        {
+            "app_popup_created": True,
+            "app_popup_user_id": str(recipient_user_id),
+            "app_popup_created_at": _iso(_now()),
+        },
+    )
+    return True
+
+
 def _phone_valid(value: str) -> bool:
     compact = re.sub(r"[\s\-()]", "", value)
     return bool(PHONE_RE.match(compact))
@@ -208,6 +299,9 @@ def _send_resend_email_sync(
 
 async def _allowed_by_preferences(session: AsyncSession, row: Any, channel: str) -> tuple[bool, str | None]:
     user_id = getattr(row, "user_id", None)
+    extra = _extra(row)
+    if channel == "email" and user_id is None and extra.get("contact_message_id"):
+        return True, None
     if user_id is None:
         return False, "recipient_user_required"
     pref_model = MODEL_BY_TABLE["notification_preferences"]
@@ -216,7 +310,6 @@ async def _allowed_by_preferences(session: AsyncSession, row: Any, channel: str)
             select(pref_model).where(pref_model.user_id == user_id, pref_model.deleted_at.is_(None)).limit(1)
         )
     ).scalar_one_or_none()
-    extra = _extra(row)
     category = str(extra.get("category") or extra.get("notification_category") or "system").lower()
     consent_required = bool(extra.get("consent_required", category in {"marketing", "promotional", "promotions"}))
     if consent_required and extra.get("consent") is False:
@@ -554,7 +647,7 @@ async def process_email_outbox(session: AsyncSession, limit: int | None = None) 
     limit = limit or settings.message_batch_size
     configured = email_delivery_configured(settings)
     rows = await _claim_rows(session, "email_outbox", limit)
-    counts = {"configured": configured, "claimed": len(rows), "provider_accepted": 0, "retry_scheduled": 0, "failed_permanent": 0, "dead_letter": 0, "blocked_configuration": 0, "suppressed": 0}
+    counts = {"configured": configured, "claimed": len(rows), "provider_accepted": 0, "in_app_mirrored": 0, "retry_scheduled": 0, "failed_permanent": 0, "dead_letter": 0, "blocked_configuration": 0, "suppressed": 0}
     for row in rows:
         extra = _extra(row)
         attempts = int(extra.get("attempts") or 0) + 1
@@ -583,6 +676,17 @@ async def process_email_outbox(session: AsyncSession, limit: int | None = None) 
             )
             _mark_terminal(row, "provider_accepted", provider_id=f"{_email_provider_mode(settings)}:accepted")
             counts["provider_accepted"] += 1
+            try:
+                if await _mirror_delivered_email_in_app(
+                    session,
+                    row=row,
+                    recipient=recipient,
+                ):
+                    counts["in_app_mirrored"] += 1
+            except Exception as error:
+                # The email was accepted already. A transient push/database
+                # issue must never send the same email again on retry.
+                _set_extra(row, {"app_popup_error": _safe_error(error)})
         except smtplib.SMTPAuthenticationError as error:
             code = getattr(error, "smtp_code", None)
             _mark_terminal(row, "failed_permanent", code=f"smtp_auth_{code or 'failed'}")

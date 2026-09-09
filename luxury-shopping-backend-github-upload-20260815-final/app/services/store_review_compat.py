@@ -41,6 +41,15 @@ INSERT INTO public.store_reviews (
 VALUES (
     :user_id, :rating, :comment, :customer_name, 'pending', FALSE, FALSE
 )
+ON CONFLICT (user_id) DO UPDATE SET
+    rating = EXCLUDED.rating,
+    comment = EXCLUDED.comment,
+    customer_name = EXCLUDED.customer_name,
+    status = 'pending',
+    is_approved = FALSE,
+    is_rejected = FALSE,
+    admin_notes = NULL,
+    updated_at = NOW()
 RETURNING id, user_id, rating, comment, customer_name,
           is_approved, is_rejected, admin_notes, status, created_at, updated_at
 """

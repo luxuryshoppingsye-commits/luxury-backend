@@ -142,7 +142,7 @@ async def _create_checkout_order(client: AsyncClient, headers: dict[str, str], p
     return checkout.json()
 
 
-async def test_cart_holds_out_of_stock_products_but_rejects_non_public_products_and_bad_quantities() -> None:
+async def test_cart_rejects_new_out_of_stock_products_but_keeps_existing_lines_reducible() -> None:
     suffix = uuid.uuid4().hex[:8]
     email, password, _ = await _seed_user(f"eligibility_{suffix}")
     approved_id = await _seed_product(f"approved_{suffix}")
@@ -157,15 +157,38 @@ async def test_cart_holds_out_of_stock_products_but_rejects_non_public_products_
         approved = await client.post("/cart", headers=headers, json={"productId": str(approved_id), "quantity": 1})
         assert approved.status_code == 201, approved.text
 
+        held_cart = await client.post(
+            "/cart",
+            headers=headers,
+            json={"productId": str(approved_id), "quantity": 2},
+        )
+        assert held_cart.status_code == 201, held_cart.text
+
+        async with SessionFactory() as session:
+            approved = await session.get(Product, approved_id)
+            assert approved is not None
+            approved.stock_quantity = 0
+            await session.commit()
+
         out_of_stock_cart = await client.post(
             "/cart",
             headers=headers,
-            json={"productId": str(out_of_stock_id), "quantity": 2},
+            json={"productId": str(out_of_stock_id), "quantity": 1},
         )
-        assert out_of_stock_cart.status_code == 201, out_of_stock_cart.text
+        assert out_of_stock_cart.status_code == 409
+        assert out_of_stock_cart.json()["detail"] == "insufficient_stock"
+
+        out_of_stock_sync = await client.put(
+            "/api/cart",
+            headers=headers,
+            json={"items": [{"productId": str(out_of_stock_id), "quantity": 1}]},
+        )
+        assert out_of_stock_sync.status_code == 409
+        assert out_of_stock_sync.json()["detail"] == "insufficient_stock"
+
         cart_read = await client.get("/cart", headers=headers)
         held_line = next(
-            row for row in cart_read.json() if row["product_id"] == str(out_of_stock_id)
+            row for row in cart_read.json() if row["product_id"] == str(approved_id)
         )
         assert held_line["is_available_for_checkout"] is False
         assert held_line["availability_error"] == "insufficient_stock"

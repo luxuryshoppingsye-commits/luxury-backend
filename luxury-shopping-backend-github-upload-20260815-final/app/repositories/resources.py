@@ -73,6 +73,7 @@ PUBLIC_READ_TABLES = {
 }
 USER_OWNED_TABLES = {
     "profiles", "wishlist", "user_cart", "notifications", "orders",
+    "returns", "return_items",
     "support_tickets", "account_deletion_requests", "user_loyalty",
     "points_transactions", "product_likes", "product_comparisons",
     "product_reviews", "store_reviews", "customer_addresses",
@@ -91,10 +92,16 @@ MERCHANT_TYPED_ORDER_ENDPOINT_TABLES = {
     "payment_receipts",
     "refunds",
     "returns",
+    "return_items",
     "order_financials",
     "order_shipping",
     "shipping_history",
     "courier_assignments",
+}
+MERCHANT_TYPED_FINANCE_ENDPOINT_TABLES = {
+    "partner_wallets",
+    "partner_settlements",
+    "partner_payments",
 }
 ADMIN_ROLES = {"admin", "manager"}
 STAFF_ROLES = ADMIN_ROLES | {"finance", "logistics", "staff", "employee"}
@@ -115,6 +122,204 @@ LOGISTICS_TABLES = {
     "inventory_locations", "order_status_history",
 }
 SUPPORT_TABLES = {"support_tickets", "ticket_messages"}
+
+_RESOURCE_ORDER_STATUS_LABELS = {
+    "pending": ("قيد الانتظار", "Pending"),
+    "confirmed": ("تم تأكيد الطلب", "Confirmed"),
+    "approved": ("تم اعتماد الطلب", "Approved"),
+    "accepted": ("تم اعتماد الطلب", "Accepted"),
+    "processing": ("قيد التجهيز", "Being prepared"),
+    "preparing": ("قيد التجهيز", "Being prepared"),
+    "ready_for_shipment": ("الطلب جاهز للشحن", "Ready for shipment"),
+    "shipped": ("تم شحن الطلب", "Shipped"),
+    "out_for_delivery": ("الطلب خرج للتوصيل", "Out for delivery"),
+    "delivered": ("تم تسليم الطلب", "Delivered"),
+    "completed": ("اكتمل الطلب", "Completed"),
+    "cancelled": ("تم إلغاء الطلب", "Cancelled"),
+    "canceled": ("تم إلغاء الطلب", "Cancelled"),
+    "rejected": ("تم رفض الطلب", "Rejected"),
+    "returned": ("تم إرجاع الطلب", "Returned"),
+}
+
+
+def _resource_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _resource_order_status_labels(value: Any) -> tuple[str, str]:
+    normalized = _resource_status(value)
+    return _RESOURCE_ORDER_STATUS_LABELS.get(
+        normalized,
+        (str(value or "قيد المتابعة"), normalized.replace("_", " ").title() or "Pending"),
+    )
+
+
+def _resource_extra_value(record: Any, key: str) -> Any:
+    extra_data = getattr(record, "extra_data", None)
+    return extra_data.get(key) if isinstance(extra_data, dict) else None
+
+
+async def _notify_customer_resource_update(
+    session: AsyncSession,
+    table: str,
+    record: Any,
+    previous: dict[str, Any],
+    changed_data: dict[str, Any],
+    actor_id: uuid.UUID | None,
+) -> None:
+    """Create customer/partner notifications for generic staff resource edits."""
+    if not actor_id:
+        return
+    from ..services.notification_service import NotificationPayload, NotificationService
+
+    target_id = None
+    notification_type = None
+    title = body = title_en = body_en = ""
+    payload: dict[str, Any] = {}
+    action_url = None
+    entity_type = table
+    entity_id = str(getattr(record, "id", ""))
+
+    if table == "international_orders":
+        target_id = getattr(record, "user_id", None)
+        old_status = _resource_status(previous.get("status"))
+        new_status = _resource_status(getattr(record, "status", None))
+        old_extra = previous.get("extra_data") if isinstance(previous.get("extra_data"), dict) else {}
+        new_extra = getattr(record, "extra_data", None) if isinstance(getattr(record, "extra_data", None), dict) else {}
+        pricing_keys = {"amount", "final_cost", "finalCost", "estimated_cost", "shipping_cost", "service_fee", "customs_cost"}
+        pricing_changed = bool(pricing_keys.intersection(changed_data)) or any(
+            old_extra.get(key) != new_extra.get(key)
+            for key in pricing_keys
+            if key in old_extra or key in new_extra
+        )
+        status_changed = "status" in changed_data and old_status != new_status
+        if not target_id or not (status_changed or pricing_changed):
+            return
+        if pricing_changed:
+            amount = getattr(record, "amount", None) or new_extra.get("final_cost") or new_extra.get("finalCost")
+            currency = new_extra.get("currency_code") or new_extra.get("currencyCode") or "YER"
+            title = "تم تحديث تسعير طلبك الدولي"
+            body = f"تم تحديث تسعير طلبك الدولي إلى {amount} {currency}. يرجى مراجعة الطلب وتأكيده للمتابعة."
+            title_en = "Your international order pricing was updated"
+            body_en = f"Your international order pricing was updated. New total: {amount} {currency}. Please review the order."
+        else:
+            ar_status, en_status = _resource_order_status_labels(new_status)
+            title = "تم تحديث حالة طلبك الدولي"
+            body = f"حالة طلبك الدولي الآن: {ar_status}."
+            title_en = "Your international order status was updated"
+            body_en = f"Your international order status is now {en_status}."
+        notification_type = "order_update"
+        payload = {
+            "orderId": entity_id,
+            "status": new_status,
+            "order_status": new_status,
+            "title_en": title_en,
+            "body_en": body_en,
+            "deep_link": f"/my-orders?highlight={entity_id}",
+        }
+        action_url = payload["deep_link"]
+    elif table == "products":
+        old_status = _resource_status(previous.get("approval_status"))
+        new_status = _resource_status(getattr(record, "approval_status", None))
+        if old_status == new_status or new_status not in {"approved", "active", "published", "rejected", "pending", "reviewing"}:
+            return
+        target_id = getattr(record, "partner_id", None)
+        if not target_id:
+            return
+        approved = new_status in {"approved", "active", "published"}
+        rejected = new_status == "rejected"
+        product_name = str(getattr(record, "name", None) or "المنتج")
+        reason = str(getattr(record, "approval_notes", None) or "").strip()
+        notification_type = "product_approved" if approved else "product_rejected" if rejected else "product_submitted_for_review"
+        title = "مبروك تمت الموافقة على منتجك" if approved else "تم رفض منتجك" if rejected else "منتجك قيد المراجعة"
+        body = (
+            f"تمت الموافقة على المنتج {product_name} ويمكن للعملاء رؤيته الآن."
+            if approved
+            else f"سبب الرفض: {reason}" if rejected and reason else "تم رفض منتجك. يرجى مراجعة بياناته."
+            if rejected
+            else f"تم إبقاء المنتج {product_name} قيد المراجعة."
+        )
+        title_en = "Your product was approved" if approved else "Your product was rejected" if rejected else "Your product is under review"
+        body_en = (
+            "Your product was approved and is now visible to customers."
+            if approved
+            else f"Reason for rejection: {reason}" if rejected and reason else "Your product was rejected. Please review its details."
+            if rejected
+            else "Your product is being reviewed by the administration."
+        )
+        payload = {
+            "productId": entity_id,
+            "approvalStatus": new_status,
+            "title_en": title_en,
+            "body_en": body_en,
+            "deep_link": "/partner/products",
+        }
+        if rejected and reason:
+            payload["rejectionReason"] = reason
+        action_url = "/partner/products"
+    elif table in {"partner_storefronts", "partner_applications"}:
+        old_status = _resource_status(previous.get("status"))
+        new_status = _resource_status(getattr(record, "status", None))
+        if old_status == new_status or new_status not in {"approved", "rejected"}:
+            return
+        target_id = getattr(record, "partner_id", None) or getattr(record, "user_id", None)
+        if not target_id:
+            return
+        reason = str(_resource_extra_value(record, "review_reason") or getattr(record, "description", None) or "").strip()
+        storefront = table == "partner_storefronts"
+        notification_type = ("storefront_" if storefront else "partner_application_") + new_status
+        title = (
+            "مبروك تمت الموافقة على متجرك" if storefront and new_status == "approved"
+            else "تم رفض طلب متجرك" if storefront
+            else "تمت الموافقة على طلب التاجر" if new_status == "approved"
+            else "تم رفض طلب التاجر"
+        )
+        body = (
+            "تمت الموافقة على متجرك وأصبح جاهزاً لاستقبال المنتجات والعملاء." if storefront and new_status == "approved"
+            else f"سبب الرفض: {reason}" if storefront and reason
+            else "تمت الموافقة على طلب متجرك ويمكنك الآن تجهيز المنتجات للمراجعة." if new_status == "approved"
+            else f"سبب الرفض: {reason}" if reason
+            else "تم رفض طلب التاجر. راجع بيانات الطلب ثم تواصل مع الدعم."
+        )
+        title_en = "Your store was approved" if storefront and new_status == "approved" else "Your store was rejected" if storefront else "Your merchant application was approved" if new_status == "approved" else "Your merchant application was rejected"
+        body_en = (
+            "Your store was approved and is ready for customers." if storefront and new_status == "approved"
+            else f"Reason for rejection: {reason}" if storefront and reason
+            else "Your merchant application was approved. You can now prepare your products for review." if new_status == "approved"
+            else f"Reason for rejection: {reason}" if reason
+            else "Please review your merchant application and contact support if needed."
+        )
+        payload = {
+            "title_en": title_en,
+            "body_en": body_en,
+            "deep_link": "/partner/products" if storefront else "/partner/applications",
+        }
+        action_url = payload["deep_link"]
+    else:
+        return
+
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=target_id,
+            title=title,
+            body=body,
+            notification_type=notification_type or "message",
+            category="order" if table == "international_orders" else "partner" if table in {"partner_storefronts", "partner_applications"} else "system",
+            priority="high",
+            action_type="open_resource",
+            action_url=action_url,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            order_id=getattr(record, "id", None) if table == "international_orders" else None,
+            payload=payload,
+            created_by=actor_id,
+            deduplication_key=(
+                f"partner-application-review:{entity_id}:{_resource_status(getattr(record, 'status', None))}"
+                if table == "partner_applications"
+                else f"resource-update:{table}:{entity_id}:{notification_type}:{datetime.now().astimezone().isoformat()}"
+            ),
+        )
+    )
 
 
 def _json_value(value: Any) -> Any:
@@ -358,6 +563,8 @@ class ResourceRepository:
             raise HTTPException(status_code=403, detail="resource_role_scope_denied")
         if "partner" in self.roles and operation == "select" and self.table in MERCHANT_TYPED_ORDER_ENDPOINT_TABLES:
             raise HTTPException(status_code=403, detail="merchant_typed_endpoint_required")
+        if "partner" in self.roles and operation == "select" and self.table in MERCHANT_TYPED_FINANCE_ENDPOINT_TABLES:
+            raise HTTPException(status_code=403, detail="merchant_typed_finance_endpoint_required")
         if self.table in USER_OWNED_TABLES:
             return
         if "partner" in self.roles and (self.table in PARTNER_OWNED_TABLES or self.table in {"products", "product_variants"}):
@@ -806,9 +1013,23 @@ class ResourceRepository:
             record = await self._record_from_row(row)
             if record is None:
                 continue
+            previous = {
+                "status": getattr(record, "status", None),
+                "approval_status": getattr(record, "approval_status", None),
+                "amount": getattr(record, "amount", None),
+                "extra_data": dict(getattr(record, "extra_data", None) or {}),
+            }
             for key, value in data.items():
                 if key != "id" and key not in {"user_id", "owner_id", "partner_id", "merchant_id", "marketer_id", "courier_id"}:
                     setattr(record, key, value)
+            await _notify_customer_resource_update(
+                self.session,
+                self.table,
+                record,
+                previous,
+                data,
+                self.user_id,
+            )
             updated.append(record)
         await self.session.flush()
         return [self._serialize_response(record) for record in updated]

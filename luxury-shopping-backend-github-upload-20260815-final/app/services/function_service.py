@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException, Request
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -112,6 +112,166 @@ def _is_chat_product_request(message: str) -> bool:
             "men", "women", "perfume", "shoes", "bag", "watch", "electronics",
         ],
     )
+
+
+_CHAT_CATALOG_AUDIENCE_TERMS: dict[str, tuple[str, ...]] = {
+    "women": (
+        "نسائي",
+        "نسائية",
+        "نساء",
+        "حريمي",
+        "سيدات",
+        "للسيدات",
+        "women",
+        "woman",
+        "ladies",
+        "female",
+    ),
+    "men": (
+        "رجالي",
+        "رجالية",
+        "رجال",
+        "للرجال",
+        "men",
+        "man",
+        "gents",
+        "male",
+    ),
+    "kids": (
+        "طفل",
+        "اطفال",
+        "أطفال",
+        "طفلي",
+        "طفلتي",
+        "ابني",
+        "بنتي",
+        "اولاد",
+        "أولاد",
+        "kids",
+        "kid",
+        "child",
+        "children",
+        "boys",
+        "girls",
+    ),
+}
+
+
+def _chat_requested_catalog_audiences(message: str) -> tuple[str, ...]:
+    """Return only the explicit shopper audiences named in a request.
+
+    Generic words such as "ملابس" must not override this signal: the catalog
+    contains several clothing departments, so treating a generic match as an
+    audience caused a women's request to include children's products.
+    """
+    return tuple(
+        audience
+        for audience, terms in _CHAT_CATALOG_AUDIENCE_TERMS.items()
+        if _has_any_chat_audience_term(message, terms)
+    )
+
+
+def _has_any_chat_audience_term(value: str, terms: tuple[str, ...]) -> bool:
+    """Match English audience words whole, so ``women`` never also matches ``men``."""
+    return any(
+        _has_any_whole_chat_term(value, [term])
+        if re.fullmatch(r"[a-z ]+", term, re.IGNORECASE)
+        else _has_any_chat_term(value, [term])
+        for term in terms
+    )
+
+
+def _chat_audience_category_clause(audience: str) -> Any:
+    terms = _CHAT_CATALOG_AUDIENCE_TERMS[audience]
+    clauses = []
+    for term in terms:
+        pattern = f"%{term}%"
+        clauses.extend(
+            [
+                Category.name.ilike(pattern),
+                Category.name_en.ilike(pattern),
+                Category.slug.ilike(pattern),
+                Category.description_ar.ilike(pattern),
+                Category.description_en.ilike(pattern),
+            ]
+        )
+    return or_(*clauses)
+
+
+def _chat_audience_category_ids(audience: str) -> Any:
+    return select(Category.id).where(
+        Category.deleted_at.is_(None),
+        Category.is_active.is_(True),
+        _chat_audience_category_clause(audience),
+    )
+
+
+def _chat_audience_product_text_clause(audience: str) -> Any:
+    terms = _CHAT_CATALOG_AUDIENCE_TERMS[audience]
+    product_clauses = []
+    for term in terms:
+        pattern = f"%{term}%"
+        product_clauses.extend(
+            [
+                Product.name.ilike(pattern),
+                Product.name_en.ilike(pattern),
+                Product.description.ilike(pattern),
+                Product.promotional_title.ilike(pattern),
+            ]
+        )
+    return or_(*product_clauses)
+
+
+def _chat_audience_product_clause(audience: str) -> Any:
+    return or_(
+        _chat_audience_product_text_clause(audience),
+        Product.category_id.in_(_chat_audience_category_ids(audience)),
+    )
+
+
+def _chat_catalog_audience_product_filters(message: str) -> list[Any]:
+    """Keep catalog recommendations within each explicitly requested audience."""
+    requested = _chat_requested_catalog_audiences(message)
+    if not requested:
+        return []
+    allowed = [_chat_audience_product_clause(audience) for audience in requested]
+    excluded = [
+        audience
+        for audience in _CHAT_CATALOG_AUDIENCE_TERMS
+        if audience not in requested
+    ]
+    filters: list[Any] = [or_(*allowed)]
+    for audience in excluded:
+        # Keep products without a category eligible when their own title or
+        # description confirms the requested audience. ``NOT (NULL IN ...)``
+        # is SQL NULL, so it would otherwise hide those valid products.
+        filters.extend(
+            [
+                not_(_chat_audience_product_text_clause(audience)),
+                or_(
+                    Product.category_id.is_(None),
+                    not_(Product.category_id.in_(_chat_audience_category_ids(audience))),
+                ),
+            ]
+        )
+    return filters
+
+
+def _chat_catalog_audience_category_filters(message: str) -> list[Any]:
+    """Apply the same audience boundary when Noura lists store categories."""
+    requested = _chat_requested_catalog_audiences(message)
+    if not requested:
+        return []
+    allowed = [_chat_audience_category_clause(audience) for audience in requested]
+    excluded = [
+        _chat_audience_category_clause(audience)
+        for audience in _CHAT_CATALOG_AUDIENCE_TERMS
+        if audience not in requested
+    ]
+    filters: list[Any] = [or_(*allowed)]
+    if excluded:
+        filters.append(not_(or_(*excluded)))
+    return filters
 
 
 def _expand_chat_catalog_terms(terms: list[str]) -> list[str]:
@@ -1125,6 +1285,18 @@ def _looks_like_unusable_ai_answer(value: str, language: str) -> bool:
 
 
 def _answer_matches_chat_intent(message: str, answer: str) -> bool:
+    requested_audiences = _chat_requested_catalog_audiences(message)
+    if requested_audiences:
+        conflicting_audiences = (
+            audience
+            for audience in _CHAT_CATALOG_AUDIENCE_TERMS
+            if audience not in requested_audiences
+        )
+        if any(
+            _has_any_chat_audience_term(answer, _CHAT_CATALOG_AUDIENCE_TERMS[audience])
+            for audience in conflicting_audiences
+        ):
+            return False
     direct_guidance = _chat_direct_guidance(message, "ar") or _chat_direct_guidance(message, "en")
     if direct_guidance:
         normalized_message = _normalize_chat_text(message)
@@ -1657,8 +1829,9 @@ async def _chat_site_context(
         terms = []
 
     public_product_filters = [Product.is_active.is_(True), *public_product_clauses(Product)]
+    audience_product_filters = _chat_catalog_audience_product_filters(message)
 
-    product_filters = list(public_product_filters)
+    product_filters = [*public_product_filters, *audience_product_filters]
     if budget is not None:
         product_filters.append(Product.price <= budget)
     if terms:
@@ -1716,6 +1889,7 @@ async def _chat_site_context(
 
     offer_filters = [
         *public_product_filters,
+        *audience_product_filters,
         Product.original_price.is_not(None),
         Product.original_price > Product.price,
     ]
@@ -1734,11 +1908,16 @@ async def _chat_site_context(
             ).scalars()
         )
 
+    category_audience_filters = _chat_catalog_audience_category_filters(message)
     categories = list(
         (
             await session.execute(
                 select(Category)
-                .where(Category.deleted_at.is_(None), Category.is_active.is_(True))
+                .where(
+                    Category.deleted_at.is_(None),
+                    Category.is_active.is_(True),
+                    *category_audience_filters,
+                )
                 .order_by(Category.sort_order.asc(), Category.name.asc())
                 .limit(10 if wants_categories or not terms else 5)
             )
@@ -1949,18 +2128,43 @@ async def _approve_partner(
     else:
         storefront.status = "active"
         storefront.is_active = True
+    business_type = str((application.extra_data or {}).get("business_type") or "").strip()
+    store_categories = [
+        str(value).strip().lower()
+        for value in ((application.extra_data or {}).get("store_categories") or [])
+        if str(value).strip().lower()
+        in {"fashion", "beauty", "accessories", "electronics", "home", "kids", "food"}
+    ]
+    store_details = {
+        key: str((application.extra_data or {}).get(key) or "").strip()
+        for key in ("store_city", "store_address")
+        if str((application.extra_data or {}).get(key) or "").strip()
+    }
+    if business_type or store_categories or store_details:
+        storefront.extra_data = {
+            **(storefront.extra_data or {}),
+            **store_details,
+            **({"business_type": business_type} if business_type else {}),
+            **({"store_categories": list(dict.fromkeys(store_categories))} if store_categories else {}),
+        }
     await NotificationService(session).create_notification(
         NotificationPayload(
             user_id=application.user_id,
             title="تمت الموافقة على طلب متجرك",
-            body="تمت الموافقة على طلب متجرك ويمكنك الآن تجهيز المنتجات للمراجعة.",
+            body="تمت الموافقة على طلب متجرك. افتح التطبيق واقبل اتفاقية التاجر لبدء تجهيز متجرك.",
             notification_type="partner_application_approved",
             category="partner",
             priority="high",
             entity_type="partner_applications",
             entity_id=str(application.id),
+            payload={
+                "title_en": "Your merchant application was approved",
+                "body_en": "Your merchant account is ready. Review and accept the merchant agreement to continue.",
+                "deep_link": "/partner/agreement?required=1",
+            },
             created_by=actor.id,
             deduplication_key=f"partner-application-review:{application.id}:approved",
+            delivery_channels=("in_app", "mobile_push", "web_push"),
         )
     )
     return {"ok": True, "application": serialize_record(application)}
@@ -2151,23 +2355,29 @@ async def execute_function(
         target_ids = [_uuid(item, "user_id") for item in raw_ids]
         if any(item != actor.id for item in target_ids):
             _require_roles(roles, STAFF_ROLES)
-        model = MODEL_BY_TABLE["notifications"]
         created = []
+        service = NotificationService(session)
+        title = _text(body, "title", "p_title", default="إشعار")
+        message = _text(body, "message", "p_message", "body", "p_body")
+        notification_type = _text(body, "type", "p_type", default="message")
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
         for target_id in target_ids:
-            row = model(
-                user_id=target_id,
-                recipient_id=target_id,
-                order_id=_uuid(body.get("order_id") or body.get("p_order_id"), "order_id")
-                if body.get("order_id") or body.get("p_order_id")
-                else None,
-                title=_text(body, "title", "p_title", default="إشعار"),
-                body=_text(body, "message", "p_message", "body", "p_body"),
-                message=_text(body, "message", "p_message", "body", "p_body"),
-                type=_text(body, "type", "p_type", default="message"),
-                status="new",
-                is_read=False,
+            row = await service.create_notification(
+                NotificationPayload(
+                    user_id=target_id,
+                    title=title,
+                    body=message,
+                    notification_type=notification_type,
+                    category=_text(body, "category", default="system"),
+                    priority=_text(body, "priority", default="high"),
+                    order_id=_uuid(body.get("order_id") or body.get("p_order_id"), "order_id")
+                    if body.get("order_id") or body.get("p_order_id")
+                    else None,
+                    payload=payload,
+                    created_by=actor.id,
+                    source="function_create_user_notification",
+                )
             )
-            session.add(row)
             created.append(row)
         await session.flush()
         return [serialize_record(row) for row in created]
@@ -2239,9 +2449,40 @@ async def execute_function(
         priority = _text(body, "priority", default="high")
         action_url = _text(body, "actionUrl", "action_url", "url", "deep_link") or None
         payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        requested_dedupe_key = _text(
+            body,
+            "deduplicationKey",
+            "deduplication_key",
+            "dedupe_key",
+        )
+        raw_channels = body.get("channels")
+        if isinstance(raw_channels, list):
+            delivery_channels = tuple(
+                str(channel).strip() for channel in raw_channels if str(channel).strip()
+            )
+        elif isinstance(raw_channels, dict):
+            channel_aliases = {
+                "push": "mobile_push",
+                "mobile_push": "mobile_push",
+                "browser": "web_push",
+                "web_push": "web_push",
+                "in_app": "in_app",
+            }
+            delivery_channels = tuple(
+                channel_aliases[key]
+                for key, enabled in raw_channels.items()
+                if enabled is True and key in channel_aliases
+            )
+        else:
+            delivery_channels = None
         created = []
         for target in user_ids:
             target_id = _uuid(target, "user_id")
+            target_dedupe_key = (
+                f"{requested_dedupe_key}:{target_id}"
+                if requested_dedupe_key
+                else None
+            )
             notification = await service.create_notification(
                 NotificationPayload(
                     user_id=target_id,
@@ -2254,6 +2495,8 @@ async def execute_function(
                     payload=payload,
                     created_by=actor.id,
                     source="function_fanout",
+                    deduplication_key=target_dedupe_key,
+                    delivery_channels=delivery_channels,
                 )
             )
             created.append(notification)

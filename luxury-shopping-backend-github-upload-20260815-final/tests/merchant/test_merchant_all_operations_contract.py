@@ -118,6 +118,42 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
         assert "partner" in merchant_auth["roles"]
         merchant_headers = _headers(merchant_auth["access_token"])
 
+        supplier_creation = await client.post(
+            "/manage/suppliers",
+            headers=merchant_headers,
+            json={"name": f"Forbidden supplier {suffix}"},
+        )
+        assert supplier_creation.status_code == 403, supplier_creation.text
+        assert supplier_creation.json()["detail"] == "supplier_management_admin_only"
+
+        supplier_assignment = await client.post(
+            "/manage/products",
+            headers=merchant_headers,
+            json={
+                "name": f"Forbidden supplier product {suffix}",
+                "price": 1,
+                "supplierName": "Forbidden supplier",
+            },
+        )
+        assert supplier_assignment.status_code == 403, supplier_assignment.text
+        assert (
+            supplier_assignment.json()["detail"]
+            == "merchant_product_field_denied:supplierName"
+        )
+
+        foreign_category_coupon = await client.post(
+            "/partner/coupons",
+            headers=merchant_headers,
+            json={
+                "code": f"FOREIGNCATEGORY{suffix.upper()}",
+                "amount": 10,
+                "scope": "categories",
+                "category_ids": [str(uuid.uuid4())],
+            },
+        )
+        assert foreign_category_coupon.status_code == 422, foreign_category_coupon.text
+        assert foreign_category_coupon.json()["detail"] == "coupon_categories_not_owned"
+
         merchant_logo = await client.post(
             "/storage/upload",
             headers=merchant_headers,
@@ -171,21 +207,40 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
 
         option_ids: list[tuple[str, str]] = []
         for option in ("brands", "colors", "sizes"):
+            option_payload = {
+                "name": f"E2E {option} {suffix}",
+                "code": f"E2E-{option}-{suffix}",
+            }
+            if option == "brands":
+                option_payload["logo_url"] = "https://example.test/brand-logo.png"
             created = await client.post(
                 f"/partner/product-options/{option}",
                 headers=merchant_headers,
-                json={"name": f"E2E {option} {suffix}", "code": f"E2E-{option}-{suffix}"},
+                json=option_payload,
             )
             assert created.status_code == 201, created.text
+            if option == "brands":
+                assert created.json()["data"]["logo_url"] == option_payload["logo_url"]
             record_id = created.json()["data"]["id"]
             listed = await client.get(f"/partner/product-options/{option}", headers=merchant_headers)
-            assert listed.status_code == 200 and any(row["id"] == record_id for row in listed.json()["data"])
+            assert listed.status_code == 200, listed.text
+            listed_row = next(row for row in listed.json()["data"] if row["id"] == record_id)
+            assert listed_row["can_manage"] is True
+            assert listed_row["is_default"] is False
+            update_payload = {"name": f"E2E {option} Updated {suffix}"}
+            if option == "brands":
+                update_payload["logoUrl"] = "https://example.test/brand-logo-updated.png"
             updated = await client.patch(
                 f"/partner/product-options/{option}/{record_id}",
                 headers=merchant_headers,
-                json={"name": f"E2E {option} Updated {suffix}"},
+                json=update_payload,
             )
             assert updated.status_code == 200, updated.text
+            if option == "brands":
+                assert (
+                    updated.json()["data"]["logo_url"]
+                    == update_payload["logoUrl"]
+                )
             option_ids.append((option, record_id))
 
         coupon = await client.post(
@@ -255,6 +310,15 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
             json={"status": "approved"},
         )
         assert approved_product.status_code == 200, approved_product.text
+        merchant_notifications = await client.get(
+            "/api/partner/notifications",
+            headers=merchant_headers,
+        )
+        assert merchant_notifications.status_code == 200, merchant_notifications.text
+        assert any(
+            row.get("type") == "product_approved"
+            for row in merchant_notifications.json()["data"]
+        )
 
         request_created = await client.post(
             "/api/partner/requests",
@@ -262,8 +326,68 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
             json={"title": f"Merchant Request {suffix}", "description": "Special order test", "estimated_value": 5000},
         )
         assert request_created.status_code == 200, request_created.text
+        request_id = request_created.json()["data"]["id"]
         request_list = await client.get("/api/partner/requests", headers=merchant_headers)
         assert request_list.status_code == 200 and request_list.json()["data"]
+        assert any(row["id"] == request_id for row in request_list.json()["data"])
+
+        admin_requests = await client.get(
+            "/api/admin/partner-requests",
+            headers=admin_headers,
+        )
+        assert admin_requests.status_code == 200, admin_requests.text
+        admin_request = next(
+            row for row in admin_requests.json()["data"] if row["id"] == request_id
+        )
+        assert admin_request["partner_email"] == customer_email
+        assert admin_request["title"] == f"Merchant Request {suffix}"
+        reviewed_request = await client.patch(
+            f"/api/admin/partner-requests/{request_id}/review",
+            headers=admin_headers,
+            json={"status": "approved"},
+        )
+        assert reviewed_request.status_code == 200, reviewed_request.text
+        assert reviewed_request.json()["data"]["status"] == "approved"
+        request_list_after_review = await client.get(
+            "/api/partner/requests",
+            headers=merchant_headers,
+        )
+        approved_request = next(
+            row
+            for row in request_list_after_review.json()["data"]
+            if row["id"] == request_id
+        )
+        assert approved_request["status"] == "approved"
+        merchant_notifications_after_review = await client.get(
+            "/api/partner/notifications",
+            headers=merchant_headers,
+        )
+        assert merchant_notifications_after_review.status_code == 200
+        assert any(
+            row.get("type") == "partner_request_approved"
+            for row in merchant_notifications_after_review.json()["data"]
+        )
+
+        deletable_request = await client.post(
+            "/api/partner/requests",
+            headers=merchant_headers,
+            json={"title": f"Deletable Request {suffix}", "description": "Delete contract test"},
+        )
+        assert deletable_request.status_code == 200, deletable_request.text
+        deletable_request_id = deletable_request.json()["data"]["id"]
+        deleted_request = await client.delete(
+            f"/api/partner/requests/{deletable_request_id}",
+            headers=merchant_headers,
+        )
+        assert deleted_request.status_code == 200, deleted_request.text
+        request_list_after_delete = await client.get(
+            "/api/partner/requests",
+            headers=merchant_headers,
+        )
+        assert all(
+            row["id"] != deletable_request_id
+            for row in request_list_after_delete.json()["data"]
+        )
 
         shipping_model = MODEL_BY_TABLE["shipping_zones"]
         async with SessionFactory() as session:
@@ -302,15 +426,24 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
 
         partner_orders = await client.get("/api/partner/orders", headers=merchant_headers)
         assert partner_orders.status_code == 200 and any(row["id"] == order_id for row in partner_orders.json()["data"])
+        merchant_order = next(row for row in partner_orders.json()["data"] if row["id"] == order_id)
+        assert merchant_order["payment_status"] == "pending"
         detail = await client.get(f"/api/partner/orders/{order_id}", headers=merchant_headers)
         assert detail.status_code == 200, detail.text
-        for next_status in ("confirmed", "preparing", "ready_for_shipment"):
-            changed = await client.patch(
-                f"/api/partner/orders/{order_id}/status",
-                headers=merchant_headers,
-                json={"nextStatus": next_status},
-            )
-            assert changed.status_code == 200, changed.text
+        assert detail.json()["data"]["order"]["payment_status"] == "pending"
+        merchant_status_change = await client.patch(
+            f"/api/partner/orders/{order_id}/status",
+            headers=merchant_headers,
+            json={"nextStatus": "confirmed"},
+        )
+        assert merchant_status_change.status_code == 403, merchant_status_change.text
+        assert merchant_status_change.json()["detail"] == "partner_order_status_read_only"
+        staff_status_change = await client.patch(
+            f"/api/orders/{order_id}/status",
+            headers=admin_headers,
+            json={"nextStatus": "confirmed"},
+        )
+        assert staff_status_change.status_code == 200, staff_status_change.text
 
         receipt = await client.post(
             f"/orders/{order_id}/payment-receipt",

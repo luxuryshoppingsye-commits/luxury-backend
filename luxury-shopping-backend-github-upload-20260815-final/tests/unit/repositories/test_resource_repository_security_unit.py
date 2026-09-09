@@ -99,6 +99,19 @@ def test_partner_cannot_read_sensitive_order_tables_through_generic_resource(tab
     _assert_http_detail(exc, "merchant_typed_endpoint_required")
 
 
+@pytest.mark.parametrize(
+    "table",
+    ["partner_wallets", "partner_settlements", "partner_payments"],
+)
+def test_partner_cannot_read_financial_records_through_generic_resource(table: str) -> None:
+    repo = _repository(table, roles={"partner"})
+
+    with pytest.raises(HTTPException) as exc:
+        repo.ensure_access("select")
+
+    _assert_http_detail(exc, "merchant_typed_finance_endpoint_required")
+
+
 def test_marketer_cannot_create_commissions_or_payments() -> None:
     commissions = _repository("marketer_commissions", roles={"marketer"})
     payments = _repository("marketer_payments", roles={"marketer"})

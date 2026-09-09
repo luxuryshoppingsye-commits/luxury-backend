@@ -48,6 +48,11 @@ PUBLIC_STOREFRONT_ORIGINS = (
 )
 CRITICAL_SECURITY_TABLES = (
     "account_security",
+    # A remembered mobile session cannot be renewed when this table is
+    # missing: auth_payload intentionally omits the refresh token in that
+    # case. Create it alongside the other security tables for older
+    # production databases that have not yet run the migration.
+    "refresh_tokens",
     "refresh_token_security",
     "password_reset_token_state",
     "verification_tokens",

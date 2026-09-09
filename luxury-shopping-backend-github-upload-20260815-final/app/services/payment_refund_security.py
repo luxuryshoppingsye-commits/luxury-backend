@@ -706,9 +706,44 @@ async def find_receipt_for_access(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="receipt_not_found")
-    if getattr(row, "user_id", None) != user.id and not roles.intersection(FINANCE_REVIEW_ROLES):
+    if (
+        getattr(row, "user_id", None) != user.id
+        and not roles.intersection(FINANCE_REVIEW_ROLES)
+        and not await _partner_can_access_order_receipt(
+            session,
+            order_id=getattr(row, "order_id", None),
+            user=user,
+            roles=roles,
+        )
+    ):
         raise HTTPException(status_code=404, detail="receipt_not_found")
     return row
+
+
+async def _partner_can_access_order_receipt(
+    session: AsyncSession,
+    *,
+    order_id: Any,
+    user: User,
+    roles: set[str],
+) -> bool:
+    if "partner" not in roles or order_id is None:
+        return False
+    try:
+        normalized_order_id = (
+            order_id if isinstance(order_id, uuid.UUID) else uuid.UUID(str(order_id))
+        )
+    except (TypeError, ValueError):
+        return False
+    partner_item = await session.execute(
+        select(OrderItem.id)
+        .where(
+            OrderItem.order_id == normalized_order_id,
+            OrderItem.partner_id == user.id,
+        )
+        .limit(1)
+    )
+    return partner_item.scalar_one_or_none() is not None
 
 
 async def find_file_asset_for_access(
@@ -751,6 +786,12 @@ async def find_file_asset_for_access(
         asset.owner_user_id != user.id
         and asset.created_by != user.id
         and not roles.intersection(FINANCE_REVIEW_ROLES)
+        and not await _partner_can_access_order_receipt(
+            session,
+            order_id=(getattr(asset, "extra_data", None) or {}).get("order_id"),
+            user=user,
+            roles=roles,
+        )
     ):
         raise HTTPException(status_code=404, detail="receipt_not_found")
     return asset

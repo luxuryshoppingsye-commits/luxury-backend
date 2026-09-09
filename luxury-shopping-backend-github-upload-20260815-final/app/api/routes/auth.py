@@ -389,6 +389,7 @@ async def _queue_email_verification(
             "verification_url": verify_link,
             "action_label": "تفعيل الحساب",
             "verification_expires_minutes": 10,
+            "app_popup_created": True,
         },
     )
     session.add(email_row)
@@ -454,6 +455,9 @@ def _web_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "roles": payload.get("roles") or [],
         "session": session_payload,
         "requires_verification": payload.get("requires_verification", False),
+        "partner_agreement_accepted": payload.get(
+            "partner_agreement_accepted"
+        ),
         "delivery_status": payload.get("delivery_status"),
         "captcha_status": payload.get("captcha_status"),
     }
@@ -705,8 +709,44 @@ async def register_merchant(
 ):
     body = await request.json()
     store_name = str(body.get("storeName") or body.get("businessName") or "").strip()
+    business_type = str(body.get("businessType") or "").strip().lower()
+    description = str(body.get("description") or "").strip()
+    store_city = str(body.get("storeCity") or "").strip()
+    store_address = str(body.get("storeAddress") or "").strip()
+    if len(description) > 4000 or len(store_city) > 120 or len(store_address) > 500:
+        raise HTTPException(status_code=422, detail="store_details_too_long")
+    raw_categories = body.get("storeCategories", body.get("store_categories", []))
+    if not isinstance(raw_categories, list):
+        raise HTTPException(status_code=422, detail="store_categories_must_be_a_list")
+    allowed_categories = {
+        "fashion",
+        "beauty",
+        "accessories",
+        "electronics",
+        "home",
+        "kids",
+        "food",
+    }
+    store_categories = list(
+        dict.fromkeys(
+            str(value).strip().lower()
+            for value in raw_categories
+            if str(value).strip().lower() in allowed_categories
+        )
+    )
+    supplied_categories = {
+        str(value).strip().lower() for value in raw_categories if str(value).strip()
+    }
+    if supplied_categories != set(store_categories):
+        raise HTTPException(status_code=422, detail="invalid_store_category")
+    if business_type and business_type not in allowed_categories | {"other"}:
+        raise HTTPException(status_code=422, detail="invalid_business_type")
+    if not store_categories and business_type in allowed_categories:
+        store_categories.append(business_type)
     if len(store_name) < 2:
         raise HTTPException(status_code=400, detail="store_name_required")
+    if not store_categories:
+        raise HTTPException(status_code=400, detail="store_category_required")
 
     profile = (
         await session.execute(
@@ -763,10 +803,14 @@ async def register_merchant(
         email=user.email,
         phone=phone,
         status="pending",
-        description=str(body.get("description") or ""),
+        description=description,
         logo_url=body.get("logoUrl"),
         extra_data={
             "city": city,
+            **({"store_city": store_city} if store_city else {}),
+            **({"store_address": store_address} if store_address else {}),
+            **({"business_type": business_type} if business_type else {}),
+            "store_categories": store_categories,
             **(
                 {"address_id": str(default_address.id)}
                 if default_address is not None
@@ -1742,18 +1786,6 @@ async def password_reset_request(
         await session.flush()
         reset_state = PasswordResetTokenState(reset_token_id=reset_row.id)
         session.add(reset_state)
-        await _queue_email_push_mirror(
-            session,
-            user_id=user.id,
-            title="استعادة كلمة المرور",
-            body=(
-                "تم إرسال رمز استعادة كلمة المرور المكوّن من 6 أرقام إلى بريدك الإلكتروني، والرمز صالح لمدة 10 دقائق."
-                if uses_otp
-                else "تم إرسال رابط استعادة كلمة المرور إلى بريدك الإلكتروني، والرابط صالح لمدة 30 دقيقة."
-            ),
-            notification_type="password_reset_requested",
-            category="security",
-        )
         delivery_status = _email_delivery_status()
         email_message = (
             f"رمز استعادة كلمة المرور هو: {raw_token}\nالرمز صالح لمدة {expires_minutes} دقائق."
@@ -1761,6 +1793,7 @@ async def password_reset_request(
             else f"استخدم رابط استعادة كلمة المرور خلال {expires_minutes} دقيقة:\n{_append_query_param(redirect_target, 'token', raw_token)}"
         )
         email_extra_data: dict[str, Any] = {
+            "purpose": "password_reset",
             "client_type": body.client_type,
             "category": "security",
             "expires_in_minutes": expires_minutes,

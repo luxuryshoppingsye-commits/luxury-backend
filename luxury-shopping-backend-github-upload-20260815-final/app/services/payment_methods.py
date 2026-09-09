@@ -36,6 +36,9 @@ _METHOD_DEFINITIONS = (
         "sort_order": 10,
         "requires_receipt": True,
         "requires_transaction_reference": True,
+        "transfer_recipients": [
+            {"label": "خدمة حاسب الكريمي - إيداع يمني", "value": "1171211"},
+        ],
     },
     {
         "provider_key": "JAIB",
@@ -45,6 +48,9 @@ _METHOD_DEFINITIONS = (
         "sort_order": 20,
         "requires_receipt": True,
         "requires_transaction_reference": True,
+        "transfer_recipients": [
+            {"label": "رقم حساب جيب", "value": "549179"},
+        ],
     },
     {
         "provider_key": "JAWALI",
@@ -54,6 +60,9 @@ _METHOD_DEFINITIONS = (
         "sort_order": 30,
         "requires_receipt": True,
         "requires_transaction_reference": True,
+        "transfer_recipients": [
+            {"label": "رقم حساب جوالي", "value": "126638"},
+        ],
     },
     {
         "provider_key": "YEMEN_WALLET",
@@ -63,6 +72,12 @@ _METHOD_DEFINITIONS = (
         "sort_order": 40,
         "requires_receipt": False,
         "requires_transaction_reference": True,
+        "transfer_recipients": [
+            {"label": "الكريمي - إيداع يمني", "value": "3087726117"},
+            {"label": "الكريمي - إيداع سعودي", "value": "3101858013"},
+            {"label": "الكريمي - إيداع دولار", "value": "3101751294"},
+            {"label": "رقم الهاتف", "value": "781010460"},
+        ],
     },
     {
         "provider_key": "ONE_CASH",
@@ -72,6 +87,9 @@ _METHOD_DEFINITIONS = (
         "sort_order": 50,
         "requires_receipt": True,
         "requires_transaction_reference": True,
+        "transfer_recipients": [
+            {"label": "رقم حساب ون كاش", "value": "177552"},
+        ],
     },
     {
         "provider_key": "WALLET_TRANSFER",
@@ -150,6 +168,27 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
+def _transfer_recipient_rows(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    recipients: list[dict[str, str]] = []
+    values: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        number = _text(entry.get("value") or entry.get("number"))
+        if number is None or number in values:
+            continue
+        values.add(number)
+        recipients.append(
+            {
+                "label": _text(entry.get("label") or entry.get("name")) or "رقم الحساب",
+                "value": number,
+            }
+        )
+    return recipients
+
+
 def normalize_payment_method_rows(
     raw_methods: Any,
     *,
@@ -187,6 +226,10 @@ def normalize_payment_method_rows(
         ):
             if field in raw:
                 row[field] = _text(raw[field])
+        if "transfer_recipients" in raw or "transferRecipients" in raw:
+            row["transfer_recipients"] = _transfer_recipient_rows(
+                raw.get("transfer_recipients") or raw.get("transferRecipients")
+            )
         for field in ("requires_receipt", "requires_transaction_reference", "is_active"):
             if field in raw:
                 row[field] = _bool(raw[field])
@@ -231,11 +274,25 @@ def payment_methods_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def payment_method_has_recipient(row: dict[str, Any]) -> bool:
-    return any(
-        _text(row.get(field)) is not None
-        for field in ("merchant_number", "account_number", "phone_number")
+def payment_method_recipients(row: dict[str, Any]) -> list[dict[str, str]]:
+    recipients = _transfer_recipient_rows(
+        row.get("transfer_recipients") or row.get("transferRecipients")
     )
+    values = {recipient["value"] for recipient in recipients}
+    for label, field in (
+        ("رقم التاجر", "merchant_number"),
+        ("رقم الحساب", "account_number"),
+        ("رقم الهاتف", "phone_number"),
+    ):
+        number = _text(row.get(field))
+        if number is not None and number not in values:
+            recipients.append({"label": label, "value": number})
+            values.add(number)
+    return recipients
+
+
+def payment_method_has_recipient(row: dict[str, Any]) -> bool:
+    return bool(payment_method_recipients(row))
 
 
 def payment_account_options(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -243,12 +300,8 @@ def payment_account_options(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         if row.get("is_active") is not True or not payment_method_has_recipient(row):
             continue
-        account_number = (
-            _text(row.get("merchant_number"))
-            or _text(row.get("account_number"))
-            or _text(row.get("phone_number"))
-        )
-        assert account_number is not None
+        recipients = payment_method_recipients(row)
+        account_number = recipients[0]["value"]
         accounts.append(
             {
                 "id": str(row["provider_key"]).lower(),

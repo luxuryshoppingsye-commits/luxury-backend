@@ -141,6 +141,38 @@ MERCHANT_APPLICATION_REVIEW_STATUSES = (
     "submitted",
 )
 MERCHANT_APPLICATION_ACTIVE_STATUSES = ("approved", "active")
+PARTNER_STOREFRONT_CATEGORY_KEYS = frozenset(
+    {
+        "fashion",
+        "beauty",
+        "accessories",
+        "electronics",
+        "home",
+        "kids",
+        "food",
+    }
+)
+PARTNER_NOTIFICATION_TYPES = frozenset(
+    {
+        "partner_application_approved",
+        "partner_application_rejected",
+        "partner_order_status_changed",
+        "product_submitted_for_review",
+        "product_approved",
+        "product_rejected",
+        "store_review_approved",
+        "support_reply",
+    }
+)
+PARTNER_NOTIFICATION_ENTITY_TYPES = frozenset(
+    {
+        "products",
+        "partner_applications",
+        "partner_coupons",
+        "partner_order_requests",
+        "partner_contracts",
+    }
+)
 
 
 async def _queue_email_push_mirror(
@@ -595,6 +627,40 @@ def _partner_coupon_values(body: dict[str, Any], existing: dict[str, Any] | None
     }
 
 
+async def _assert_partner_coupon_targets(
+    session: AsyncSession,
+    *,
+    partner_id: uuid.UUID,
+    values: dict[str, Any],
+) -> None:
+    """Keep merchant coupons within that merchant's own catalog."""
+    campaign = values["extra_data"]
+    scope = str(campaign.get("scope") or "all").lower()
+    if scope == "all":
+        return
+    owned_rows = await session.execute(
+        select(Product.id, Product.category_id).where(
+            Product.partner_id == partner_id,
+            Product.deleted_at.is_(None),
+        )
+    )
+    owned_catalog_rows = owned_rows.all()
+    owned_products = {str(product_id) for product_id, _ in owned_catalog_rows}
+    if scope == "products":
+        requested_products = {str(value) for value in campaign.get("product_ids") or []}
+        if not requested_products.issubset(owned_products):
+            raise HTTPException(status_code=422, detail="coupon_products_not_owned")
+        return
+    owned_categories = {
+        str(category_id)
+        for _, category_id in owned_catalog_rows
+        if category_id is not None
+    }
+    requested_categories = {str(value) for value in campaign.get("category_ids") or []}
+    if not requested_categories.issubset(owned_categories):
+        raise HTTPException(status_code=422, detail="coupon_categories_not_owned")
+
+
 async def _assert_coupon_code_available(
     session: AsyncSession,
     code: str,
@@ -620,6 +686,68 @@ async def _assert_coupon_code_available(
         customer_query = customer_query.where(customer_model.id != customer_coupon_id)
     if (await session.execute(customer_query.limit(1))).scalar_one_or_none() is not None:
         raise HTTPException(status_code=409, detail="coupon_code_exists")
+
+
+async def _partner_coupon_store_name(session: AsyncSession, partner_id: uuid.UUID) -> str:
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    store_name = (
+        await session.execute(
+            select(storefront_model.name)
+            .where(
+                storefront_model.deleted_at.is_(None),
+                or_(
+                    storefront_model.partner_id == partner_id,
+                    storefront_model.user_id == partner_id,
+                ),
+            )
+            .order_by(storefront_model.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return _first_text(store_name, default="متجر التاجر")
+
+
+def _partner_coupon_notification_content(
+    *,
+    campaign: dict[str, Any],
+    coupon_code: str,
+    partner_id: uuid.UUID,
+) -> tuple[str, str, str, dict[str, Any]]:
+    store_name = _first_text(campaign.get("store_name"), default="متجر التاجر")
+    scope = str(campaign.get("scope") or "all").lower()
+    scope_text = {
+        "products": f"لمنتجات محددة من متجر {store_name} فقط",
+        "categories": f"لتصنيفات محددة من متجر {store_name} فقط",
+    }.get(scope, f"لجميع منتجات متجر {store_name} فقط")
+    title = _first_text(campaign.get("title"), default="كوبون خصم")
+    discount_value = campaign.get("discount_value") or 0
+    discount_type = campaign.get("discount_type") or "percentage"
+    discount_label = (
+        f"{discount_value:g}%"
+        if discount_type == "percentage"
+        else f"{discount_value:g} ر.ي"
+    )
+    product_ids = list(campaign.get("product_ids") or [])
+    action_url = (
+        f"/product/{product_ids[0]}"
+        if scope == "products" and product_ids
+        else f"/products?partnerId={partner_id}"
+    )
+    body = f"{title}: استخدم {coupon_code} واحصل على خصم {discount_label}. صالح {scope_text}."
+    return (
+        "كوبون خصم",
+        body,
+        action_url,
+        {
+            "coupon_code": coupon_code,
+            "discount": discount_label,
+            "partner_id": str(partner_id),
+            "store_name": store_name,
+            "scope": scope,
+            "scope_text": scope_text,
+            "store_only": True,
+        },
+    )
 
 
 async def _notify_coupon_customers(
@@ -677,23 +805,22 @@ async def _notify_coupon_customers(
             ).scalars().all()
         )
         customer_ids = [customer_id for customer_id in customer_ids if customer_id in loyalty_customer_ids]
-    title = str(campaign.get("title") or "كوبون خصم")
-    discount_value = campaign.get("discount_value") or 0
-    discount_type = campaign.get("discount_type") or "percentage"
-    discount_label = f"{discount_value:g}%" if discount_type == "percentage" else f"{discount_value:g} ر.ي"
-    product_ids = list(campaign.get("product_ids") or [])
-    action_url = f"/product/{product_ids[0]}" if product_ids else "/offers"
+    title, body, action_url, payload = _partner_coupon_notification_content(
+        campaign=campaign,
+        coupon_code=str(coupon.code),
+        partner_id=actor.id,
+    )
     payloads = [
         NotificationPayload(
             user_id=customer_id,
-            title="كوبون جديد متاح",
-            body=f"{title}: استخدم {coupon.code} واحصل على خصم {discount_label}.",
+            title=title,
+            body=body,
             notification_type="coupon",
             category="promotional",
             action_url=action_url,
             entity_type="coupon",
             entity_id=str(coupon.id),
-            payload={"coupon_code": coupon.code, "discount": discount_label},
+            payload=payload,
             created_by=actor.id,
             source="partner_coupon_campaign",
             deduplication_key=f"coupon-campaign:{coupon.id}:{customer_id}",
@@ -1241,6 +1368,35 @@ async def save_partner_storefront(request: Request, user: User = Depends(require
     for source, target in mapping.items():
         if source in body:
             setattr(row, target, body[source])
+    if "storeCategories" in body or "store_categories" in body:
+        raw_categories = body.get("storeCategories", body.get("store_categories"))
+        if not isinstance(raw_categories, list):
+            raise HTTPException(status_code=422, detail="store_categories_must_be_a_list")
+        categories = list(
+            dict.fromkeys(
+                str(value).strip().lower()
+                for value in raw_categories
+                if str(value).strip().lower() in PARTNER_STOREFRONT_CATEGORY_KEYS
+            )
+        )
+        if len(categories) != len(
+            {
+                str(value).strip().lower()
+                for value in raw_categories
+                if str(value).strip()
+            }
+        ):
+            raise HTTPException(status_code=422, detail="invalid_store_category")
+        row.extra_data = {
+            **(row.extra_data or {}),
+            "store_categories": categories,
+        }
+    for source, target, maximum in (("storeCity", "store_city", 120), ("storeAddress", "store_address", 500)):
+        if source in body:
+            value = str(body[source] or "").strip()
+            if len(value) > maximum:
+                raise HTTPException(status_code=422, detail="store_details_too_long")
+            row.extra_data = {**(row.extra_data or {}), target: value}
     # Flush and refresh before serializing so the response is the same value a
     # new request will read after the transaction has committed.  This also
     # makes database defaults and server-side timestamps visible immediately.
@@ -1330,8 +1486,19 @@ async def review_partner_storefront(
                 priority="high",
                 entity_type="partner_storefronts",
                 entity_id=str(row.id),
+                payload={
+                    "title_en": "Your store was approved" if status == "approved" else "Your store was rejected",
+                    "body_en": (
+                        "Your store was approved and is ready for customers."
+                        if status == "approved"
+                        else f"Reason for rejection: {reason}" if reason else "Your store request was rejected. Please contact support."
+                    ),
+                    "deep_link": "/partner/products",
+                    **({"rejectionReason": reason} if status == "rejected" and reason else {}),
+                },
                 created_by=admin.id,
                 deduplication_key=f"storefront-review:{row.id}:{status}:{getattr(row, 'updated_at', None)}",
+                delivery_channels=("in_app", "mobile_push", "web_push"),
             )
         )
     await session.commit()
@@ -1523,6 +1690,32 @@ def _partner_option_clause(model: Any, partner_id: uuid.UUID):
     return model.extra_data["partner_id"].astext == str(partner_id)
 
 
+def _partner_option_response(row: Any, partner_id: uuid.UUID) -> dict[str, Any]:
+    """Return a catalog option with an explicit merchant-management flag.
+
+    A visible option without this flag is a global catalog value.  The client
+    must never infer ownership from an arbitrary field on the record, because
+    that could expose edit or delete actions for a default value.
+    """
+    payload = dict(row) if isinstance(row, dict) else serialize_record(row)
+    extra_data = (
+        getattr(row, "extra_data", None)
+        if not isinstance(row, dict)
+        else payload.get("extra_data")
+    )
+    extra_data = extra_data if isinstance(extra_data, dict) else {}
+    owner_id = (
+        payload.get("partner_id")
+        or payload.get("partnerId")
+        or extra_data.get("partner_id")
+        or extra_data.get("partnerId")
+    )
+    can_manage = str(owner_id or "") == str(partner_id)
+    payload["can_manage"] = can_manage
+    payload["is_default"] = not can_manage
+    return payload
+
+
 @router.get("/partner/product-options/{option}")
 async def list_partner_product_options(
     option: str,
@@ -1541,7 +1734,7 @@ async def list_partner_product_options(
         owner_id = extra_data.get("partner_id") if isinstance(extra_data, dict) else None
         if owner_id in (None, "", str(user.id)):
             visible_rows.append(row)
-    return {"data": [serialize_record(row) for row in visible_rows]}
+    return {"data": [_partner_option_response(row, user.id) for row in visible_rows]}
 
 
 @router.post("/partner/product-options/{option}", status_code=201)
@@ -1556,14 +1749,22 @@ async def create_partner_product_option(
     name = _first_text(body.get("name"), body.get("label"))
     if not name:
         raise HTTPException(status_code=422, detail="option_name_required")
+    logo_url = _first_text(body.get("logo_url"), body.get("logoUrl"))
     row = await _api_create(
         session,
         table,
-        {"name": name, "code": body.get("code"), "is_active": True, "status": "active", "partner_id": user.id},
+        {
+            "name": name,
+            "code": body.get("code"),
+            "is_active": True,
+            "status": "active",
+            "partner_id": user.id,
+            **({"logo_url": logo_url} if table == "brands" and logo_url else {}),
+        },
         user,
     )
     await session.commit()
-    return {"data": row}
+    return {"data": _partner_option_response(row, user.id)}
 
 
 @router.patch("/partner/product-options/{option}/{record_id}")
@@ -1581,10 +1782,12 @@ async def update_partner_product_option(
         raise HTTPException(status_code=404, detail="partner_option_not_found")
     body = await request.json()
     row.name = _first_text(body.get("name"), body.get("label"), row.name)
+    if table == "brands" and ("logo_url" in body or "logoUrl" in body):
+        row.logo_url = _first_text(body.get("logo_url"), body.get("logoUrl")) or None
     if hasattr(row, "code") and body.get("code") is not None:
         row.code = str(body.get("code") or "")
     await session.commit()
-    return {"data": serialize_record(row)}
+    return {"data": _partner_option_response(row, user.id)}
 
 
 @router.delete("/partner/product-options/{option}/{record_id}")
@@ -1684,9 +1887,15 @@ async def create_partner_coupon(
 ):
     body = await request.json()
     values = _partner_coupon_values(body)
+    await _assert_partner_coupon_targets(session, partner_id=user.id, values=values)
     await _assert_coupon_code_available(session, values["code"])
     partner_model = MODEL_BY_TABLE["partner_coupons"]
     customer_model = MODEL_BY_TABLE["coupons"]
+    campaign = {
+        **values["extra_data"],
+        "store_name": await _partner_coupon_store_name(session, user.id),
+        "partner_id": str(user.id),
+    }
     partner_coupon = partner_model(
         partner_id=user.id,
         code=values["code"],
@@ -1694,11 +1903,10 @@ async def create_partner_coupon(
         status="active",
         is_active=True,
         expires_at=values["expires_at"],
-        extra_data=values["extra_data"],
+        extra_data=campaign,
     )
     session.add(partner_coupon)
     await session.flush()
-    campaign = dict(values["extra_data"])
     customer_coupon = customer_model(
         code=values["code"],
         title=values["title"],
@@ -1747,6 +1955,7 @@ async def update_partner_coupon(
     existing["code"] = row.code
     existing["discount_value"] = existing.get("discount_value", float(row.amount or 0))
     values = _partner_coupon_values(body, existing)
+    await _assert_partner_coupon_targets(session, partner_id=user.id, values=values)
     linked_id = existing.get("customer_coupon_id")
     customer_coupon_id = _uuid(linked_id, "customer_coupon_id") if linked_id else None
     await _assert_coupon_code_available(
@@ -1755,10 +1964,21 @@ async def update_partner_coupon(
         partner_coupon_id=row.id,
         customer_coupon_id=customer_coupon_id,
     )
+    campaign = {
+        **values["extra_data"],
+        "store_name": _first_text(
+            existing.get("store_name"),
+            await _partner_coupon_store_name(session, user.id),
+        ),
+        "partner_id": str(user.id),
+    }
     row.code = values["code"]
     row.amount = values["amount"]
     row.expires_at = values["expires_at"]
-    row.extra_data = {**values["extra_data"], "customer_coupon_id": str(customer_coupon_id) if customer_coupon_id else None}
+    row.extra_data = {
+        **campaign,
+        "customer_coupon_id": str(customer_coupon_id) if customer_coupon_id else None,
+    }
     customer_model = MODEL_BY_TABLE["coupons"]
     if customer_coupon_id is not None:
         customer_coupon = await session.get(customer_model, customer_coupon_id, with_for_update=True)
@@ -1770,7 +1990,7 @@ async def update_partner_coupon(
             customer_coupon.is_active = True
             customer_coupon.status = "active"
             customer_coupon.extra_data = {
-                **values["extra_data"],
+                **campaign,
                 "partner_coupon_id": str(row.id),
                 "partner_id": str(user.id),
                 "source": "partner_coupon",
@@ -1784,7 +2004,7 @@ async def update_partner_coupon(
             is_active=True,
             expires_at=values["expires_at"],
             extra_data={
-                **values["extra_data"],
+                **campaign,
                 "partner_coupon_id": str(row.id),
                 "partner_id": str(user.id),
                 "source": "partner_coupon",
@@ -1792,7 +2012,7 @@ async def update_partner_coupon(
         )
         session.add(customer_coupon)
         await session.flush()
-        row.extra_data = {**values["extra_data"], "customer_coupon_id": str(customer_coupon.id)}
+        row.extra_data = {**campaign, "customer_coupon_id": str(customer_coupon.id)}
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -1882,6 +2102,24 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
         else:
             storefront.status = "active"
             storefront.is_active = True
+        business_type = str((application.extra_data or {}).get("business_type") or "").strip()
+        store_categories = [
+            str(value).strip().lower()
+            for value in ((application.extra_data or {}).get("store_categories") or [])
+            if str(value).strip().lower() in PARTNER_STOREFRONT_CATEGORY_KEYS
+        ]
+        store_details = {
+            key: str((application.extra_data or {}).get(key) or "").strip()
+            for key in ("store_city", "store_address")
+            if str((application.extra_data or {}).get(key) or "").strip()
+        }
+        if business_type or store_categories or store_details:
+            storefront.extra_data = {
+                **(storefront.extra_data or {}),
+                **store_details,
+                **({"business_type": business_type} if business_type else {}),
+                **({"store_categories": list(dict.fromkeys(store_categories))} if store_categories else {}),
+            }
     elif status == "rejected" and application.user_id:
         rejected_user = await session.get(User, application.user_id, with_for_update=True)
         if rejected_user is not None:
@@ -1901,7 +2139,7 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
     if application.user_id:
         title = "تمت الموافقة على طلب متجرك" if status == "approved" else "نعتذر عن عدم الموافقة على طلب متجرك"
         message = (
-            "تمت الموافقة على طلب متجرك ويمكنك الآن تجهيز المنتجات للمراجعة."
+            "تمت الموافقة على طلب متجرك. افتح التطبيق واقبل اتفاقية التاجر لبدء تجهيز متجرك."
             if status == "approved"
             else f"نعتذر، تعذرت الموافقة على طلب متجرك. السبب: {reason}"
         )
@@ -1915,8 +2153,23 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
                 priority="high",
                 entity_type="partner_applications",
                 entity_id=str(application.id),
+                payload=(
+                    {
+                        "title_en": "Your merchant application was approved",
+                        "body_en": "Your merchant account is ready. Review and accept the merchant agreement to continue.",
+                        "deep_link": "/partner/agreement?required=1",
+                    }
+                    if status == "approved"
+                    else {
+                        "title_en": "Your merchant application was rejected",
+                        "body_en": "Your merchant application was not approved. Review the reason and submit a new request when it is resolved.",
+                        "deep_link": "/join",
+                        "rejectionReason": reason,
+                    }
+                ),
                 created_by=admin.id,
                 deduplication_key=f"partner-application-review:{application.id}:{status}",
+                delivery_channels=("in_app", "mobile_push", "web_push"),
             )
         )
     await session.commit()
@@ -5208,6 +5461,67 @@ async def api_delete_product_review(
     return {"data": {"deleted": True, "product_id": product_id, "review_images": review_images}}
 
 
+@router.patch("/api/reviews/products/{review_id}/status")
+async def api_update_product_review_status(
+    review_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Moderate a product review through the server-owned staff workflow."""
+    body = _normalize_store_review_status_payload(await request.json())
+    requested_status = str(body.get("status") or "").strip().lower()
+    is_rejected = requested_status in {
+        "rejected",
+        "declined",
+        "denied",
+        "hidden",
+        "blocked",
+        "inactive",
+        "disabled",
+    }
+    is_approved = requested_status in REVIEW_APPROVED_STATUSES
+    if not is_approved and not is_rejected:
+        raise HTTPException(status_code=422, detail="invalid_product_review_status")
+
+    review_model = MODEL_BY_TABLE["product_reviews"]
+    row = await session.get(review_model, review_id, with_for_update=True)
+    if row is None or getattr(row, "deleted_at", None) is not None:
+        raise HTTPException(status_code=404, detail="review_not_found")
+
+    canonical_status = "approved" if is_approved else "rejected"
+    row.status = canonical_status
+    row.is_approved = is_approved
+    metadata = dict(getattr(row, "extra_data", None) or {})
+    metadata.update(
+        {
+            "reviewed_by": str(staff.id),
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            "moderation_status": canonical_status,
+        }
+    )
+    admin_notes = _review_text(body.get("admin_notes"))
+    if admin_notes:
+        metadata["admin_notes"] = admin_notes
+    row.extra_data = metadata
+
+    if is_approved:
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=row.user_id,
+                title="تم قبول تقييمك للمنتج",
+                body="شكرًا لمشاركتك تجربتك. تمت الموافقة على تقييمك وسيظهر للعملاء.",
+                notification_type="product_review_approved",
+                category="system",
+                action_url=f"/products/{row.product_id}",
+                deduplication_key=f"product-review-approved:{review_id}",
+                delivery_channels=("in_app", "mobile_push", "web_push"),
+            )
+        )
+    await session.commit()
+    return {"data": await _product_review_response(session, row)}
+
+
 @router.post("/api/reviews/store", status_code=201)
 async def api_create_store_review(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     body = await request.json()
@@ -5434,6 +5748,29 @@ async def api_reject_partner_application(application_id: uuid.UUID, request: Req
         raise HTTPException(status_code=404, detail="application_not_found")
     row.status = "rejected"
     row.extra_data = {**(row.extra_data or {}), **_jsonable(body)}
+    if row.user_id:
+        reason = str(body.get("reason") or body.get("rejectionReason") or "").strip()
+        await NotificationService(session).create_notification(
+            NotificationPayload(
+                user_id=row.user_id,
+                title="تم رفض طلب التاجر",
+                body=f"سبب الرفض: {reason}" if reason else "تم رفض طلب التاجر. راجع البيانات ثم تواصل مع الدعم.",
+                notification_type="partner_application_rejected",
+                category="partner",
+                priority="high",
+                action_url="/partner/applications",
+                entity_type="partner_applications",
+                entity_id=str(row.id),
+                payload={
+                    "title_en": "Your merchant application was rejected",
+                    "body_en": f"Reason for rejection: {reason}" if reason else "Please review your merchant application and contact support if needed.",
+                    "deep_link": "/partner/applications",
+                    **({"rejectionReason": reason} if reason else {}),
+                },
+                created_by=staff.id,
+                deduplication_key=f"partner-application-review:{row.id}:rejected",
+            )
+        )
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -5882,6 +6219,55 @@ async def api_update_refund_status(
         staff=staff,
         roles=roles,
     )
+    # A finance completion closes the linked customer return automatically so
+    # the customer sees the final state without a second manual transition.
+    refund_model = MODEL_BY_TABLE["refunds"]
+    refund_record = await session.get(refund_model, refund_id)
+    return_id = (getattr(refund_record, "extra_data", {}) or {}).get("return_id") if refund_record is not None else None
+    completed = str((getattr(refund_record, "status", None) or "")).lower() in {"completed", "succeeded", "provider_succeeded", "manual_completed"}
+    if return_id and completed:
+        return_model = MODEL_BY_TABLE["returns"]
+        return_record = await session.get(return_model, uuid.UUID(str(return_id)), with_for_update=True)
+        if return_record is not None and str(return_record.status or "") != "refunded":
+            extra = dict(return_record.extra_data or {})
+            extra["history"] = [*(extra.get("history") or []), {"status": "refunded", "at": datetime.now(timezone.utc).isoformat(), "actor": str(staff.id), "refund_id": str(refund_id)}]
+            extra["refund_completed_at"] = datetime.now(timezone.utc).isoformat()
+            return_record.status = "refunded"
+            return_record.extra_data = extra
+            return_item_model = MODEL_BY_TABLE["return_items"]
+            return_item_rows = list(
+                (
+                    await session.execute(
+                        select(return_item_model).where(
+                            return_item_model.return_id == return_record.id,
+                            return_item_model.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars()
+            )
+            for return_item in return_item_rows:
+                return_item.status = "refunded"
+            order = await session.get(Order, return_record.order_id)
+            if order is not None:
+                await NotificationService(session).create_notification(
+                    NotificationPayload(
+                        user_id=order.user_id,
+                        title="تم رد مبلغ الإرجاع",
+                        body=f"تم رد مبلغ طلب الإرجاع للطلب {order.order_number}.",
+                        notification_type="order_return_update",
+                        category="order",
+                        priority="high",
+                        action_type="open_resource",
+                        action_url=f"/orders/{order.id}",
+                        entity_type="return",
+                        entity_id=str(return_record.id),
+                        order_id=order.id,
+                        payload={"return_id": str(return_record.id), "order_id": str(order.id), "return_status": "refunded"},
+                        created_by=staff.id,
+                        deduplication_key=f"return-status:{return_record.id}:refunded",
+                    )
+                )
+            await session.commit()
     return {"data": row}
 
 
@@ -6152,8 +6538,11 @@ async def api_price_international_order(order_id: uuid.UUID, request: Request, s
                 payload={
                     "orderId": str(order_id),
                     "status": row.status,
+                    "order_status": row.status,
                     "finalCost": float(grand_total),
                     "currencyCode": currency_code,
+                    "title_en": "Your international order pricing was updated",
+                    "body_en": f"Your international order pricing was updated. New total: {format(grand_total, 'f')} {currency_code}. Please review the order.",
                 },
                 created_by=staff.id,
                 deduplication_key=f"international-order-pricing:{order_id}:{pricing_updated_at.isoformat()}",
@@ -6987,6 +7376,22 @@ async def api_admin_product_approval(product_id: uuid.UUID, request: Request, st
                     "productId": str(row.id),
                     "approvalStatus": next_status,
                     "deep_link": "/partner/products",
+                    "title_en": (
+                        "Your product was approved"
+                        if approved
+                        else "Your product was rejected"
+                        if rejected
+                        else "Your product is under review"
+                    ),
+                    "body_en": (
+                        "Your product was approved and is now visible to customers."
+                        if approved
+                        else f"Reason for rejection: {reason}"
+                        if rejected and reason
+                        else "Your product was rejected. Please review its details."
+                        if rejected
+                        else "Your product is being reviewed by the administration."
+                    ),
                     **({"rejectionReason": reason} if rejected else {}),
                 },
                 created_by=staff.id,
@@ -8257,7 +8662,7 @@ async def api_order_invoice_email(order_id: uuid.UUID, staff: User = Depends(req
                 status="queued",
                 email=recipient.email,
                 message=f"Order {row.order_number} invoice is ready.",
-                extra_data={"order_id": str(order_id), "category": "order", "dedupe_key": dedupe_key, "template": "order_invoice"},
+                extra_data={"order_id": str(order_id), "category": "order", "dedupe_key": dedupe_key, "template": "order_invoice", "app_popup_created": True},
             )
         )
     await session.commit()
@@ -8300,7 +8705,7 @@ async def resend_order_confirmation(order_id: uuid.UUID, user: User = Depends(cu
                 status="queued",
                 email=user.email,
                 message=f"Your order {order.order_number} was received.",
-                extra_data={"order_id": str(order.id), "category": "order", "dedupe_key": dedupe_key, "template": "order_confirmation"},
+                extra_data={"order_id": str(order.id), "category": "order", "dedupe_key": dedupe_key, "template": "order_confirmation", "app_popup_created": True},
             )
         )
     await session.commit()
@@ -8503,7 +8908,11 @@ async def api_reply_contact_message(
             deduplication_key=reply_dedupe_key,
         )
     outbox = await _api_create(session, "email_outbox", {
-        "user_id": staff.id,
+        # Use the customer as the queue owner so support-email preferences are
+        # evaluated for the recipient rather than the administrator replying.
+        # Anonymous contact messages keep a null owner and are still delivered
+        # by the contact-reply exception in the outbox worker.
+        "user_id": recipient_user_id,
         "title": subject,
         "status": "queued",
         "email": recipient,
@@ -8512,6 +8921,7 @@ async def api_reply_contact_message(
         "consent_required": False,
         "contact_message_id": str(record_id),
         "reply_to": recipient,
+        "app_popup_created": recipient_user_id is not None,
     }, staff)
     contact.status = "replied"
     await session.commit()
@@ -9025,12 +9435,18 @@ async def partner_notifications(
     user: User = Depends(require_partner),
     session: AsyncSession = Depends(get_session),
 ):
-    """Return only notifications for customer orders that belong to this merchant."""
+    """Return customer-order and merchant-workflow alerts for this merchant."""
     model = MODEL_BY_TABLE["notifications"]
     partner_order_ids = select(OrderItem.order_id).where(OrderItem.partner_id == user.id)
+    merchant_event = or_(
+        func.lower(func.trim(func.coalesce(model.type, ""))).in_(
+            PARTNER_NOTIFICATION_TYPES
+        ),
+        model.entity_type.in_(PARTNER_NOTIFICATION_ENTITY_TYPES),
+    )
     where_clause = and_(
         _notification_visible_clause(model, user.id),
-        model.order_id.in_(partner_order_ids),
+        or_(model.order_id.in_(partner_order_ids), merchant_event),
     )
     try:
         result = await session.execute(
@@ -9767,6 +10183,20 @@ async def _partner_sales_analytics(
         end=end,
         partner_id=partner_id,
     )
+    settlement_model = MODEL_BY_TABLE["partner_settlements"]
+    due_amount, due_rows = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(settlement_model.amount), 0),
+                func.count(settlement_model.id),
+            ).where(
+                settlement_model.partner_id == partner_id,
+                settlement_model.deleted_at.is_(None),
+                func.lower(settlement_model.status).in_(("pending", "unpaid")),
+            )
+        )
+    ).one()
+    recorded_due = money(due_amount or 0)
     return {
         "period": normalized_period,
         "range": {
@@ -9827,6 +10257,14 @@ async def _partner_sales_analytics(
         },
         "aggregation": "own_order_items_successful_payments_minus_refunds",
         "recognizedRevenue": recognized,
+        "dues": {
+            "recorded_due": format(recorded_due, "f"),
+            "recorded_due_count": int(due_rows or 0),
+            "currency_code": recognized["currency_code"],
+            "scope": "all_recorded_unpaid_settlements",
+            "access": "read_only",
+            "managed_by": "finance_team",
+        },
     }
 
 

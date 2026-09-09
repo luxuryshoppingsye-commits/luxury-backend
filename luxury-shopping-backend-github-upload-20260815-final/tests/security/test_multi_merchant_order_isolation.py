@@ -163,6 +163,14 @@ async def _seed_mixed_order(run_id: str) -> dict[str, object]:
         session.add(history_model(order_id=order.id, status="processing", notes=f"{run_id} global note mentions {product_b.name}"))
         session.add(shipping_model(order_id=order.id, status="assigned", fee=Decimal("1500.00"), description=f"{run_id} full shipping operation"))
         session.add(shipping_history_model(order_id=order.id, status="assigned", notes=f"{run_id} courier internal note"))
+        settlement_model = MODEL_BY_TABLE["partner_settlements"]
+        session.add(
+            settlement_model(
+                partner_id=merchant_a.id,
+                status="pending",
+                amount=Decimal("7250.00"),
+            )
+        )
         await session.commit()
         return {
             "run_id": run_id,
@@ -184,7 +192,12 @@ def _payload_text(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _assert_no_cross_merchant_or_customer_leak(payload: object, seeded: dict[str, object]) -> None:
+def _assert_no_cross_merchant_or_customer_leak(
+    payload: object,
+    seeded: dict[str, object],
+    *,
+    allow_payment_receipt: bool = False,
+) -> None:
     text = _payload_text(payload)
     _, _, customer_id = seeded["customer"]  # type: ignore[misc]
     forbidden_fragments = [
@@ -197,11 +210,12 @@ def _assert_no_cross_merchant_or_customer_leak(payload: object, seeded: dict[str
         "Sensitive full address",
         "bank_transfer",
         "TX-",
-        "receipt",
         "global note",
         "courier internal",
         "customer private note",
     ]
+    if not allow_payment_receipt:
+        forbidden_fragments.append("receipt")
     for fragment in forbidden_fragments:
         assert str(fragment) not in text
     assert not merchant_payload_forbidden_keys(payload)
@@ -249,7 +263,14 @@ async def test_partner_order_list_detail_report_and_generic_resources_are_scoped
         assert "payments" not in detail_payload
         assert "shipping" not in detail_payload
         assert "notes" not in detail_payload
-        _assert_no_cross_merchant_or_customer_leak(detail_payload, seeded)
+        receipt_payload = detail_payload.get("payment_receipt")
+        assert isinstance(receipt_payload, dict)
+        assert receipt_payload["receipt_path"].startswith("/uploads/receipts/")
+        _assert_no_cross_merchant_or_customer_leak(
+            detail_payload,
+            seeded,
+            allow_payment_receipt=True,
+        )
 
         forbidden_detail = await client.get(f"/orders/{order_id}", headers=merchant_c_headers, params={"scope": "partner"})
         assert forbidden_detail.status_code == 404
@@ -281,6 +302,14 @@ async def test_partner_order_list_detail_report_and_generic_resources_are_scoped
             "averageOrdersPerCustomer": "1.00",
         }
         assert report_body["aggregation"] == "own_order_items_successful_payments_minus_refunds"
+        assert report_body["dues"] == {
+            "recorded_due": "7250.00",
+            "recorded_due_count": 1,
+            "currency_code": "YER",
+            "scope": "all_recorded_unpaid_settlements",
+            "access": "read_only",
+            "managed_by": "finance_team",
+        }
         _assert_no_cross_merchant_or_customer_leak(report_body, seeded)
 
         for table in ("orders", "order_items", "order_payments", "payment_receipts", "order_status_history", "order_shipping"):
@@ -291,6 +320,15 @@ async def test_partner_order_list_detail_report_and_generic_resources_are_scoped
             )
             assert response.status_code == 403, f"{table}: {response.text}"
             assert response.json()["detail"] == "merchant_typed_endpoint_required"
+
+        for table in ("partner_wallets", "partner_settlements", "partner_payments"):
+            response = await client.post(
+                f"/resources/{table}/query",
+                headers=merchant_a_headers,
+                json={"operation": "select", "limit": 1},
+            )
+            assert response.status_code == 403, f"{table}: {response.text}"
+            assert response.json()["detail"] == "merchant_typed_finance_endpoint_required"
 
         admin_detail = await client.get(f"/orders/{order_id}", headers=admin_headers)
         assert admin_detail.status_code == 200, admin_detail.text

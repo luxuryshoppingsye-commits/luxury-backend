@@ -64,9 +64,9 @@ async def test_welcome_waits_for_device_registration(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("channel,enabled,expected", [
     ("push", True, ("mobile_push",)), ("in_app", True, ("in_app",)),
-    ("push", False, None),
+    ("push", False, ("mobile_push",)),
 ])
-async def test_production_campaign_push_is_queued_and_respects_preferences(monkeypatch, channel, enabled, expected):
+async def test_production_campaign_push_is_queued_for_every_target(monkeypatch, channel, enabled, expected):
     monkeypatch.setattr(rs, "get_settings", lambda: SimpleNamespace(app_env="production"))
     notification = SimpleNamespace(
         preferences_for=AsyncMock(return_value=SimpleNamespace(promotional_notifications=enabled,
@@ -77,14 +77,19 @@ async def test_production_campaign_push_is_queued_and_respects_preferences(monke
     row = SimpleNamespace(id=uuid.uuid4(), title="Friday", message="Have a good Friday", created_by=uuid.uuid4())
     result = await rs.CampaignService()._deliver_batch(session, row, [uuid.uuid4()], [channel])
     assert result["blocked_credentials"] == 0
-    if expected is None:
-        notification.create_notification.assert_not_awaited()
-        assert session.added[0].extra_data["status"] == "suppressed_by_preference"
-    else:
-        payload = notification.create_notification.await_args.args[0]
-        assert payload.delivery_channels == expected
-        assert payload.notification_type == "marketing_campaign"
-        assert result["sent"] == 1
+    payload = notification.create_notification.await_args.args[0]
+    assert payload.delivery_channels == expected
+    assert payload.notification_type == "marketing_campaign"
+    assert result["sent"] == 1
+
+
+def test_campaigns_always_include_in_app_and_phone_alert_channels():
+    normalized = rs.CampaignService()._normalize_body({
+        "title": "إعلان جديد",
+        "message": "وصلت منتجات وعروض جديدة إلى المتجر.",
+        "channel": "email",
+    })
+    assert {"in_app", "push"}.issubset(normalized["channels"])
 
 
 @pytest.mark.asyncio
