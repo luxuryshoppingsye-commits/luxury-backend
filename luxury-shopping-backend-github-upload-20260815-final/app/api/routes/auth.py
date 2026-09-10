@@ -20,7 +20,7 @@ from ...database import get_session
 from ...dependencies import current_user, require_admin, user_roles
 from ...models import MODEL_BY_TABLE
 from ...config import get_settings
-from ...models.domain import LoginAttempt, PasswordResetToken, PasswordResetTokenState, PhoneOtpToken, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole, VerificationToken
+from ...models.domain import AuthSession, LoginAttempt, PasswordResetToken, PasswordResetTokenState, PhoneOtpToken, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole, VerificationToken
 from ...models.domain import StaffPermissionSet
 from ...repositories.resources import serialize_record
 from ...schemas.auth import (
@@ -54,8 +54,10 @@ from ...services.auth_service import (
     extract_client_ip,
     record_login_attempt,
     record_security_event,
+    revoke_auth_session,
     revoke_all_refresh_tokens,
     revoke_refresh_token,
+    rotate_auth_session,
     rotate_refresh_token,
 )
 from ...services.api_protection import capabilities_for_roles
@@ -847,7 +849,20 @@ async def refresh(
     session: AsyncSession = Depends(get_session),
 ):
     try:
-        payload = await rotate_refresh_token(session, body.refresh_token, request)
+        if body.session_token:
+            try:
+                payload = await rotate_auth_session(session, body.session_token, request)
+            except HTTPException as error:
+                # Older deployments may not have the session table yet. Fall
+                # back to the rotating refresh token only when the session
+                # credential itself is unavailable.
+                if not body.refresh_token or error.detail != "invalid_session":
+                    raise
+                payload = await rotate_refresh_token(session, body.refresh_token, request)
+        elif body.refresh_token:
+            payload = await rotate_refresh_token(session, body.refresh_token, request)
+        else:
+            raise HTTPException(status_code=401, detail="refresh_token_required")
     except HTTPException:
         await session.commit()
         raise
@@ -883,7 +898,10 @@ async def web_refresh(
 
 @router.post("/auth/logout")
 async def logout(body: RefreshRequest, session: AsyncSession = Depends(get_session)):
-    await revoke_refresh_token(session, body.refresh_token)
+    if body.refresh_token:
+        await revoke_refresh_token(session, body.refresh_token)
+    if body.session_token:
+        await revoke_auth_session(session, body.session_token)
     await session.commit()
     return {"ok": True}
 
@@ -930,6 +948,7 @@ async def list_active_sessions(
         "data": [
             {
                 "id": str(row.id),
+                "auth_session_id": str(row.session_id) if row.session_id is not None else None,
                 "session_family_id": str(state.session_family_id if state is not None else row.id),
                 "created_at": row.created_at.isoformat(),
                 "expires_at": row.expires_at.isoformat(),
@@ -954,6 +973,10 @@ async def revoke_session(
         raise HTTPException(status_code=404, detail="session_not_found")
     if row.revoked_at is None:
         row.revoked_at = datetime.now(timezone.utc)
+    if row.session_id is not None:
+        auth_session = await session.get(AuthSession, row.session_id, with_for_update=True)
+        if auth_session is not None and auth_session.revoked_at is None:
+            auth_session.revoked_at = datetime.now(timezone.utc)
     await record_security_event(
         session,
         user_id=user.id,

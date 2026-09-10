@@ -665,11 +665,29 @@ async def _coupon_payload(
     if int(prior.scalar_one()) >= per_user:
         return {"valid": False, "reason": "coupon_usage_limit"}
     subtotal = Decimal(str(body.get("subtotal") or body.get("p_subtotal") or 0))
-    minimum = Decimal(str(extra.get("min_order_amount") or 0))
+    minimum = Decimal(
+        str(
+            extra.get("min_order_amount")
+            if extra.get("min_order_amount") is not None
+            else extra.get("minimum_order_amount") or 0
+        )
+    )
     if subtotal < minimum:
         return {"valid": False, "reason": "minimum_order_not_met"}
-    discount_type = str(extra.get("discount_type") or "fixed")
-    discount_value = Decimal(str(extra.get("discount_value") or coupon.amount or 0))
+    discount_type = str(
+        extra.get("discount_type")
+        or extra.get("discountType")
+        or extra.get("type")
+        or "fixed"
+    ).lower().strip()
+    raw_discount_value = extra.get("discount_value")
+    if raw_discount_value is None:
+        raw_discount_value = extra.get("discountValue")
+    if raw_discount_value is None:
+        raw_discount_value = coupon.amount
+    discount_value = Decimal(str(raw_discount_value or 0))
+    if discount_type != "free_shipping" and discount_value <= 0 and coupon.amount:
+        discount_value = Decimal(str(coupon.amount))
     if discount_type == "percentage":
         discount = subtotal * discount_value / Decimal("100")
     elif discount_type == "free_shipping":

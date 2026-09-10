@@ -88,12 +88,41 @@ class StaffPermissionSet(Base, TimestampMixin):
     permissions: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]", nullable=False)
 
 
+class AuthSession(Base, UuidPrimaryKeyMixin, TimestampMixin):
+    """Durable server-side login session owned by one user.
+
+    The raw session token is never stored.  A remembered mobile session has
+    no fixed expiry and is ended by logout, account security changes, or an
+    administrator revoking the session.
+    """
+
+    __tablename__ = "auth_sessions"
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    session_token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    remembered: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(Text)
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    __table_args__ = (
+        Index("ix_auth_sessions_active_user", "user_id", "revoked_at"),
+    )
+
+
 class RefreshToken(Base, UuidPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "refresh_tokens"
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("auth_sessions.id", ondelete="CASCADE"), index=True
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -705,6 +734,7 @@ MODEL_BY_TABLE: dict[str, type[Base]] = {
     "profiles": Profile,
     "user_roles": UserRole,
     "staff_permission_sets": StaffPermissionSet,
+    "auth_sessions": AuthSession,
     "refresh_tokens": RefreshToken,
     "password_reset_tokens": PasswordResetToken,
     "account_security": AccountSecurity,

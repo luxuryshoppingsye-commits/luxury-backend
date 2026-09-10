@@ -69,6 +69,17 @@ def test_public_storefront_reads_are_not_protected_by_auth_policy() -> None:
     assert loyalty_initialize.authentication_required is True
     assert loyalty_initialize.rate_limit_policy == "customer_write"
 
+    for path in (
+        "/ai/image-search",
+        "/api/ai/image-search",
+        "/api/operations/ai/image-search",
+        "/functions/image-search",
+    ):
+        image_search = policy_for_route("POST", path)
+        assert image_search.authentication_required is False, path
+        assert image_search.rate_limit_policy == "search", path
+        assert image_search.maximum_request_bytes >= 8 * 1024 * 1024, path
+
     protected_writes = (
         ("GET", "/api/analytics/events"),
         ("POST", "/api/content/menus"),

@@ -50,6 +50,133 @@ class LoyaltyProgramSettings:
     max_redeem_percentage: int = 50
 
 
+# Tier thresholds are part of the customer-facing loyalty contract.  The
+# database stores the editable tier fields in ``extra_data`` when the
+# compatibility schema is used, so the API must derive the active tier from
+# the current point total instead of trusting a stale user row.
+DEFAULT_LOYALTY_TIERS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "برونزي",
+        "name_en": "Bronze",
+        "min_points": 0,
+        "discount_percentage": 0,
+        "benefits": ["ترحيب في برنامج الولاء", "إشعارات العروض الحصرية"],
+        "color": "#CD7F32",
+    },
+    {
+        "name": "فضي",
+        "name_en": "Silver",
+        "min_points": 500,
+        "discount_percentage": 5,
+        "benefits": ["خصم 5% على جميع المشتريات", "أولوية في إشعارات العروض"],
+        "color": "#C0C0C0",
+    },
+    {
+        "name": "ذهبي",
+        "name_en": "Gold",
+        "min_points": 2000,
+        "discount_percentage": 10,
+        "benefits": ["خصم 10% على جميع المشتريات", "شحن مجاني للطلبات المؤهلة"],
+        "color": "#D4AF37",
+    },
+    {
+        "name": "بلاتيني",
+        "name_en": "Platinum",
+        "min_points": 5000,
+        "discount_percentage": 15,
+        "benefits": ["خصم 15% عند الشراء", "دعم أسرع وهدايا موسمية"],
+        "color": "#E5E4E2",
+    },
+)
+
+
+def _loyalty_integer(value: Any, fallback: int = 0) -> int:
+    try:
+        return max(0, int(Decimal(str(value))))
+    except (ArithmeticError, TypeError, ValueError):
+        return fallback
+
+
+def _loyalty_benefits(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    return [item.strip() for item in str(value).replace("،", ",").split(",") if item.strip()]
+
+
+def normalize_loyalty_tier(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a stored tier row for point-based selection."""
+
+    name = str(row.get("name") or row.get("title") or "").strip()
+    if not name:
+        return None
+    minimum = row.get("min_points", row.get("minPoints", row.get("amount", 0)))
+    return {
+        "id": str(row.get("id") or ""),
+        "name": name,
+        "name_en": str(row.get("name_en") or row.get("nameEn") or "").strip(),
+        "min_points": _loyalty_integer(minimum),
+        "discount_percentage": row.get("discount_percentage", row.get("discountPercentage", 0)) or 0,
+        "benefits": _loyalty_benefits(row.get("benefits")),
+        "color": str(row.get("color") or "").strip(),
+    }
+
+
+def loyalty_tier_for_points(
+    tiers: list[dict[str, Any]],
+    total_points: int,
+) -> dict[str, Any]:
+    """Return the highest eligible tier for the supplied point total."""
+
+    eligible = [
+        tier
+        for tier in tiers
+        if _loyalty_integer(tier.get("min_points")) <= max(0, total_points)
+    ]
+    if not eligible:
+        return dict(DEFAULT_LOYALTY_TIERS[0])
+    return max(eligible, key=lambda tier: _loyalty_integer(tier.get("min_points")))
+
+
+def loyalty_next_tier_min_points(
+    tiers: list[dict[str, Any]],
+    total_points: int,
+) -> int | None:
+    """Return the next threshold, or ``None`` after the final tier."""
+
+    upcoming = [
+        _loyalty_integer(tier.get("min_points"))
+        for tier in tiers
+        if _loyalty_integer(tier.get("min_points")) > max(0, total_points)
+    ]
+    return min(upcoming) if upcoming else None
+
+
+async def loyalty_tier_catalog(session: AsyncSession) -> list[dict[str, Any]]:
+    """Load active tiers and fall back to the published default thresholds."""
+
+    model = MODEL_BY_TABLE["loyalty_tiers"]
+    result = await session.execute(
+        select(model)
+        .where(
+            model.deleted_at.is_(None),
+            model.is_active.is_(True),
+            func.lower(model.status).in_(("active", "published", "enabled")),
+        )
+        .order_by(model.sort_order.asc(), model.created_at.asc())
+        .limit(500)
+    )
+    tiers = [
+        normalized
+        for row in result.scalars()
+        if (normalized := normalize_loyalty_tier(serialize_record(row))) is not None
+    ]
+    return sorted(tiers, key=lambda tier: _loyalty_integer(tier.get("min_points"))) or [
+        dict(tier) for tier in DEFAULT_LOYALTY_TIERS
+    ]
+
+
 def _positive_whole_number(value: Any, fallback: int) -> int:
     try:
         parsed = int(Decimal(str(value)))
@@ -208,12 +335,19 @@ def derive_local_payment_status(total: Any, paid: Any, existing_status: Any = No
     normalized_total = money_or_zero(total)
     normalized_paid = money_or_zero(paid)
     legacy_status = str(existing_status or "").strip().lower()
+    if legacy_status in {"refunded", "partial_refund", "partially_refunded"}:
+        return legacy_status
+    # Some local payments are confirmed by an administrator and persisted on
+    # the request itself without an order_payments ledger row. Preserve that
+    # explicit source of truth so the list and detail views cannot disagree.
+    if legacy_status in {"paid", "payment_approved", "approved", "completed"}:
+        return "paid"
     if normalized_total > 0 and normalized_paid >= normalized_total:
         return "paid"
     if normalized_paid > 0:
         return "partial"
-    if legacy_status in {"partial_refund", "refunded"}:
-        return legacy_status
+    if legacy_status in {"pending", "under_review", "manual_review"}:
+        return "pending"
     return "unpaid"
 
 
@@ -428,8 +562,21 @@ async def _coupon_discount(
         ).scalar_one_or_none()
         if loyalty is None:
             raise HTTPException(status_code=409, detail="coupon_audience_not_eligible")
-    discount_type = str(extra.get("discount_type") or extra.get("type") or "fixed").lower().strip()
-    raw_value = extra.get("discount_value") if extra.get("discount_value") is not None else coupon.amount
+    discount_type = str(
+        extra.get("discount_type")
+        or extra.get("discountType")
+        or extra.get("type")
+        or "fixed"
+    ).lower().strip()
+    raw_value = extra.get("discount_value")
+    if raw_value is None:
+        raw_value = extra.get("discountValue")
+    if raw_value is None:
+        raw_value = coupon.amount
+    # Compatibility records created before the normalized extra_data contract
+    # may contain a zero placeholder while the real value is in amount.
+    if discount_type != "free_shipping" and money_or_zero(raw_value) <= 0:
+        raw_value = coupon.amount
     if discount_type in {"percentage", "percent"}:
         percentage = min(money(raw_value or 0), Decimal("100.00"))
         discount = money(eligible_subtotal * percentage / Decimal("100"))

@@ -49,6 +49,12 @@ def create_refresh_token() -> tuple[str, str, datetime]:
     return raw, digest, expires_at
 
 
+def create_session_token() -> tuple[str, str]:
+    """Create the durable opaque credential for a remembered app session."""
+    raw = secrets.token_urlsafe(64)
+    return raw, token_hash(raw)
+
+
 def token_hash(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 

@@ -107,8 +107,11 @@ def test_register_request_allows_blank_optional_phone_as_none() -> None:
 
 def test_refresh_request_requires_a_real_refresh_token() -> None:
     assert RefreshRequest.model_validate({"refreshToken": "x" * 20}).refresh_token == "x" * 20
+    assert RefreshRequest.model_validate({"sessionToken": "s" * 20}).session_token == "s" * 20
     with pytest.raises(ValidationError):
         RefreshRequest.model_validate({"refreshToken": "too-short"})
+    with pytest.raises(ValidationError):
+        RefreshRequest.model_validate({})
 
 
 def test_password_change_request_uses_api_aliases() -> None:

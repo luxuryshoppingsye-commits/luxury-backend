@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fastapi import HTTPException
@@ -159,6 +159,18 @@ def _resource_extra_value(record: Any, key: str) -> Any:
     return extra_data.get(key) if isinstance(extra_data, dict) else None
 
 
+def _resource_values_equal(left: Any, right: Any) -> bool:
+    """Compare resource values while treating numeric JSON representations equally."""
+    if left == right:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        return Decimal(str(left).strip()) == Decimal(str(right).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
 async def _notify_customer_resource_update(
     session: AsyncSession,
     table: str,
@@ -186,36 +198,59 @@ async def _notify_customer_resource_update(
         new_status = _resource_status(getattr(record, "status", None))
         old_extra = previous.get("extra_data") if isinstance(previous.get("extra_data"), dict) else {}
         new_extra = getattr(record, "extra_data", None) if isinstance(getattr(record, "extra_data", None), dict) else {}
-        pricing_keys = {"amount", "final_cost", "finalCost", "estimated_cost", "shipping_cost", "service_fee", "customs_cost"}
-        pricing_changed = bool(pricing_keys.intersection(changed_data)) or any(
-            old_extra.get(key) != new_extra.get(key)
+        pricing_keys = {
+            "amount",
+            "final_cost",
+            "finalCost",
+            "estimated_cost",
+            "estimatedCost",
+            "shipping_cost",
+            "shippingCost",
+            "service_fee",
+            "serviceFee",
+            "customs_cost",
+            "customsCost",
+        }
+        pricing_changed = (
+            "amount" in changed_data
+            and not _resource_values_equal(previous.get("amount"), getattr(record, "amount", None))
+        ) or any(
+            key in changed_data
+            and not _resource_values_equal(old_extra.get(key), new_extra.get(key))
             for key in pricing_keys
-            if key in old_extra or key in new_extra
+        ) or (
+            "extra_data" in changed_data
+            and any(
+                not _resource_values_equal(old_extra.get(key), new_extra.get(key))
+                for key in pricing_keys
+            )
         )
         status_changed = "status" in changed_data and old_status != new_status
         if not target_id or not (status_changed or pricing_changed):
             return
-        if pricing_changed:
+        # A status transition is the customer-facing event even when the
+        # admin form submits the unchanged pricing fields alongside it.
+        if status_changed:
+            ar_status, en_status = _resource_order_status_labels(new_status)
+            title = "تم تحديث حالة طلبك الدولي"
+            body = f"حالة طلبك الدولي الآن: {ar_status}."
+            title_en = "Your international order status was updated"
+            body_en = f"Your international order status is now {en_status}."
+        else:
             amount = getattr(record, "amount", None) or new_extra.get("final_cost") or new_extra.get("finalCost")
             currency = new_extra.get("currency_code") or new_extra.get("currencyCode") or "YER"
             title = "تم تحديث تسعير طلبك الدولي"
             body = f"تم تحديث تسعير طلبك الدولي إلى {amount} {currency}. يرجى مراجعة الطلب وتأكيده للمتابعة."
             title_en = "Your international order pricing was updated"
             body_en = f"Your international order pricing was updated. New total: {amount} {currency}. Please review the order."
-        else:
-            ar_status, en_status = _resource_order_status_labels(new_status)
-            title = "تم تحديث حالة طلبك الدولي"
-            body = f"حالة طلبك الدولي الآن: {ar_status}."
-            title_en = "Your international order status was updated"
-            body_en = f"Your international order status is now {en_status}."
-        notification_type = "order_update"
+        notification_type = "order_status" if status_changed else "order_update"
         payload = {
             "orderId": entity_id,
             "status": new_status,
             "order_status": new_status,
             "title_en": title_en,
             "body_en": body_en,
-            "deep_link": f"/my-orders?highlight={entity_id}",
+            "deep_link": f"/international-orders/{entity_id}",
         }
         action_url = payload["deep_link"]
     elif table == "products":

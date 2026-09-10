@@ -41,15 +41,7 @@ INSERT INTO public.store_reviews (
 VALUES (
     :user_id, :rating, :comment, :customer_name, 'pending', FALSE, FALSE
 )
-ON CONFLICT (user_id) DO UPDATE SET
-    rating = EXCLUDED.rating,
-    comment = EXCLUDED.comment,
-    customer_name = EXCLUDED.customer_name,
-    status = 'pending',
-    is_approved = FALSE,
-    is_rejected = FALSE,
-    admin_notes = NULL,
-    updated_at = NOW()
+ON CONFLICT (user_id) DO NOTHING
 RETURNING id, user_id, rating, comment, customer_name,
           is_approved, is_rejected, admin_notes, status, created_at, updated_at
 """
@@ -62,6 +54,22 @@ SET status = :status,
     admin_notes = COALESCE(:admin_notes, admin_notes),
     updated_at = NOW()
 WHERE id = :review_id
+RETURNING id, user_id, rating, comment, customer_name,
+          is_approved, is_rejected, admin_notes, status, created_at, updated_at
+"""
+
+_HANDOVER_CONTENT_UPDATE_SQL = """
+UPDATE public.store_reviews
+SET rating = :rating,
+    comment = :comment,
+    customer_name = :customer_name,
+    status = 'pending',
+    is_approved = FALSE,
+    is_rejected = FALSE,
+    admin_notes = NULL,
+    updated_at = NOW()
+WHERE id = :review_id
+  AND user_id = :user_id
 RETURNING id, user_id, rating, comment, customer_name,
           is_approved, is_rejected, admin_notes, status, created_at, updated_at
 """
@@ -79,6 +87,7 @@ SELECT sr.id, sr.user_id,
            LOWER(COALESCE(sr.status, '')) IN ('rejected', 'declined', 'denied', 'hidden', 'blocked', 'inactive', 'disabled')
            OR LOWER(COALESCE(sr.extra_data ->> 'is_rejected', '')) IN ('true', '1', 'yes')
        ) AS is_rejected,
+       COALESCE(NULLIF(sr.extra_data ->> 'show_name', ''), 'true') AS show_name,
        sr.extra_data ->> 'admin_notes' AS admin_notes, sr.created_at, sr.updated_at, sr.status,
        p.full_name AS profile_full_name
 FROM public.store_reviews sr
@@ -105,6 +114,7 @@ SELECT sr.id, sr.user_id,
            LOWER(COALESCE(sr.status, '')) IN ('rejected', 'declined', 'denied', 'hidden', 'blocked', 'inactive', 'disabled')
            OR LOWER(COALESCE(sr.extra_data ->> 'is_rejected', '')) IN ('true', '1', 'yes')
        ) AS is_rejected,
+       COALESCE(NULLIF(sr.extra_data ->> 'show_name', ''), 'true') AS show_name,
        sr.extra_data ->> 'admin_notes' AS admin_notes, sr.created_at, sr.updated_at, sr.status,
        p.full_name AS profile_full_name
 FROM public.store_reviews sr
@@ -128,11 +138,37 @@ _APPROVED_STATUS_NAMES = frozenset({"approved", "active", "published", "visible"
 _REJECTED_STATUS_NAMES = frozenset({"rejected", "declined", "denied", "hidden", "blocked", "inactive", "disabled"})
 
 
+def _as_bool(value: Any, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def mask_store_review_name(value: Any) -> str:
+    """Keep a recognizable part of the account name while hiding its middle."""
+    text_value = " ".join(str(value or "").split())
+    if not text_value:
+        return "عميل"
+    words = text_value.split(" ")
+    if len(words) > 1:
+        return f"{words[0]}***{words[-1][-1]}"
+    if len(text_value) <= 2:
+        return f"{text_value[0]}***"
+    return f"{text_value[0]}***{text_value[-1]}"
+
+
 def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
     profile_name = str(row.get("profile_full_name") or "").strip()
     customer_name = str(row.get("customer_name") or "").strip()
     if (not customer_name or customer_name in _STORE_LABEL_NAMES) and profile_name:
         customer_name = profile_name
+    show_name = _as_bool(row.get("show_name"), default=True)
+    if not show_name:
+        customer_name = mask_store_review_name(customer_name)
     comment = row.get("comment")
     if comment is None:
         comment = row.get("body") or row.get("title")
@@ -154,6 +190,7 @@ def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
         "rating": max(0, min(5, rating)),
         "comment": str(comment).strip() if comment not in (None, "") else None,
         "customer_name": customer_name or None,
+        "show_name": show_name,
         "status": status or "pending",
         "is_approved": bool(is_approved),
         "is_rejected": bool(is_rejected),
@@ -216,7 +253,44 @@ async def create_handover_store_review(
                 "customer_name": customer_name,
             },
         )
-        return normalize_store_review_row(dict(result.mappings().one()))
+        mappings = result.mappings()
+        row = mappings.one_or_none() if hasattr(mappings, "one_or_none") else mappings.one()
+        if row is None:
+            # The unique user constraint rejected a second review.
+            return {}
+        return normalize_store_review_row(dict(row))
+    except ProgrammingError:
+        await session.rollback()
+        return None
+
+
+async def update_handover_store_review(
+    session: AsyncSession,
+    *,
+    review_id: uuid.UUID,
+    user_id: uuid.UUID,
+    rating: int,
+    comment: str,
+    customer_name: str | None,
+) -> dict[str, Any] | None:
+    """Update a customer's existing review in the direct-column schema.
+
+    Returning ``None`` on a schema mismatch lets the route use the generic
+    resource-table writer without changing the public endpoint contract.
+    """
+    try:
+        result = await session.execute(
+            text(_HANDOVER_CONTENT_UPDATE_SQL),
+            {
+                "review_id": review_id,
+                "user_id": user_id,
+                "rating": rating,
+                "comment": comment,
+                "customer_name": customer_name,
+            },
+        )
+        row = result.mappings().one_or_none()
+        return normalize_store_review_row(dict(row)) if row is not None else {}
     except ProgrammingError:
         await session.rollback()
         return None

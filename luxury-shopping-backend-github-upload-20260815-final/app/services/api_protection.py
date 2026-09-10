@@ -208,6 +208,7 @@ PUBLIC_POST_PATHS = frozenset(
         "/api/ai/image-search",
         "/api/operations/ai/chat",
         "/api/operations/ai/product-assistant",
+        "/api/operations/ai/image-search",
         "/api/catalog/cart/hydrate",
     }
 )
@@ -394,16 +395,23 @@ def _policy(
     audit: bool = False,
     idempotency: bool = False,
     ai_quota: str | None = None,
+    maximum_request_bytes: int | None = None,
 ) -> ApiProtectionPolicy:
     settings = get_settings()
-    maximum_request_bytes = settings.max_upload_bytes if name == "upload" else settings.api_max_request_bytes
+    request_limit = (
+        maximum_request_bytes
+        if maximum_request_bytes is not None
+        else settings.max_upload_bytes
+        if name == "upload"
+        else settings.api_max_request_bytes
+    )
     return ApiProtectionPolicy(
         policy_name=name,
         authentication_required=auth,
         required_permissions=permissions,
         allowed_roles=roles,
         rate_limit_policy=rate or name,
-        maximum_request_bytes=maximum_request_bytes,
+        maximum_request_bytes=request_limit,
         maximum_response_rows=settings.resource_admin_max_page_size if name in {"admin_write", "finance_write"} else settings.resource_max_page_size,
         maximum_page_size=settings.resource_admin_max_page_size if name in {"admin_write", "finance_write"} else settings.resource_max_page_size,
         maximum_filter_count=settings.resource_max_filters,
@@ -431,6 +439,29 @@ def policy_for_route(method: str, path: str) -> ApiProtectionPolicy:
         return _policy("internal_diagnostics", auth=False, rate="internal_diagnostics", public=True)
     if normalized.startswith("/internal"):
         return _policy("internal_diagnostics", auth=True, roles=("admin", "manager"), rate="internal_diagnostics", sensitive=True)
+    # Image search is a customer-facing storefront action.  Keep both the
+    # compatibility endpoint and the function proxy usable for guests; the
+    # request is still bounded by the anonymous search limiter and the image
+    # is never persisted by the handler.
+    if method == "POST" and (
+        function_name == "image-search"
+        or normalized
+        in {
+            "/ai/image-search",
+            "/api/ai/image-search",
+            "/api/operations/ai/image-search",
+        }
+    ):
+        return _policy(
+            "search",
+            auth=False,
+            rate="search",
+            public=True,
+            # The handler validates the decoded image at 6 MiB. The larger
+            # envelope is needed for base64 and JSON overhead for older app
+            # builds that do not pre-compress the photo on the device.
+            maximum_request_bytes=8 * 1024 * 1024,
+        )
     if function_name in PUBLIC_FUNCTIONS:
         return _policy("public_read", auth=False, rate="public_read", public=True)
     if function_name in AI_GENERATION_FUNCTIONS:

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from backend.app.models.domain import AccountSecurity, LoginAttempt, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole
+from backend.app.models.domain import AuthSession, AccountSecurity, LoginAttempt, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole
 from backend.app.services import auth_service
 
 
@@ -155,7 +155,10 @@ async def test_auth_payload_issues_tokens_and_persists_refresh(monkeypatch: pyte
     assert refresh.user_agent == "unit-agent"
     assert refresh.ip_address == "127.0.0.1"
     _only_added(session, RefreshTokenSecurity)
-    assert session.flushed == 2
+    auth_session = _only_added(session, AuthSession)
+    assert refresh.session_id == auth_session.id
+    assert payload["session_token"]
+    assert session.flushed == 3
 
 
 @pytest.mark.asyncio
@@ -197,6 +200,7 @@ async def test_auth_payload_keeps_access_login_when_optional_session_tables_are_
     async def optional_table_ready(_session, table_name: str) -> bool:
         return table_name not in {
             AccountSecurity.__tablename__,
+            AuthSession.__tablename__,
             RefreshToken.__tablename__,
             RefreshTokenSecurity.__tablename__,
         }

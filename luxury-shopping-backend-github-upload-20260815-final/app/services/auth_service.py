@@ -16,6 +16,7 @@ from ..config import get_settings
 from ..models import MODEL_BY_TABLE
 from ..models.domain import (
     AccountSecurity,
+    AuthSession,
     LoginAttempt,
     PasswordResetTokenState,
     PhoneOtpToken,
@@ -28,7 +29,7 @@ from ..models.domain import (
 )
 from ..repositories.resources import serialize_record
 from ..security.passwords import hash_password, validate_password, verify_password
-from ..security.tokens import create_access_token, create_refresh_token, token_hash
+from ..security.tokens import create_access_token, create_refresh_token, create_session_token, token_hash
 from .api_protection import trusted_client_ip
 
 ACTIVE_ACCOUNT_STATUS = "active"
@@ -378,6 +379,7 @@ async def auth_payload(
     request: Request | None = None,
     issue_tokens: bool = True,
     session_family_id: uuid.UUID | None = None,
+    auth_session_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     roles = await roles_for(session, user.id)
     account_state = await account_security_for(session, user.id)
@@ -434,6 +436,35 @@ async def auth_payload(
     if partner_agreement_accepted is not None:
         payload["partner_agreement_accepted"] = partner_agreement_accepted
     if issue_tokens:
+        if await _optional_table_ready(session, AuthSession.__tablename__):
+            now = datetime.now(timezone.utc)
+            if auth_session_id is None:
+                raw_session, session_hash = create_session_token()
+                auth_session = AuthSession(
+                    user_id=user.id,
+                    session_token_hash=session_hash,
+                    # A remembered session is renewable and ends through an
+                    # explicit logout/revocation or account security action.
+                    expires_at=None,
+                    last_seen_at=now,
+                    remembered=True,
+                    user_agent=request.headers.get("user-agent") if request else None,
+                    ip_address=extract_client_ip(request),
+                )
+                session.add(auth_session)
+                if await _safe_flush(session):
+                    auth_session_id = auth_session.id
+                    payload["session_token"] = raw_session
+            else:
+                await session.execute(
+                    update(AuthSession)
+                    .where(
+                        AuthSession.id == auth_session_id,
+                        AuthSession.user_id == user.id,
+                        AuthSession.revoked_at.is_(None),
+                    )
+                    .values(last_seen_at=now)
+                )
         payload.update({
             "access_token": create_access_token(
                 str(user.id),
@@ -449,6 +480,7 @@ async def auth_payload(
             refresh = RefreshToken(
                 user_id=user.id,
                 token_hash=refresh_hash,
+                session_id=auth_session_id,
                 expires_at=expires_at,
                 user_agent=request.headers.get("user-agent") if request else None,
                 ip_address=extract_client_ip(request),
@@ -631,6 +663,16 @@ async def revoke_all_refresh_tokens(
     except SQLAlchemyError:
         await session.rollback()
         return 0
+    if await _optional_table_ready(session, AuthSession.__tablename__):
+        try:
+            await session.execute(
+                update(AuthSession)
+                .where(AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None))
+                .values(revoked_at=timestamp)
+            )
+            await session.flush()
+        except SQLAlchemyError:
+            await session.rollback()
     return int(getattr(result, "rowcount", 0) or 0)
 
 
@@ -661,6 +703,15 @@ async def cleanup_security_artifacts(
         )
         .values(revoked_at=timestamp)
     )
+    if await _optional_table_ready(session, AuthSession.__tablename__):
+        await session.execute(
+            update(AuthSession)
+            .where(
+                AuthSession.revoked_at.is_(None),
+                AuthSession.user_id.in_(blocked_users),
+            )
+            .values(revoked_at=timestamp)
+        )
     expired_verifications = await session.execute(
         update(VerificationToken)
         .where(
@@ -731,6 +782,16 @@ async def revoke_refresh_family(
     except SQLAlchemyError:
         await session.rollback()
         return 0
+    if stored.session_id is not None and await _optional_table_ready(session, AuthSession.__tablename__):
+        try:
+            await session.execute(
+                update(AuthSession)
+                .where(AuthSession.id == stored.session_id, AuthSession.revoked_at.is_(None))
+                .values(revoked_at=timestamp)
+            )
+            await session.flush()
+        except SQLAlchemyError:
+            await session.rollback()
     return int(getattr(result, "rowcount", 0) or 0)
 
 
@@ -798,6 +859,17 @@ async def rotate_refresh_token(
     if user is None or not account_can_login(user, account_state):
         await revoke_refresh_family(session, stored, now=now)
         raise HTTPException(status_code=401, detail="inactive_user")
+    if stored.session_id is not None and await _optional_table_ready(session, AuthSession.__tablename__):
+        auth_session = await session.get(AuthSession, stored.session_id, with_for_update=True)
+        if (
+            auth_session is None
+            or auth_session.user_id != user.id
+            or auth_session.revoked_at is not None
+            or (auth_session.expires_at is not None and auth_session.expires_at <= now)
+        ):
+            stored.revoked_at = now
+            raise HTTPException(status_code=401, detail="invalid_refresh_token")
+        auth_session.last_seen_at = now
     stored.revoked_at = now
     stored_state = None
     if await _optional_table_ready(session, RefreshTokenSecurity.__tablename__):
@@ -815,6 +887,7 @@ async def rotate_refresh_token(
         request=request,
         issue_tokens=True,
         session_family_id=family_id,
+        auth_session_id=stored.session_id,
     )
     if payload.get("refresh_token"):
         new_hash = token_hash(str(payload["refresh_token"]))
@@ -833,11 +906,74 @@ async def rotate_refresh_token(
     return payload
 
 
+async def rotate_auth_session(
+    session: AsyncSession, raw_session: str, request: Request
+) -> dict[str, Any]:
+    """Renew a durable remembered session when its short refresh token is gone."""
+    if not await _optional_table_ready(session, AuthSession.__tablename__):
+        raise HTTPException(status_code=401, detail="invalid_session")
+    result = await session.execute(
+        select(AuthSession)
+        .where(AuthSession.session_token_hash == token_hash(raw_session))
+        .with_for_update()
+    )
+    auth_session = result.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if (
+        auth_session is None
+        or auth_session.revoked_at is not None
+        or (auth_session.expires_at is not None and auth_session.expires_at <= now)
+    ):
+        raise HTTPException(status_code=401, detail="invalid_session")
+    user = await session.get(User, auth_session.user_id)
+    account_state = await account_security_for(session, auth_session.user_id)
+    if user is None or not account_can_login(user, account_state):
+        auth_session.revoked_at = now
+        raise HTTPException(status_code=401, detail="inactive_user")
+    auth_session.last_seen_at = now
+    return await auth_payload(
+        session,
+        user,
+        request=request,
+        issue_tokens=True,
+        auth_session_id=auth_session.id,
+    )
+
+
 async def revoke_refresh_token(session: AsyncSession, raw_refresh: str) -> None:
+    now = datetime.now(timezone.utc)
+    result = await session.execute(
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash(raw_refresh))
+    )
+    stored = result.scalar_one_or_none()
+    if stored is None:
+        return
+    if stored.revoked_at is None:
+        stored.revoked_at = now
+    if stored.session_id is not None and await _optional_table_ready(session, AuthSession.__tablename__):
+        await session.execute(
+            update(AuthSession)
+            .where(AuthSession.id == stored.session_id, AuthSession.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+
+
+async def revoke_auth_session(session: AsyncSession, raw_session: str) -> None:
+    if not await _optional_table_ready(session, AuthSession.__tablename__):
+        return
+    now = datetime.now(timezone.utc)
+    result = await session.execute(
+        select(AuthSession).where(AuthSession.session_token_hash == token_hash(raw_session))
+    )
+    auth_session = result.scalar_one_or_none()
+    if auth_session is None:
+        return
+    if auth_session.revoked_at is None:
+        auth_session.revoked_at = now
     await session.execute(
         update(RefreshToken)
-        .where(RefreshToken.token_hash == token_hash(raw_refresh), RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
+        .where(RefreshToken.session_id == auth_session.id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=now)
     )
 
 

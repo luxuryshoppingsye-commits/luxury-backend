@@ -129,37 +129,116 @@ def _terms(value) -> list[str]:
     ))[:12]
 
 
+def _gemini_image_model_candidates(settings) -> list[str]:
+    """Return vision-capable text models without using the image generator model."""
+    configured = str(getattr(settings, "ai_default_model", "") or "").strip()
+    allowlist = str(getattr(settings, "ai_model_allowlist", "") or "").split(",")
+    retired = {"gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001"}
+    candidates: list[str] = []
+    for raw in [configured, *allowlist, "gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+        model = raw.strip()
+        if (
+            not model
+            or model == "default"
+            or model in retired
+            or not model.startswith("gemini-")
+            or model.endswith("-image")
+            or model in candidates
+        ):
+            continue
+        candidates.append(model)
+    return candidates or ["gemini-2.5-flash"]
+
+
+def _json_object_from_gemini(payload: dict) -> dict:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("image_analysis_empty")
+    content = candidates[0].get("content") if isinstance(candidates[0], dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        raise ValueError("image_analysis_empty")
+    text = "".join(
+        str(part.get("text") or "")
+        for part in parts
+        if isinstance(part, dict) and not part.get("thought")
+    ).strip()
+    if not text:
+        raise ValueError("image_analysis_empty")
+    # Gemini normally honours responseMimeType, but older/overloaded models
+    # sometimes wrap the same JSON in a markdown fence or add one sentence.
+    # Accept the object itself while rejecting arbitrary non-JSON output.
+    unfenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    try:
+        data = json.loads(unfenced)
+    except json.JSONDecodeError:
+        start = unfenced.find("{")
+        end = unfenced.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("invalid_image_analysis")
+        data = json.loads(unfenced[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("invalid_image_analysis")
+    return data
+
+
 async def _gemini_image_json(encoded: str, prompt: str, *, error_code: str) -> dict:
     settings = get_settings()
-    key = (settings.gemini_api_key or settings.google_api_key or settings.ai_api_key).strip()
+    key = (
+        getattr(settings, "gemini_api_key", "")
+        or getattr(settings, "google_api_key", "")
+        or getattr(settings, "ai_api_key", "")
+    ).strip()
     if not key:
         raise HTTPException(503, "image_search_provider_unconfigured")
-    model = settings.ai_default_model.strip()
-    if not model.startswith("gemini-"):
-        model = "gemini-2.5-flash"
     headers = {"Content-Type": "application/json"}
-    headers.update({"Authorization": f"Bearer {key}"} if key.startswith("ya29.") else {"x-goog-api-key": key})
-    try:
-        async with httpx.AsyncClient(timeout=settings.ai_request_timeout_seconds) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers=headers,
-                json={
-                    "contents": [{"role": "user", "parts": [
-                        {"text": prompt},
-                        {"inlineData": {"mimeType": "image/jpeg", "data": encoded}},
-                    ]}],
-                    "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 1024},
-                },
-            )
-            response.raise_for_status()
-            parts = response.json()["candidates"][0]["content"]["parts"]
-            data = json.loads("".join(part.get("text", "") for part in parts if not part.get("thought")))
-            if not isinstance(data, dict):
-                raise ValueError("invalid_image_analysis")
-            return data
-    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
-        raise HTTPException(502, error_code) from exc
+    headers.update(
+        {"Authorization": f"Bearer {key}"}
+        if key.startswith("ya29.")
+        else {"x-goog-api-key": key}
+    )
+    last_status: int | None = None
+    last_error: Exception | None = None
+    timeout = getattr(settings, "ai_request_timeout_seconds", 20)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for model in _gemini_image_model_candidates(settings):
+            generation_config = {
+                "responseMimeType": "application/json",
+                "maxOutputTokens": 1024,
+                "temperature": 0,
+            }
+            if model.startswith("gemini-2.5"):
+                generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+            try:
+                response = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers=headers,
+                    json={
+                        "contents": [{"role": "user", "parts": [
+                            {"text": prompt},
+                            {"inlineData": {"mimeType": "image/jpeg", "data": encoded}},
+                        ]}],
+                        "generationConfig": generation_config,
+                    },
+                )
+                response.raise_for_status()
+                return _json_object_from_gemini(response.json())
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                last_status = exc.response.status_code
+                # Model availability and quota can differ by model. Try the
+                # next safe candidate before reporting a provider failure.
+                if last_status in {401, 403}:
+                    raise HTTPException(503, "image_search_provider_auth_failed") from exc
+                continue
+            except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                continue
+    if last_status == 429:
+        raise HTTPException(503, "image_search_provider_rate_limited") from last_error
+    if last_status == 404:
+        raise HTTPException(503, "image_search_model_unavailable") from last_error
+    raise HTTPException(503, error_code) from last_error
 
 
 async def _describe_image(encoded: str) -> dict:

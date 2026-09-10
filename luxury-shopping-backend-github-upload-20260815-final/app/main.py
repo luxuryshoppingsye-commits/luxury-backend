@@ -48,6 +48,9 @@ PUBLIC_STOREFRONT_ORIGINS = (
 )
 CRITICAL_SECURITY_TABLES = (
     "account_security",
+    # A remembered mobile session is stored separately from the rotating
+    # refresh-token rows, so it can renew the app after a short token expires.
+    "auth_sessions",
     # A remembered mobile session cannot be renewed when this table is
     # missing: auth_payload intentionally omits the refresh token in that
     # case. Create it alongside the other security tables for older

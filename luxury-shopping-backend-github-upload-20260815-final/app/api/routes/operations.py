@@ -27,7 +27,11 @@ from ...database import SessionFactory, get_session
 from ...dependencies import bearer, current_user, optional_user, require_admin, require_courier, require_marketer, require_partner, require_staff, user_roles
 from ...models import MODEL_BY_TABLE, RESOURCE_TABLES
 from ...models.domain import FileAsset, Order, OrderItem, Product, ProductVariant, Profile, User, UserRole
-from ...repositories.resources import ResourceRepository, serialize_record
+from ...repositories.resources import (
+    ResourceRepository,
+    _notify_customer_resource_update,
+    serialize_record,
+)
 from ...security.tokens import decode_token
 from ...services.auth_service import (
     _canonical_role,
@@ -44,6 +48,7 @@ from ...services.store_review_compat import (
     create_handover_store_review,
     fetch_public_store_reviews,
     fetch_user_store_review,
+    mask_store_review_name,
     update_handover_store_review_status,
 )
 from ...services.catalog_policy import (
@@ -69,7 +74,10 @@ from ...services.financial_calculator import (
     approved_payment_total,
     financial_response_row,
     find_idempotent_refund,
+    loyalty_next_tier_min_points,
     loyalty_program_settings,
+    loyalty_tier_catalog,
+    loyalty_tier_for_points,
     money,
     reconcile_loyalty_for_user,
     receipt_amount_for_order,
@@ -3409,6 +3417,90 @@ async def api_public_local_partner_products(
     return {"data": rows}
 
 
+_LOCAL_REQUEST_STATUS_LABELS = {
+    "pending": "طلبك قيد الانتظار",
+    "new": "تم استلام طلبك",
+    "reviewing": "طلبك قيد المراجعة",
+    "under_review": "طلبك قيد المراجعة",
+    "approved": "تمت الموافقة على طلبك",
+    "confirmed": "تم تأكيد طلبك",
+    "accepted": "تم قبول طلبك",
+    "processing": "طلبك قيد التجهيز",
+    "ready_for_shipment": "طلبك جاهز للشحن",
+    "shipped": "تم شحن طلبك",
+    "out_for_delivery": "طلبك خرج للتوصيل",
+    "delivered": "تم تسليم طلبك",
+    "completed": "اكتمل طلبك",
+    "rejected": "تم رفض طلبك",
+    "cancelled": "تم إلغاء طلبك",
+    "canceled": "تم إلغاء طلبك",
+}
+_LOCAL_REQUEST_STATUS_LABELS_EN = {
+    "pending": "Your request is pending",
+    "new": "Your request was received",
+    "reviewing": "Your request is under review",
+    "under_review": "Your request is under review",
+    "approved": "Your request was approved",
+    "confirmed": "Your request was confirmed",
+    "accepted": "Your request was accepted",
+    "processing": "Your request is being prepared",
+    "ready_for_shipment": "Your request is ready for shipment",
+    "shipped": "Your request was shipped",
+    "out_for_delivery": "Your request is out for delivery",
+    "delivered": "Your request was delivered",
+    "completed": "Your request was completed",
+    "rejected": "Your request was rejected",
+    "cancelled": "Your request was cancelled",
+    "canceled": "Your request was cancelled",
+}
+
+
+def _local_request_status_key(status: Any) -> str:
+    return str(status or "pending").strip().lower().replace(" ", "_") or "pending"
+
+
+async def _create_local_request_notification(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    request_id: str,
+    status: Any,
+    created: bool = False,
+    created_by: uuid.UUID | None = None,
+) -> None:
+    status_key = _local_request_status_key(status)
+    status_label = _LOCAL_REQUEST_STATUS_LABELS.get(status_key, f"حالة طلبك: {status_key.replace('_', ' ')}")
+    status_label_en = _LOCAL_REQUEST_STATUS_LABELS_EN.get(status_key, f"Your request status: {status_key.replace('_', ' ').title()}")
+    title = "تم استلام طلب التسوق المحلي" if created else "تحديث حالة طلب التسوق المحلي"
+    title_en = "Local shopping request received" if created else "Local shopping request status updated"
+    body = "تم استلام طلب التسوق المحلي وسيتم مراجعته قريبًا." if created else f"{status_label}."
+    body_en = "Your local shopping request was received and will be reviewed soon." if created else f"{status_label_en}."
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=user_id,
+            title=title,
+            body=body,
+            notification_type="order_created" if created else "order_status",
+            category="order",
+            priority="high",
+            action_type="open_local_shopping",
+            action_url="/local-shopping",
+            entity_type="local_shopping_request",
+            entity_id=request_id or None,
+            payload={
+                "local_request_id": request_id,
+                "local_request_status": status_key,
+                "deep_link": "/local-shopping",
+                "title_en": title_en,
+                "body_en": body_en,
+            },
+            created_by=created_by,
+            source="local_shopping",
+            deduplication_key=f"local-request-created:{request_id}" if created else f"local-request-status:{request_id}:{status_key}",
+        )
+    )
+
+
 @router.get("/api/shopping/local/requests")
 async def api_user_local_shopping_requests(
     user: User = Depends(current_user),
@@ -3421,6 +3513,23 @@ async def api_user_local_shopping_requests(
         statement = statement.where(model.user_id == user.id)
     result = await session.execute(statement.order_by(model.created_at.desc()).limit(500))
     return {"data": await serialize_local_shopping_requests(session, list(result.scalars()))}
+
+
+@router.get("/api/shopping/local/requests/{request_id}")
+async def api_user_local_shopping_request_detail(
+    request_id: uuid.UUID,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    model = MODEL_BY_TABLE["local_shopping_requests"]
+    row = await session.get(model, request_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="local_shopping_request_not_found")
+    if not roles.intersection({"admin", "manager", "staff"}) and row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="local_shopping_request_not_found")
+    serialized = await serialize_local_shopping_requests(session, [row])
+    return {"data": serialized[0]}
 
 
 @router.post("/api/shopping/local/requests", status_code=201)
@@ -3488,6 +3597,16 @@ async def api_create_local_shopping_request(
         "amount": amount,
     }
     row = await _api_create(session, "local_shopping_requests", payload, user)
+    request_id = str(row.get("id") or "").strip()
+    if request_id:
+        await _create_local_request_notification(
+            session,
+            user_id=user.id,
+            request_id=request_id,
+            status="pending",
+            created=True,
+            created_by=user.id,
+        )
     await session.commit()
     return {"data": row}
 
@@ -5060,14 +5179,26 @@ def _public_product_review_filters(product_id: uuid.UUID):
     if "deleted_at" in columns:
         clauses.append(columns.deleted_at.is_(None))
     if "status" in columns:
-        clauses.append(columns.status.in_(("approved", "active", "published", "visible", "live")))
-    if "is_approved" in columns:
-        clauses.append(columns.is_approved.is_(True))
+        # Product reviews are published immediately after the verified
+        # purchase check. Keep only explicit moderation outcomes hidden so
+        # legacy pending rows become visible after this workflow change.
+        clauses.append(
+            ~func.lower(func.coalesce(columns.status, "")).in_(
+                REVIEW_HIDDEN_STATUSES
+            )
+        )
     return review_model, columns, clauses
 
 
 REVIEW_APPROVED_STATUSES = ("approved", "active", "published", "visible", "live", "accepted", "approve", "accept")
-REVIEW_ORDER_STATUSES = ("delivered", "completed", "received")
+REVIEW_HIDDEN_STATUSES = ("rejected", "declined", "denied", "hidden", "blocked", "inactive", "disabled", "deleted")
+REVIEW_ORDER_STATUSES = (
+    "delivered",
+    "completed",
+    "received",
+    "customer_received",
+    "fulfilled",
+)
 MAX_REVIEW_IMAGES = 5
 MAX_REVIEW_COMMENT_LENGTH = 1000
 
@@ -5091,6 +5222,26 @@ def _review_text(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value).strip()
+
+
+def _review_bool(value: Any, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+async def _review_account_name(session: AsyncSession, user: User) -> str:
+    result = await session.execute(
+        select(Profile.full_name)
+        .where(Profile.user_id == user.id, Profile.deleted_at.is_(None))
+        .limit(1)
+    )
+    profile_name = _review_text(result.scalar_one_or_none())
+    return profile_name or "عميل رفاهية التسوق"
 
 
 def _normalize_review_images(value: Any, request: Request | None = None) -> list[str]:
@@ -5183,20 +5334,31 @@ async def _eligible_review_order_id(
     user_id: uuid.UUID,
     product_id: uuid.UUID,
 ) -> uuid.UUID | None:
+    # Delivery is the review gate. Payment status stays independent because
+    # cash-on-delivery and legacy orders can remain pending after fulfillment.
+    # Read the receipt marker as a fallback for legacy orders whose status was
+    # not migrated even though the customer confirmed delivery.
     result = await session.execute(
-        select(Order.id)
+        select(Order.id, Order.status, Order.extra_data)
         .join(OrderItem, OrderItem.order_id == Order.id)
         .where(
             Order.user_id == user_id,
             OrderItem.product_id == product_id,
             Order.deleted_at.is_(None),
-            func.lower(func.coalesce(Order.payment_status, "")) == "paid",
-            func.lower(func.coalesce(Order.status, "")).in_(REVIEW_ORDER_STATUSES),
         )
         .order_by(Order.created_at.desc())
-        .limit(1)
+        .limit(50)
     )
-    return result.scalar_one_or_none()
+    for order_id, status, extra_data in result.all():
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status in REVIEW_ORDER_STATUSES:
+            return order_id
+        if isinstance(extra_data, dict) and any(
+            str(extra_data.get(key) or "").strip()
+            for key in ("customer_received_at", "customerReceivedAt")
+        ):
+            return order_id
+    return None
 
 
 async def _review_eligibility(
@@ -5257,7 +5419,7 @@ async def _review_eligibility(
         return {
             "can_review": False,
             "reason": "not_delivered",
-            "message": "سيظهر التقييم بعد دفع الطلب واستلامه.",
+            "message": "سيظهر التقييم بعد استلام الطلب.",
             "order_id": None,
             "has_review": False,
         }
@@ -5273,6 +5435,7 @@ async def _review_eligibility(
 async def _product_review_response(session: AsyncSession, row: Any) -> dict[str, Any]:
     raw = serialize_record(row)
     status = str(raw.get("status") or "").lower()
+    is_hidden = status in REVIEW_HIDDEN_STATUSES
     profile = (
         await session.execute(
             select(Profile)
@@ -5288,7 +5451,7 @@ async def _product_review_response(session: AsyncSession, row: Any) -> dict[str,
         "rating": int(getattr(row, "rating", 0) or 0),
         "comment": _review_text(getattr(row, "comment", None) or getattr(row, "body", None)) or None,
         "review_images": images,
-        "is_approved": bool(getattr(row, "is_approved", None)) or status in REVIEW_APPROVED_STATUSES,
+        "is_approved": not is_hidden,
         "is_verified_purchase": bool(getattr(row, "is_verified_purchase", False)),
         "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
@@ -5384,14 +5547,14 @@ async def api_create_product_review(
         user_id=user.id,
         product_id=product_id,
         order_id=uuid.UUID(str(eligibility["order_id"])),
-        status="pending",
+        status="approved",
         title="Product review",
         body=values["comment"],
         rating=values["rating"],
         comment=values["comment"],
         review_images=values["review_images"],
         is_verified_purchase=True,
-        is_approved=False,
+        is_approved=True,
         extra_data={},
     )
     session.add(row)
@@ -5426,8 +5589,8 @@ async def api_update_product_review(
     row.comment = values["comment"]
     row.body = values["comment"]
     row.review_images = values["review_images"]
-    row.status = "pending"
-    row.is_approved = False
+    row.status = "approved"
+    row.is_approved = True
     await session.flush()
     await session.refresh(row)
     payload = await _product_review_response(session, row)
@@ -5528,28 +5691,39 @@ async def api_create_store_review(request: Request, user: User = Depends(current
     values = _review_input_values(body, request)
     if not values["comment"]:
         raise HTTPException(status_code=422, detail="review_comment_required")
-    customer_name = _review_text(body.get("customer_name") or body.get("customerName"))
-    if len(customer_name) > 160:
-        raise HTTPException(status_code=422, detail="review_customer_name_limit_exceeded")
+
+    existing = await fetch_user_store_review(session, user.id)
+    if existing and existing.get("id"):
+        raise HTTPException(status_code=409, detail="review_already_submitted")
+
+    account_name = await _review_account_name(session, user)
+    show_name = _review_bool(
+        body.get("show_name", body.get("showName")),
+        default=True,
+    )
+    display_name = account_name if show_name else mask_store_review_name(account_name)
 
     row = await create_handover_store_review(
         session,
         user_id=user.id,
         rating=values["rating"],
         comment=values["comment"],
-        customer_name=customer_name or None,
+        customer_name=display_name,
     )
+    if row == {}:
+        raise HTTPException(status_code=409, detail="review_already_submitted")
     if row is None:
         row = await _api_create(
             session,
             "store_reviews",
             {
                 "user_id": user.id,
-                "title": customer_name or "Review",
+                "title": account_name,
                 "body": values["comment"],
                 "rating": values["rating"],
                 "comment": values["comment"],
-                "customer_name": customer_name,
+                "customer_name": account_name,
+                "show_name": show_name,
                 "status": "pending",
             },
             user,
@@ -6531,7 +6705,7 @@ async def api_price_international_order(order_id: uuid.UUID, request: Request, s
                 category="order",
                 priority="high",
                 action_type="open_order",
-                action_url=f"/my-orders?highlight={order_id}",
+                action_url=f"/international-orders/{order_id}",
                 entity_type="international_orders",
                 entity_id=str(order_id),
                 order_id=order_id,
@@ -6541,6 +6715,7 @@ async def api_price_international_order(order_id: uuid.UUID, request: Request, s
                     "order_status": row.status,
                     "finalCost": float(grand_total),
                     "currencyCode": currency_code,
+                    "deep_link": f"/international-orders/{order_id}",
                     "title_en": "Your international order pricing was updated",
                     "body_en": f"Your international order pricing was updated. New total: {format(grand_total, 'f')} {currency_code}. Please review the order.",
                 },
@@ -6740,7 +6915,23 @@ async def api_unlink_local_international_order(order_id: uuid.UUID, staff: User 
 
 @router.patch("/api/admin-shopping/local-requests/{request_id}")
 async def api_patch_local_shopping_request(request_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("local_shopping_requests", request, session, staff, request_id, "update")
+    model = MODEL_BY_TABLE["local_shopping_requests"]
+    local_request = await session.get(model, request_id)
+    if local_request is None:
+        raise HTTPException(status_code=404, detail="record_not_found")
+    previous_status = _local_request_status_key(local_request.status)
+    row = await _api_update(session, "local_shopping_requests", request_id, await request.json(), staff)
+    next_status = _local_request_status_key(local_request.status)
+    if next_status != previous_status and local_request.user_id is not None:
+        await _create_local_request_notification(
+            session,
+            user_id=local_request.user_id,
+            request_id=str(request_id),
+            status=next_status,
+            created_by=staff.id,
+        )
+    await session.commit()
+    return {"data": row}
 
 
 @router.get("/api/payments/local/{request_id}")
@@ -7638,6 +7829,12 @@ async def _api_update(session: AsyncSession, table: str, record_id: uuid.UUID, b
     if row is None:
         raise HTTPException(status_code=404, detail="record_not_found")
     values = _normalize_admin_body(table, body, actor)
+    previous = {
+        "status": getattr(row, "status", None),
+        "approval_status": getattr(row, "approval_status", None),
+        "amount": getattr(row, "amount", None),
+        "extra_data": dict(getattr(row, "extra_data", None) or {}),
+    }
     extra = dict(getattr(row, "extra_data", {}) or {})
     for key, value in values.items():
         if key in model.__table__.c and key not in {"id", "created_at"}:
@@ -7646,6 +7843,15 @@ async def _api_update(session: AsyncSession, table: str, record_id: uuid.UUID, b
             extra[key] = _jsonable(value)
     if "extra_data" in model.__table__.c:
         row.extra_data = extra
+    if table == "international_orders":
+        await _notify_customer_resource_update(
+            session,
+            table,
+            row,
+            previous,
+            values,
+            actor.id if actor is not None else None,
+        )
     await session.flush()
     return serialize_record(row)
 
@@ -10467,6 +10673,9 @@ async def loyalty_me(user: User = Depends(current_user), session: AsyncSession =
         Decimal("0"),
     )
     total_points = max(available_points, int(total_earned))
+    tiers = await loyalty_tier_catalog(session)
+    current_tier = loyalty_tier_for_points(tiers, total_points)
+    next_tier_min_points = loyalty_next_tier_min_points(tiers, total_points)
     return {
         "user_id": str(user.id),
         "points": available_points,
@@ -10478,6 +10687,12 @@ async def loyalty_me(user: User = Depends(current_user), session: AsyncSession =
         "maxRedeemPercentage": settings.max_redeem_percentage,
         "isActive": settings.is_active,
         "awardedPoints": awarded,
+        "tierName": current_tier["name"],
+        "tierNameEn": current_tier.get("name_en") or None,
+        "tierDiscountPercentage": current_tier.get("discount_percentage", 0),
+        "currentTierBenefits": current_tier.get("benefits", []),
+        "nextTierMinPoints": next_tier_min_points,
+        "tiers": tiers,
         "transactions": [serialize_record(item) for item in transactions],
     }
 

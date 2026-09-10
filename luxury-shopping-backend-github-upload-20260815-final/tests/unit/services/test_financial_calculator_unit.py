@@ -43,6 +43,28 @@ def test_money_or_zero_safely_handles_invalid_values() -> None:
 
 
 @pytest.mark.parametrize(
+    ("total_points", "expected_tier", "expected_next"),
+    [
+        (0, "برونزي", 500),
+        (499, "برونزي", 500),
+        (500, "فضي", 2000),
+        (1182, "فضي", 2000),
+        (2000, "ذهبي", 5000),
+        (5000, "بلاتيني", None),
+    ],
+)
+def test_loyalty_tier_changes_from_current_points(
+    total_points: int,
+    expected_tier: str,
+    expected_next: int | None,
+) -> None:
+    tiers = [dict(tier) for tier in fc.DEFAULT_LOYALTY_TIERS]
+
+    assert fc.loyalty_tier_for_points(tiers, total_points)["name"] == expected_tier
+    assert fc.loyalty_next_tier_min_points(tiers, total_points) == expected_next
+
+
+@pytest.mark.parametrize(
     ("total", "paid", "expected"),
     [
         ("100.00", "0", "unpaid"),
@@ -239,3 +261,26 @@ async def test_partner_product_coupon_rejects_a_cart_without_its_product() -> No
         )
 
     assert exc_info.value.detail == "coupon_not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_coupon_uses_amount_when_legacy_extra_value_is_zero() -> None:
+    coupon = SimpleNamespace(
+        id=uuid.uuid4(),
+        code="LEGACY100",
+        amount=Decimal("100.00"),
+        expires_at=None,
+        extra_data={"discount_type": "fixed", "discount_value": 0},
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=_CouponLookupResult(coupon)))
+
+    discount, coupon_id, meta = await fc._coupon_discount(
+        session,
+        code="LEGACY100",
+        subtotal=Decimal("500.00"),
+        user_id=uuid.uuid4(),
+    )
+
+    assert discount == Decimal("100.00")
+    assert coupon_id == str(coupon.id)
+    assert meta["discount_value"] == "100.00"

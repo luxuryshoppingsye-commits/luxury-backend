@@ -3,6 +3,7 @@ import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from PIL import Image
@@ -28,6 +29,31 @@ def test_image_reencoded_without_metadata():
     with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
         assert image.format == "JPEG"
         assert image.size == (16, 16)
+
+
+def test_gemini_json_parser_accepts_fenced_response():
+    payload = {
+        "candidates": [{
+            "content": {
+                "parts": [{"text": '```json\n{"typeTerms": ["bag"], "attributes": []}\n```'}],
+            },
+        }],
+    }
+    assert service._json_object_from_gemini(payload) == {
+        "typeTerms": ["bag"],
+        "attributes": [],
+    }
+
+
+def test_image_model_candidates_skip_retired_and_generator_models():
+    settings = SimpleNamespace(
+        ai_default_model="gemini-2.0-flash",
+        ai_model_allowlist="gemini-2.5-flash-image,gemini-2.5-flash",
+    )
+    assert service._gemini_image_model_candidates(settings) == [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
 
 
 @pytest.mark.asyncio
@@ -82,6 +108,36 @@ async def test_provider_receives_actual_image_bytes(monkeypatch):
     monkeypatch.setattr(service.httpx, "AsyncClient", Client)
     result = await service._describe_image(service._image_data(image_body()))
     assert result["typeTerms"] == ["bag"]
+
+
+@pytest.mark.asyncio
+async def test_provider_falls_back_to_available_model_and_fenced_json(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(
+        gemini_api_key="test-key", google_api_key="", ai_api_key="",
+        ai_default_model="gemini-2.5-flash", ai_model_allowlist="gemini-2.5-flash",
+        ai_request_timeout_seconds=10))
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, headers, json):
+            calls.append(url)
+            if len(calls) == 1:
+                response = httpx.Response(404, request=httpx.Request("POST", url))
+                raise httpx.HTTPStatusError("model unavailable", request=response.request, response=response)
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"candidates": [{"content": {"parts": [
+                    {"text": '```json\n{"typeTerms": ["bag"], "attributes": []}\n```'},
+                ]}}]},
+            )
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", Client)
+    result = await service._describe_image(service._image_data(image_body()))
+    assert result["typeTerms"] == ["bag"]
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

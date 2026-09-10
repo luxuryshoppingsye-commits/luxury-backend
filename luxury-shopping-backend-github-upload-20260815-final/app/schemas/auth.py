@@ -108,7 +108,8 @@ class FirebaseAuthRequest(BaseModel):
 class RefreshRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    refresh_token: str = Field(min_length=20)
+    refresh_token: str | None = Field(default=None, min_length=20)
+    session_token: str | None = Field(default=None, min_length=20)
 
     @model_validator(mode="before")
     @classmethod
@@ -116,7 +117,16 @@ class RefreshRequest(BaseModel):
         if isinstance(data, dict) and "refreshToken" in data and "refresh_token" not in data:
             data = dict(data)
             data["refresh_token"] = data.pop("refreshToken")
+        if isinstance(data, dict) and "sessionToken" in data and "session_token" not in data:
+            data = dict(data)
+            data["session_token"] = data.pop("sessionToken")
         return data
+
+    @model_validator(mode="after")
+    def require_a_session_credential(self) -> "RefreshRequest":
+        if not self.refresh_token and not self.session_token:
+            raise ValueError("refresh_token_or_session_token_required")
+        return self
 
 
 class PasswordChangeRequest(BaseModel):
