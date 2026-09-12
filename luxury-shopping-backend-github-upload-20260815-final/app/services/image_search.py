@@ -135,7 +135,23 @@ def _gemini_image_model_candidates(settings) -> list[str]:
     allowlist = str(getattr(settings, "ai_model_allowlist", "") or "").split(",")
     retired = {"gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001"}
     candidates: list[str] = []
-    for raw in [configured, *allowlist, "gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+    # Keep this list in step with the text assistant. Render deployments can
+    # retain an older AI_DEFAULT_MODEL while the provider has already moved
+    # to a newer vision-capable model, so the current safe models must remain
+    # fallbacks for image search as well.
+    for raw in [
+        configured,
+        *allowlist,
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+        "gemini-flash-latest",
+    ]:
         model = raw.strip()
         if (
             not model
@@ -147,7 +163,48 @@ def _gemini_image_model_candidates(settings) -> list[str]:
         ):
             continue
         candidates.append(model)
-    return candidates or ["gemini-2.5-flash"]
+    return candidates or ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+
+
+async def _discover_gemini_image_models(client, headers: dict[str, str]) -> list[str]:
+    """Discover models that actually support generateContent for this key.
+
+    Gemini model names and availability change independently of the app
+    release. If every configured name returns 404, querying the provider's
+    model catalogue lets the already deployed backend recover without a
+    client update or a hard-coded retired model.
+    """
+    try:
+        response = await client.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        return []
+
+    listed = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(listed, list):
+        return []
+    discovered: list[str] = []
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        methods = entry.get("supportedGenerationMethods")
+        if not isinstance(methods, list) or "generateContent" not in methods:
+            continue
+        model = str(entry.get("name") or "").strip()
+        if model.startswith("models/"):
+            model = model[7:]
+        if (
+            not model.startswith("gemini-")
+            or model.endswith("-image")
+            or model in discovered
+        ):
+            continue
+        discovered.append(model)
+    return discovered
 
 
 def _json_object_from_gemini(payload: dict) -> dict:
@@ -200,40 +257,57 @@ async def _gemini_image_json(encoded: str, prompt: str, *, error_code: str) -> d
     last_status: int | None = None
     last_error: Exception | None = None
     timeout = getattr(settings, "ai_request_timeout_seconds", 20)
+    configured_url = str(getattr(settings, "ai_api_url", "") or "").strip()
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for model in _gemini_image_model_candidates(settings):
-            generation_config = {
-                "responseMimeType": "application/json",
-                "maxOutputTokens": 1024,
-                "temperature": 0,
-            }
-            if model.startswith("gemini-2.5"):
-                generation_config["thinkingConfig"] = {"thinkingBudget": 0}
-            try:
-                response = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers=headers,
-                    json={
-                        "contents": [{"role": "user", "parts": [
-                            {"text": prompt},
-                            {"inlineData": {"mimeType": "image/jpeg", "data": encoded}},
-                        ]}],
-                        "generationConfig": generation_config,
-                    },
-                )
-                response.raise_for_status()
-                return _json_object_from_gemini(response.json())
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                last_status = exc.response.status_code
-                # Model availability and quota can differ by model. Try the
-                # next safe candidate before reporting a provider failure.
-                if last_status in {401, 403}:
-                    raise HTTPException(503, "image_search_provider_auth_failed") from exc
-                continue
-            except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                last_error = exc
-                continue
+        models: list[str | None] = (
+            [None] if configured_url else _gemini_image_model_candidates(settings)
+        )
+        discovery_attempted = False
+        while True:
+            for model in models:
+                generation_config = {
+                    "responseMimeType": "application/json",
+                    "maxOutputTokens": 1024,
+                    "temperature": 0,
+                }
+                if isinstance(model, str) and model.startswith("gemini-2.5"):
+                    generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+                try:
+                    response = await client.post(
+                        configured_url
+                        if configured_url
+                        else f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        headers=headers,
+                        json={
+                            "contents": [{"role": "user", "parts": [
+                                {"text": prompt},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": encoded}},
+                            ]}],
+                            "generationConfig": generation_config,
+                        },
+                    )
+                    response.raise_for_status()
+                    return _json_object_from_gemini(response.json())
+                except httpx.HTTPStatusError as exc:
+                    last_error = exc
+                    last_status = exc.response.status_code
+                    # Model availability and quota can differ by model. Try the
+                    # next safe candidate before reporting a provider failure.
+                    if last_status in {401, 403}:
+                        raise HTTPException(503, "image_search_provider_auth_failed") from exc
+                    continue
+                except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    last_error = exc
+                    continue
+
+            if configured_url or discovery_attempted or last_status != 404:
+                break
+            discovery_attempted = True
+            discovered = await _discover_gemini_image_models(client, headers)
+            additions = [model for model in discovered if model not in models]
+            if not additions:
+                break
+            models.extend(additions)
     if last_status == 429:
         raise HTTPException(503, "image_search_provider_rate_limited") from last_error
     if last_status == 404:

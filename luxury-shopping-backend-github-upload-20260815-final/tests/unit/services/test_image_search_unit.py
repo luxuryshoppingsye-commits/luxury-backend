@@ -52,8 +52,90 @@ def test_image_model_candidates_skip_retired_and_generator_models():
     )
     assert service._gemini_image_model_candidates(settings) == [
         "gemini-2.5-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
         "gemini-2.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-flash-latest",
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_keeps_only_generate_content_gemini_models():
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "models": [
+                    {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent"]},
+                    {"name": "models/gemini-2.5-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                    {"name": "models/text-embedding-005", "supportedGenerationMethods": ["embedContent"]},
+                ]
+            }
+
+    class Client:
+        async def get(self, url, headers):
+            assert url.endswith("/v1beta/models")
+            assert headers["x-goog-api-key"] == "test-key"
+            return Response()
+
+    assert await service._discover_gemini_image_models(
+        Client(), {"x-goog-api-key": "test-key"}
+    ) == ["gemini-3.6-flash"]
+
+
+@pytest.mark.asyncio
+async def test_image_analysis_discovers_a_provider_model_after_static_404s(monkeypatch):
+    settings = SimpleNamespace(
+        gemini_api_key="test-key",
+        google_api_key="",
+        ai_api_key="",
+        ai_api_url="",
+        ai_default_model="gemini-2.0-flash",
+        ai_model_allowlist="",
+        ai_request_timeout_seconds=2,
+    )
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls.append(("post", url))
+            if "gemini-discovered" not in url:
+                return httpx.Response(404, request=httpx.Request("POST", url))
+            return httpx.Response(200, request=httpx.Request("POST", url), json={
+                "candidates": [{"content": {"parts": [
+                    {"text": '{"typeTerms": ["bag"], "attributes": []}'},
+                ]}}],
+            })
+
+        async def get(self, url, *, headers):
+            calls.append(("get", url))
+            return httpx.Response(200, request=httpx.Request("GET", url), json={
+                "models": [{
+                    "name": "models/gemini-discovered",
+                    "supportedGenerationMethods": ["generateContent"],
+                }],
+            })
+
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service.httpx, "AsyncClient", lambda **_kwargs: Client())
+
+    result = await service._describe_image("encoded-image")
+
+    assert result["typeTerms"] == ["bag"]
+    assert any(kind == "get" for kind, _ in calls)
+    assert calls[-1][1].endswith("/models/gemini-discovered:generateContent")
 
 
 @pytest.mark.asyncio
