@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import HTTPException
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
 from backend.app.services import image_search as service
 
@@ -208,6 +208,30 @@ async def test_visual_search_does_not_require_product_name_match(monkeypatch):
 
     assert result["searchInfo"]["source"] == "visual_image_similarity"
     assert result["products"][0]["id"] == "match"
+
+
+def test_visual_similarity_accepts_a_reframed_product_photo():
+    source = Image.new("RGB", (240, 360), (242, 242, 242))
+    draw = ImageDraw.Draw(source)
+    draw.rounded_rectangle((60, 45, 180, 315), radius=24, fill=(218, 170, 40))
+    draw.ellipse((88, 120, 152, 184), fill=(245, 220, 120))
+    reframed = ImageOps.pad(source, (360, 360), method=Image.Resampling.LANCZOS, color="white")
+
+    def signature(image):
+        output = io.BytesIO()
+        image.save(output, "PNG")
+        return service._visual_signature(base64.b64encode(output.getvalue()).decode())
+
+    assert service._visual_similarity(signature(source), signature(reframed)) >= service._VISUAL_MATCH_THRESHOLD
+
+
+def test_product_image_refs_accept_path_objects():
+    product = SimpleNamespace(
+        image_url=None,
+        images=[{"path": "/uploads/products/catalog-item.webp"}],
+    )
+
+    assert service._product_image_refs(product) == ["/uploads/products/catalog-item.webp"]
 
 
 @pytest.mark.asyncio

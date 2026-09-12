@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
 import ipaddress
 import io
 import json
 import re
 import socket
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
@@ -24,8 +26,22 @@ from .catalog_policy import _public_upload_url, public_product_clauses
 
 
 _IMAGE_SIGNATURE_CACHE_MAX = 2048
-_IMAGE_SIGNATURE_CACHE: dict[str, tuple[tuple[bool, ...], tuple[bool, ...], tuple[float, ...]]] = {}
-_VISUAL_MATCH_THRESHOLD = 0.82
+_IMAGE_SIGNATURE_CACHE: dict[
+    str,
+    tuple[
+        tuple[tuple[bool, ...], ...],
+        tuple[tuple[bool, ...], ...],
+        tuple[tuple[float, ...], ...],
+    ],
+] = {}
+_IMAGE_SIGNATURE_FAILURE_CACHE: dict[str, float] = {}
+_IMAGE_SIGNATURE_FAILURE_TTL_SECONDS = 60.0
+_CATALOG_HTTP_CLIENT: contextvars.ContextVar[httpx.AsyncClient | None] = contextvars.ContextVar(
+    "catalog_http_client",
+    default=None,
+)
+_VISUAL_MATCH_THRESHOLD = 0.68
+_VISUAL_EXPAND_THRESHOLD = 0.78
 
 
 def _normalized_image_data(raw: bytes, *, error_code: str) -> str:
@@ -83,48 +99,58 @@ async def _assert_public_https_url(url: str) -> None:
         raise HTTPException(422, "product_image_url_invalid") from exc
 
 
-async def _image_data_from_public_url(image_url: str) -> str:
+async def _image_data_from_public_url(
+    image_url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> str:
     """Download a bounded public HTTPS image and normalize it before Gemini sees it."""
-    current_url = image_url.strip()
     settings = get_settings()
+
+    async def download(active_client: httpx.AsyncClient) -> str:
+        current_url = image_url.strip()
+        for _ in range(3):
+            await _assert_public_https_url(current_url)
+            async with active_client.stream(
+                "GET",
+                current_url,
+                headers={"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"},
+            ) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("image_redirect_missing")
+                    current_url = urljoin(current_url, location)
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                content_length = response.headers.get("content-length")
+                if not content_type.startswith("image/"):
+                    raise ValueError("product_image_content_type")
+                if content_length and int(content_length) > 6 * 1024 * 1024:
+                    raise ValueError("product_image_size")
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > 6 * 1024 * 1024:
+                        raise ValueError("product_image_size")
+                    chunks.append(chunk)
+                return _normalized_image_data(b"".join(chunks), error_code="invalid_product_image")
+        raise HTTPException(422, "product_image_redirect_limit")
+
     try:
+        if client is not None:
+            return await download(client)
         async with httpx.AsyncClient(
             timeout=min(settings.ai_request_timeout_seconds, 15),
             follow_redirects=False,
-        ) as client:
-            for _ in range(3):
-                await _assert_public_https_url(current_url)
-                async with client.stream(
-                    "GET",
-                    current_url,
-                    headers={"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"},
-                ) as response:
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise ValueError("image_redirect_missing")
-                        current_url = urljoin(current_url, location)
-                        continue
-                    response.raise_for_status()
-                    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                    content_length = response.headers.get("content-length")
-                    if not content_type.startswith("image/"):
-                        raise ValueError("product_image_content_type")
-                    if content_length and int(content_length) > 6 * 1024 * 1024:
-                        raise ValueError("product_image_size")
-                    chunks: list[bytes] = []
-                    size = 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > 6 * 1024 * 1024:
-                            raise ValueError("product_image_size")
-                        chunks.append(chunk)
-                    return _normalized_image_data(b"".join(chunks), error_code="invalid_product_image")
+        ) as owned_client:
+            return await download(owned_client)
     except HTTPException:
         raise
     except (httpx.HTTPError, OSError, ValueError) as exc:
         raise HTTPException(422, "product_image_unavailable") from exc
-    raise HTTPException(422, "product_image_redirect_limit")
 
 
 def _terms(value) -> list[str]:
@@ -369,34 +395,47 @@ def _match(value: str, terms: list[str]) -> int:
     return sum(bool(re.search(r"(?<!\w)" + re.escape(_normalize(term)) + r"(?!\w)", value)) for term in terms)
 
 
-def _visual_signature(encoded: str) -> tuple[tuple[bool, ...], tuple[bool, ...], tuple[float, ...]]:
+def _visual_signature(
+    encoded: str,
+) -> tuple[
+    tuple[tuple[bool, ...], ...],
+    tuple[tuple[bool, ...], ...],
+    tuple[tuple[float, ...], ...],
+]:
     """Build a text-independent visual fingerprint from an image."""
     try:
         raw = base64.b64decode(encoded, validate=True)
         with Image.open(io.BytesIO(raw)) as original:
             image = ImageOps.exif_transpose(original).convert("RGB")
-            fitted = ImageOps.fit(image, (32, 32), method=Image.Resampling.LANCZOS)
-            grayscale = fitted.convert("L")
-            pixels = list(grayscale.resize((16, 16), Image.Resampling.LANCZOS).get_flattened_data())
-            average = sum(pixels) / len(pixels)
-            average_hash = tuple(value >= average for value in pixels)
-
-            gradient_pixels = list(grayscale.resize((17, 16), Image.Resampling.LANCZOS).get_flattened_data())
-            difference_hash = tuple(
-                gradient_pixels[index] < gradient_pixels[index + 1]
-                for row in range(16)
-                for index in range(row * 17, row * 17 + 16)
+            views = (
+                ImageOps.fit(image, (32, 32), method=Image.Resampling.LANCZOS),
+                ImageOps.pad(image, (32, 32), method=Image.Resampling.LANCZOS, color=(245, 245, 245)),
             )
+            average_hashes = []
+            difference_hashes = []
+            color_histograms = []
+            for fitted in views:
+                grayscale = fitted.convert("L")
+                pixels = list(grayscale.resize((16, 16), Image.Resampling.LANCZOS).get_flattened_data())
+                average = sum(pixels) / len(pixels)
+                average_hashes.append(tuple(value >= average for value in pixels))
 
-            histogram = [0] * 24
-            for red, green, blue in fitted.resize((32, 32), Image.Resampling.BOX).get_flattened_data():
-                for offset, channel in ((0, red), (8, green), (16, blue)):
-                    histogram[offset + min(channel // 32, 7)] += 1
-            total = float(32 * 32)
-            color_histogram = tuple(value / total for value in histogram)
+                gradient_pixels = list(grayscale.resize((17, 16), Image.Resampling.LANCZOS).get_flattened_data())
+                difference_hashes.append(tuple(
+                    gradient_pixels[index] < gradient_pixels[index + 1]
+                    for row in range(16)
+                    for index in range(row * 17, row * 17 + 16)
+                ))
+
+                histogram = [0] * 24
+                for red, green, blue in fitted.resize((32, 32), Image.Resampling.BOX).get_flattened_data():
+                    for offset, channel in ((0, red), (8, green), (16, blue)):
+                        histogram[offset + min(channel // 32, 7)] += 1
+                total = float(32 * 32)
+                color_histograms.append(tuple(value / total for value in histogram))
     except (binascii.Error, OSError, ValueError, UnidentifiedImageError) as exc:
         raise HTTPException(400, "invalid_search_image") from exc
-    return average_hash, difference_hash, color_histogram
+    return tuple(average_hashes), tuple(difference_hashes), tuple(color_histograms)
 
 
 def _hamming_similarity(left: tuple[bool, ...], right: tuple[bool, ...]) -> float:
@@ -406,15 +445,35 @@ def _hamming_similarity(left: tuple[bool, ...], right: tuple[bool, ...]) -> floa
 
 
 def _visual_similarity(
-    query: tuple[tuple[bool, ...], tuple[bool, ...], tuple[float, ...]],
-    candidate: tuple[tuple[bool, ...], tuple[bool, ...], tuple[float, ...]],
+    query: tuple[
+        tuple[tuple[bool, ...], ...],
+        tuple[tuple[bool, ...], ...],
+        tuple[tuple[float, ...], ...],
+    ],
+    candidate: tuple[
+        tuple[tuple[bool, ...], ...],
+        tuple[tuple[bool, ...], ...],
+        tuple[tuple[float, ...], ...],
+    ],
 ) -> float:
     """Return a perceptual similarity score without reading product text."""
-    average_score = _hamming_similarity(query[0], candidate[0])
-    difference_score = _hamming_similarity(query[1], candidate[1])
-    histogram_distance = sum(abs(a - b) for a, b in zip(query[2], candidate[2]))
-    color_score = max(0.0, 1.0 - histogram_distance / 6.0)
-    return (average_score * 0.30) + (difference_score * 0.30) + (color_score * 0.40)
+    def views(signature):
+        if signature[0] and isinstance(signature[0][0], bool):
+            return [signature]
+        return list(zip(*signature))
+
+    best_score = 0.0
+    for query_view in views(query):
+        for candidate_view in views(candidate):
+            average_score = _hamming_similarity(query_view[0], candidate_view[0])
+            difference_score = _hamming_similarity(query_view[1], candidate_view[1])
+            histogram_distance = sum(abs(a - b) for a, b in zip(query_view[2], candidate_view[2]))
+            color_score = max(0.0, 1.0 - histogram_distance / 6.0)
+            best_score = max(
+                best_score,
+                (average_score * 0.30) + (difference_score * 0.30) + (color_score * 0.40),
+            )
+    return best_score
 
 
 def _product_image_refs(product: Product) -> list[str]:
@@ -425,7 +484,7 @@ def _product_image_refs(product: Product) -> list[str]:
     refs: list[str] = []
     for value in values:
         if isinstance(value, dict):
-            value = value.get("url") or value.get("image_url") or value.get("imageUrl") or value.get("src")
+            value = value.get("url") or value.get("image_url") or value.get("imageUrl") or value.get("path") or value.get("src")
         normalized = _public_upload_url(value)
         if normalized and normalized not in refs:
             refs.append(normalized)
@@ -451,7 +510,11 @@ def _local_product_image_path(value: str) -> Path | None:
     return candidate
 
 
-async def _product_image_encoded(value: str) -> str | None:
+async def _product_image_encoded(
+    value: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> str | None:
     local_path = _local_product_image_path(value)
     if local_path is not None and local_path.is_file():
         try:
@@ -462,6 +525,21 @@ async def _product_image_encoded(value: str) -> str | None:
     parsed = urlsplit(value)
     if parsed.scheme == "https":
         remote_url = value
+        settings = get_settings()
+        api_host = (urlsplit(str(getattr(settings, "api_base_url", "") or "")).hostname or "").lower()
+        r2_base_url = str(getattr(settings, "r2_public_base_url", "") or "").strip()
+        if (
+            str(getattr(settings, "storage_provider", "") or "").strip().lower() == "r2"
+            and api_host
+            and parsed.hostname
+            and parsed.hostname.lower() == api_host
+            and parsed.path.startswith("/api/catalog/image-proxy/")
+            and r2_base_url.startswith("https://")
+        ):
+            remote_url = urljoin(
+                r2_base_url.rstrip("/") + "/",
+                parsed.path.removeprefix("/api/catalog/image-proxy/").lstrip("/"),
+            )
     elif not parsed.scheme and value.startswith("/"):
         settings = get_settings()
         base_url = (
@@ -478,7 +556,9 @@ async def _product_image_encoded(value: str) -> str | None:
     else:
         return None
     try:
-        return await _image_data_from_public_url(remote_url)
+        if client is None:
+            return await _image_data_from_public_url(remote_url)
+        return await _image_data_from_public_url(remote_url, client=client)
     except HTTPException:
         return None
 
@@ -486,30 +566,59 @@ async def _product_image_encoded(value: str) -> str | None:
 async def _cached_product_image_signature(value: str):
     if value in _IMAGE_SIGNATURE_CACHE:
         return _IMAGE_SIGNATURE_CACHE[value]
-    encoded = await _product_image_encoded(value)
+    failed_at = _IMAGE_SIGNATURE_FAILURE_CACHE.get(value)
+    if failed_at is not None:
+        if time.monotonic() - failed_at < _IMAGE_SIGNATURE_FAILURE_TTL_SECONDS:
+            return None
+        _IMAGE_SIGNATURE_FAILURE_CACHE.pop(value, None)
+    client = _CATALOG_HTTP_CLIENT.get()
+    if client is None:
+        encoded = await _product_image_encoded(value)
+    else:
+        encoded = await _product_image_encoded(value, client=client)
     if not encoded:
+        if len(_IMAGE_SIGNATURE_FAILURE_CACHE) >= _IMAGE_SIGNATURE_CACHE_MAX:
+            _IMAGE_SIGNATURE_FAILURE_CACHE.pop(next(iter(_IMAGE_SIGNATURE_FAILURE_CACHE)))
+        _IMAGE_SIGNATURE_FAILURE_CACHE[value] = time.monotonic()
         return None
     try:
         signature = _visual_signature(encoded)
     except HTTPException:
+        if len(_IMAGE_SIGNATURE_FAILURE_CACHE) >= _IMAGE_SIGNATURE_CACHE_MAX:
+            _IMAGE_SIGNATURE_FAILURE_CACHE.pop(next(iter(_IMAGE_SIGNATURE_FAILURE_CACHE)))
+        _IMAGE_SIGNATURE_FAILURE_CACHE[value] = time.monotonic()
         return None
+    _IMAGE_SIGNATURE_FAILURE_CACHE.pop(value, None)
     if len(_IMAGE_SIGNATURE_CACHE) >= _IMAGE_SIGNATURE_CACHE_MAX:
         _IMAGE_SIGNATURE_CACHE.pop(next(iter(_IMAGE_SIGNATURE_CACHE)))
     _IMAGE_SIGNATURE_CACHE[value] = signature
     return signature
 
 
-async def _rank_by_visual_similarity(encoded: str, candidates: list[Product]) -> list[tuple[float, Product]]:
+async def _rank_by_visual_similarity(
+    encoded: str,
+    candidates: list[Product],
+    *,
+    max_refs: int = 1,
+) -> list[tuple[float, Product]]:
     query_signature = _visual_signature(encoded)
-    semaphore = asyncio.Semaphore(8)
+    semaphore = asyncio.Semaphore(24)
+    signature_tasks: dict[str, asyncio.Task] = {}
+
+    async def cached_signature(ref: str):
+        task = signature_tasks.get(ref)
+        if task is None:
+            task = asyncio.create_task(_cached_product_image_signature(ref))
+            signature_tasks[ref] = task
+        return await task
 
     async def score_product(product: Product) -> tuple[float, Product] | None:
-        refs = _product_image_refs(product)
+        refs = _product_image_refs(product)[:max(1, max_refs)]
         if not refs:
             return None
         async with semaphore:
             signatures = await asyncio.gather(
-                *(_cached_product_image_signature(ref) for ref in refs),
+                *(cached_signature(ref) for ref in refs),
                 return_exceptions=True,
             )
         scores = [
@@ -522,7 +631,18 @@ async def _rank_by_visual_similarity(encoded: str, candidates: list[Product]) ->
         score = max(scores)
         return (score, product) if score >= _VISUAL_MATCH_THRESHOLD else None
 
-    ranked = await asyncio.gather(*(score_product(product) for product in candidates))
+    limits = httpx.Limits(max_connections=24, max_keepalive_connections=24)
+    timeout = httpx.Timeout(8.0, connect=3.0, read=8.0, write=3.0, pool=3.0)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=False,
+    ) as client:
+        token = _CATALOG_HTTP_CLIENT.set(client)
+        try:
+            ranked = await asyncio.gather(*(score_product(product) for product in candidates))
+        finally:
+            _CATALOG_HTTP_CLIENT.reset(token)
     matches = [item for item in ranked if item is not None]
     matches.sort(key=lambda item: (-item[0], str(item[1].id)))
     return matches
@@ -555,7 +675,13 @@ async def search_catalog_image(body: dict, session) -> dict:
         select(Product).where(*public_product_clauses()).limit(500)
     )).scalars())
 
-    visual_ranked = await _rank_by_visual_similarity(encoded, candidates)
+    visual_ranked = await _rank_by_visual_similarity(encoded, candidates, max_refs=1)
+    if not visual_ranked or visual_ranked[0][0] < _VISUAL_EXPAND_THRESHOLD:
+        expanded_ranked = await _rank_by_visual_similarity(encoded, candidates, max_refs=4)
+        if expanded_ranked and (
+            not visual_ranked or expanded_ranked[0][0] > visual_ranked[0][0]
+        ):
+            visual_ranked = expanded_ranked
     products = [serialize_record(product) for _, product in visual_ranked[:24]]
     source = "visual_image_similarity" if products else "image_analysis"
 
