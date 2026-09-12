@@ -17,6 +17,12 @@ def image_body():
     return {"imageBase64": "data:image/png;base64," + base64.b64encode(data.getvalue()).decode()}
 
 
+def colored_image_body(color):
+    data = io.BytesIO()
+    Image.new("RGB", (64, 64), color).save(data, "PNG")
+    return {"imageBase64": "data:image/png;base64," + base64.b64encode(data.getvalue()).decode()}
+
+
 @pytest.mark.parametrize("body", [{}, {"imageBase64": "invalid"}, {"imageBase64": "data:image/png;base64,YWJj"}])
 def test_invalid_images_rejected(body):
     with pytest.raises(HTTPException) as exc:
@@ -171,6 +177,37 @@ async def test_analysis_ranks_only_matching_catalog_products(monkeypatch):
     result = await service.search_catalog_image(image_body(), Session())
     assert [p["id"] for p in result["products"]] == ["red", "blue"]
     assert result["searchInfo"]["source"] == "image_analysis"
+
+
+@pytest.mark.asyncio
+async def test_visual_search_does_not_require_product_name_match(monkeypatch):
+    query_body = colored_image_body((218, 170, 40))
+    query_encoded = service._image_data(query_body)
+    query_signature = service._visual_signature(query_encoded)
+    wrong_signature = service._visual_signature(service._image_data(colored_image_body((30, 80, 190))))
+
+    monkeypatch.setattr(service, "_describe_image", AsyncMock(return_value={
+        "productType": "handbag", "typeTerms": [], "attributes": []}))
+    monkeypatch.setattr(service, "_product_image_refs", lambda product: [product.image_url])
+
+    async def signature_for(ref):
+        return query_signature if ref == "match" else wrong_signature
+
+    monkeypatch.setattr(service, "_cached_product_image_signature", signature_for)
+    monkeypatch.setattr(service, "serialize_record", lambda product: {"id": product.id, "name": product.name})
+    rows = [
+        SimpleNamespace(id="wrong", name="منتج باسم مختلف", image_url="other"),
+        SimpleNamespace(id="match", name="اسم لا يذكر نوع المنتج", image_url="match"),
+    ]
+
+    class Session:
+        async def execute(self, _statement):
+            return SimpleNamespace(scalars=lambda: rows)
+
+    result = await service.search_catalog_image(query_body, Session())
+
+    assert result["searchInfo"]["source"] == "visual_image_similarity"
+    assert result["products"][0]["id"] == "match"
 
 
 @pytest.mark.asyncio
