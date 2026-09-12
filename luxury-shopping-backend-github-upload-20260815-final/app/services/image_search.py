@@ -530,40 +530,61 @@ async def _rank_by_visual_similarity(encoded: str, candidates: list[Product]) ->
 
 async def search_catalog_image(body: dict, session) -> dict:
     encoded = _image_data(body)
-    analysis = await _describe_image(encoded)
+    # Compare the uploaded image with catalog images before asking a vision
+    # model to describe it. A model may return no words for a clean product
+    # photo without visible text, but that must never prevent image matching.
+    if session is None:
+        # Keep the explicit provider error for isolated callers that cannot
+        # perform a catalog comparison, rather than turning it into an
+        # unrelated session attribute error.
+        analysis = await _describe_image(encoded)
+        types = _terms(analysis.get("typeTerms"))
+        product_type = str(analysis.get("productType") or "").strip()
+        return {
+            "success": True,
+            "products": [],
+            "matches": [],
+            "noMatches": True,
+            "searchInfo": {
+                "source": "image_analysis",
+                "productType": product_type[:120],
+                "searchTerms": types,
+            },
+        }
+    candidates = list((await session.execute(
+        select(Product).where(*public_product_clauses()).limit(500)
+    )).scalars())
+
+    visual_ranked = await _rank_by_visual_similarity(encoded, candidates)
+    products = [serialize_record(product) for _, product in visual_ranked[:24]]
+    source = "visual_image_similarity" if products else "image_analysis"
+
+    # Keep the existing vision/text analysis as a compatibility fallback only
+    # when no visual catalog match is available. It is never used to reject a
+    # product while a visual catalog match exists.
+    analysis: dict[str, Any] = {}
+    if not products:
+        try:
+            analysis = await _describe_image(encoded)
+        except HTTPException:
+            # Visual comparison is the required path. If the optional model
+            # is unavailable, return the visual no-match result instead of
+            # converting an image-only search into "temporarily unavailable".
+            analysis = {}
     types = _terms(analysis.get("typeTerms"))
     attributes = _terms(analysis.get("attributes"))
     product_type = str(analysis.get("productType") or "").strip()
-    products = []
-    source = "image_analysis"
-    if types or product_type:
-        # Load published products that actually have catalog images. The
-        # product name is deliberately not a gate: it may be a brand, SKU, or
-        # merchant-specific label that has no relation to visible text in the
-        # customer's photo.
-        candidates = list((await session.execute(
-            select(Product).where(*public_product_clauses()).limit(500)
-        )).scalars())
-
-        visual_ranked = await _rank_by_visual_similarity(encoded, candidates)
-        if visual_ranked:
-            source = "visual_image_similarity"
-            products = [serialize_record(product) for _, product in visual_ranked[:24]]
-
-        # Keep the existing text analysis as a compatibility fallback only
-        # when no visual catalog match is available. It is never used to
-        # reject a product while visual catalog images are available.
+    if not products and (types or product_type):
         ranked = []
-        if not products:
-            for product in candidates:
-                name = f"{product.name or ''} {product.name_en or ''}"
-                type_score = _match(name, types)
-                if not type_score:
-                    continue
-                details = f"{name} {product.description or ''} {' '.join(product.tags or [])}"
-                ranked.append((type_score * 10 + _match(details, attributes), product))
-            ranked.sort(key=lambda item: (-item[0], str(item[1].id)))
-            products = [serialize_record(product) for _, product in ranked[:24]]
+        for product in candidates:
+            name = f"{product.name or ''} {product.name_en or ''}"
+            type_score = _match(name, types)
+            if not type_score:
+                continue
+            details = f"{name} {product.description or ''} {' '.join(product.tags or [])}"
+            ranked.append((type_score * 10 + _match(details, attributes), product))
+        ranked.sort(key=lambda item: (-item[0], str(item[1].id)))
+        products = [serialize_record(product) for _, product in ranked[:24]]
     return {
         "success": True,
         "products": products,

@@ -187,7 +187,7 @@ async def test_visual_search_does_not_require_product_name_match(monkeypatch):
     wrong_signature = service._visual_signature(service._image_data(colored_image_body((30, 80, 190))))
 
     monkeypatch.setattr(service, "_describe_image", AsyncMock(return_value={
-        "productType": "handbag", "typeTerms": [], "attributes": []}))
+        "productType": "", "typeTerms": [], "attributes": []}))
     monkeypatch.setattr(service, "_product_image_refs", lambda product: [product.image_url])
 
     async def signature_for(ref):
