@@ -1001,6 +1001,10 @@ class NotificationService:
                     headers={"apns-priority": "10", "apns-push-type": "alert"},
                     payload=messaging.APNSPayload(
                         aps=messaging.Aps(
+                            alert=messaging.ApsAlert(
+                                title=localized["title"],
+                                body=localized["body"],
+                            ),
                             badge=1,
                             sound="default",
                             category="LUXURY_NOTIFICATION",

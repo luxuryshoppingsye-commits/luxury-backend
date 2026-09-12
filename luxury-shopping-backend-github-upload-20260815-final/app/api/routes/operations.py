@@ -4963,6 +4963,30 @@ async def api_store_reviews_mine(user: User = Depends(current_user), session: As
     return {"data": await fetch_user_store_review(session, user.id)}
 
 
+@router.get("/api/reviews/store/eligibility")
+async def api_store_reviews_eligibility(
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    existing = await fetch_user_store_review(session, user.id)
+    if existing and existing.get("id"):
+        return {
+            "data": {
+                "can_review": False,
+                "reason": "already_reviewed",
+                "has_order": True,
+            }
+        }
+    reason, has_order = await _customer_store_review_eligibility(session, user.id)
+    return {
+        "data": {
+            "can_review": reason == "eligible",
+            "reason": reason,
+            "has_order": has_order,
+        }
+    }
+
+
 @router.get("/api/reviews/store/admin")
 async def api_store_reviews_admin(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return {"data": [serialize_record(row) for row in await _rows(session, "store_reviews", limit=500)]}
@@ -5199,6 +5223,14 @@ REVIEW_ORDER_STATUSES = (
     "customer_received",
     "fulfilled",
 )
+STORE_REVIEW_EXCLUDED_ORDER_STATUSES = (
+    "cancelled",
+    "canceled",
+    "rejected",
+    "declined",
+    "refunded",
+    "deleted",
+)
 MAX_REVIEW_IMAGES = 5
 MAX_REVIEW_COMMENT_LENGTH = 1000
 
@@ -5232,6 +5264,68 @@ def _review_bool(value: Any, *, default: bool = True) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+async def _has_customer_store_order(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> bool:
+    """Return whether the customer has received/completed at least one order."""
+    reason, _ = await _customer_store_review_eligibility(session, user_id)
+    return reason == "eligible"
+
+
+def _store_review_order_is_delivered(status: Any, extra_data: Any) -> bool:
+    normalized_status = str(status or "").strip().lower().replace("-", "_")
+    if normalized_status in REVIEW_ORDER_STATUSES:
+        return True
+    if not isinstance(extra_data, dict):
+        return False
+    for key in (
+        "customer_received_at",
+        "customerReceivedAt",
+        "received_at",
+        "receivedAt",
+    ):
+        value = extra_data.get(key)
+        if value not in (None, "", False):
+            return True
+    return False
+
+
+async def _customer_store_review_eligibility(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> tuple[str, bool]:
+    """Return a precise review gate reason and whether any order exists.
+
+    A pending or processing order is not enough to review the app. It is kept
+    as ``has_order`` so the client can explain that the customer must wait for
+    delivery instead of incorrectly saying that no order exists.
+    """
+    has_order = False
+    for table in ("orders", "local_shopping_requests", "international_orders"):
+        model = MODEL_BY_TABLE.get(table)
+        if model is None or not all(
+            hasattr(model, field)
+            for field in ("id", "user_id", "status", "deleted_at", "extra_data")
+        ):
+            continue
+        result = await session.execute(
+            select(model.status, model.extra_data)
+            .where(
+                model.user_id == user_id,
+                func.lower(func.coalesce(model.status, "")).notin_(
+                    STORE_REVIEW_EXCLUDED_ORDER_STATUSES
+                ),
+                model.deleted_at.is_(None),
+            )
+        )
+        for status, extra_data in result.all():
+            has_order = True
+            if _store_review_order_is_delivered(status, extra_data):
+                return "eligible", True
+    return ("not_delivered" if has_order else "not_purchased"), has_order
 
 
 async def _review_account_name(session: AsyncSession, user: User) -> str:
@@ -5695,6 +5789,14 @@ async def api_create_store_review(request: Request, user: User = Depends(current
     existing = await fetch_user_store_review(session, user.id)
     if existing and existing.get("id"):
         raise HTTPException(status_code=409, detail="review_already_submitted")
+    review_reason, _ = await _customer_store_review_eligibility(session, user.id)
+    if review_reason != "eligible":
+        detail = (
+            "review_requires_delivery"
+            if review_reason == "not_delivered"
+            else "review_requires_order"
+        )
+        raise HTTPException(status_code=403, detail=detail)
 
     account_name = await _review_account_name(session, user)
     show_name = _review_bool(
