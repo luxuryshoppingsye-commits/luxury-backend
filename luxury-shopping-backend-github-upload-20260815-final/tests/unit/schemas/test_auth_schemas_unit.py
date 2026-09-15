@@ -9,6 +9,7 @@ from backend.app.schemas.auth import (
     PasswordChangeRequest,
     PasswordResetConfirm,
     PasswordResetRequest,
+    ProfileUpdateRequest,
     RefreshRequest,
     RegisterRequest,
 )
@@ -58,6 +59,20 @@ def test_login_request_accepts_existing_short_legacy_passwords() -> None:
 def test_login_request_rejects_invalid_payloads(payload: dict[str, str]) -> None:
     with pytest.raises(ValidationError):
         LoginRequest.model_validate(payload)
+
+
+def test_profile_update_accepts_merchant_logo_fields() -> None:
+    payload = ProfileUpdateRequest.model_validate(
+        {
+            "store_name": "متجر تجريبي",
+            "store_description": "وصف المتجر",
+            "store_logo_url": "https://images.example.com/logo.webp",
+        }
+    )
+
+    assert payload.store_name == "متجر تجريبي"
+    assert payload.store_description == "وصف المتجر"
+    assert payload.store_logo_url == "https://images.example.com/logo.webp"
 
 
 def test_register_request_accepts_aliases_and_normalizes_phone() -> None:

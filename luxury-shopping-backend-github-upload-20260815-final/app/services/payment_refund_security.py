@@ -27,6 +27,8 @@ from .financial_calculator import (
     sync_order_payment_status,
 )
 from .image_pipeline import prepare_image_upload
+from .notification_service import create_payment_status_notification
+from .partner_subscription import activate_subscription_from_payment
 
 
 FINANCE_REVIEW_ROLES = frozenset({"admin", "manager", "finance"})
@@ -122,6 +124,10 @@ def _safe_receipt_response(row: Any, order: Order | None = None) -> dict[str, An
         "source_label": _safe_text(extra.get("source_label"), max_len=160),
         "mime_type": _safe_text(extra.get("mime_type"), max_len=80),
         "size_bytes": extra.get("size_bytes"),
+        "payment_type": _safe_text(extra.get("payment_type"), max_len=80),
+        "partner_id": _safe_text(extra.get("partner_id"), max_len=80),
+        "period_days": extra.get("period_days"),
+        "subscription_status": _safe_text(extra.get("subscription_status"), max_len=80),
     }
     if order is not None:
         payload["orders"] = {
@@ -392,11 +398,13 @@ async def review_payment_receipt(
     )
     row.extra_data = extra
     order = None
+    previous_order_payment_status = None
     if row.order_id:
         order = (
             await session.execute(select(Order).where(Order.id == row.order_id).with_for_update())
         ).scalar_one_or_none()
         if order is not None and next_status == "approved":
+            previous_order_payment_status = str(order.payment_status or "pending").strip().lower()
             payments_model = MODEL_BY_TABLE["payments"]
             existing_payment = (
                 await session.execute(
@@ -420,9 +428,48 @@ async def review_payment_receipt(
             await session.flush()
             await sync_order_payment_status(session, order)
         elif order is not None and next_status == "rejected":
+            previous_order_payment_status = str(order.payment_status or "pending").strip().lower()
             paid = await approved_payment_total(session, order.id)
             if paid <= 0:
                 order.payment_status = "rejected"
+    elif extra.get("payment_type") == "merchant_subscription" and next_status == "approved":
+        partner_id_raw = str(extra.get("partner_id") or "").strip()
+        try:
+            partner_id = uuid.UUID(partner_id_raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="subscription_partner_required") from exc
+        subscription = await activate_subscription_from_payment(
+            session,
+            partner_id=partner_id,
+            payment_id=row.id,
+            amount=row.amount,
+            period_days=extra.get("period_days"),
+            actor_id=staff.id,
+        )
+        extra["subscription_status"] = subscription["status"]
+        extra["subscription_expires_at"] = subscription["expires_at"]
+        extra["subscription_activated_at"] = _now().isoformat()
+        row.extra_data = extra
+
+    if (
+        order is not None
+        and previous_order_payment_status is not None
+        and previous_order_payment_status != str(order.payment_status or "pending").strip().lower()
+    ):
+        next_payment_status = str(order.payment_status or "pending").strip().lower()
+        await create_payment_status_notification(
+            session,
+            user_id=order.user_id,
+            status=next_payment_status,
+            international=False,
+            entity_type="orders",
+            entity_id=str(order.id),
+            action_url=f"/orders/{order.id}",
+            order_id=order.id,
+            created_by=staff.id,
+            source="payment_receipt_review",
+            deduplication_key=f"order-payment-status:{order.id}:{previous_order_payment_status}:{next_payment_status}",
+        )
 
     _add_audit_log(
         session,

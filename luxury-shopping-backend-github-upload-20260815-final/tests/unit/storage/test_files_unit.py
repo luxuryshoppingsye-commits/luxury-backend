@@ -81,6 +81,29 @@ def test_public_upload_uses_generated_path_and_public_url(tmp_path: Path) -> Non
     assert (tmp_path / stored.relative_path).is_file()
 
 
+@pytest.mark.parametrize("role", ["employee", "logistics"])
+@pytest.mark.parametrize("purpose", ["product_image", "site_asset"])
+def test_catalog_staff_roles_can_upload_product_images(
+    tmp_path: Path, role: str, purpose: str
+) -> None:
+    storage = object.__new__(FileStorage)
+    storage.root = tmp_path.resolve()
+    storage.settings = SimpleNamespace(max_upload_bytes=10 * 1024 * 1024)
+    storage.scanner = LocalSignatureScanner()
+
+    stored = storage.save_bytes(
+        purpose,
+        "catalog-item.png",
+        PNG_BYTES,
+        "http://api.test",
+        roles={role},
+    )
+
+    expected_directory = "products/" if purpose == "product_image" else "site-assets/"
+    assert stored.relative_path.startswith(expected_directory)
+    assert stored.public_url == f"http://api.test/uploads/{stored.relative_path}"
+
+
 def test_product_description_attachment_accepts_public_pdf(tmp_path: Path) -> None:
     storage = object.__new__(FileStorage)
     storage.root = tmp_path.resolve()
@@ -139,6 +162,47 @@ def test_public_upload_can_write_to_r2_and_returns_r2_url(monkeypatch, tmp_path:
     assert calls[0]["Key"] == stored.relative_path
     assert not (tmp_path / stored.relative_path).exists()
     assert stored.quarantine_path == ""
+
+
+def test_customer_request_attachment_uses_durable_r2_storage_without_public_url(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeR2Client:
+        def put_object(self, **kwargs):
+            calls.append(kwargs)
+
+    fake_boto3 = SimpleNamespace(client=lambda *args, **kwargs: FakeR2Client())
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    storage = object.__new__(FileStorage)
+    storage.root = tmp_path.resolve()
+    storage.settings = SimpleNamespace(
+        max_upload_bytes=10 * 1024 * 1024,
+        storage_provider="r2",
+        r2_endpoint_url="https://account.r2.cloudflarestorage.com",
+        r2_bucket="luxury-private-assets",
+        r2_access_key_id="access-key",
+        r2_secret_access_key="secret-key",
+        r2_region="auto",
+        r2_public_base_url="https://images.luxuryshoppings.com",
+    )
+    storage.scanner = LocalSignatureScanner()
+
+    stored = storage.save_bytes(
+        "customer_request_attachment",
+        "request.png",
+        PNG_BYTES,
+        "http://api.test",
+        roles={"customer"},
+    )
+
+    assert stored.storage_provider == "cloudflare_r2"
+    assert stored.public_url is None
+    assert stored.quarantine_path == ""
+    assert calls[0]["Bucket"] == "luxury-private-assets"
+    assert calls[0]["Key"] == stored.relative_path
+    assert calls[0]["CacheControl"] == "private, max-age=0, no-store"
+    assert not (tmp_path / stored.relative_path).exists()
 
 
 def test_private_policy_is_not_publicly_servable(tmp_path: Path) -> None:

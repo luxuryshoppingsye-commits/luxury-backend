@@ -97,8 +97,14 @@ class ScanResult:
 
 IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp"})
 IMAGE_OR_PDF_MIMES = frozenset({"image/jpeg", "image/png", "image/webp", "application/pdf"})
-PUBLIC_IMAGE_ROLES = frozenset({"admin", "manager", "staff", "partner"})
+# Catalog staff and employees can create/update products in the dashboard, so
+# they must be able to upload the product images used by that same workflow.
+PUBLIC_IMAGE_ROLES = frozenset({"admin", "manager", "staff", "employee", "logistics", "partner"})
 CUSTOMER_ATTACHMENT_ROLES = frozenset({"customer", "admin", "manager", "staff"})
+# Customer request images are private, but they must survive Render restarts
+# just like public catalog images. They remain inaccessible without the
+# authenticated attachment endpoint; only their storage is durable on R2.
+DURABLE_PRIVATE_R2_POLICIES = frozenset({"customer_request_attachment"})
 
 
 class StoragePolicyRegistry:
@@ -136,7 +142,10 @@ class StoragePolicyRegistry:
             visibility="public",
             allowed_content_types=IMAGE_MIMES | frozenset({"image/gif"}),
             max_bytes=10 * 1024 * 1024,
-            upload_roles=frozenset({"admin", "manager", "staff"}),
+            # The dashboard's new-product image analysis uses this public
+            # asset path before the image is attached to a product. These
+            # catalog roles already have product creation/update access.
+            upload_roles=frozenset({"admin", "manager", "staff", "employee", "logistics"}),
             read_roles=frozenset(),
             requires_owner=False,
         ),
@@ -177,7 +186,7 @@ class StoragePolicyRegistry:
             visibility="private",
             allowed_content_types=IMAGE_OR_PDF_MIMES,
             max_bytes=10 * 1024 * 1024,
-            upload_roles=frozenset({"customer", "admin", "manager", "finance"}),
+            upload_roles=frozenset({"customer", "partner", "admin", "manager", "finance"}),
             read_roles=frozenset({"admin", "manager", "finance"}),
         ),
         "support_attachment": StoragePolicy(
@@ -350,7 +359,7 @@ class FileStorage:
     def _uses_r2_for_policy(self, policy: StoragePolicy) -> bool:
         return (
             str(getattr(self.settings, "storage_provider", "local")).strip().lower() == "r2"
-            and policy.visibility == "public"
+            and (policy.visibility == "public" or policy.key in DURABLE_PRIVATE_R2_POLICIES)
         )
 
     def _r2_client(self):
@@ -415,9 +424,13 @@ class FileStorage:
                 Body=data,
                 ContentType=content_type,
                 # Upload keys are UUID-based and immutable. Long-lived edge
-                # caching prevents every product card from re-downloading
-                # the same WebP after navigation.
-                CacheControl="public, max-age=31536000, immutable",
+                # Public catalog objects may be cached at the edge. Private
+                # request attachments must never be browser-cached.
+                CacheControl=(
+                    "private, max-age=0, no-store"
+                    if policy_key in DURABLE_PRIVATE_R2_POLICIES
+                    else "public, max-age=31536000, immutable"
+                ),
                 Metadata={"sha256": sha256, "policy": policy_key},
             )
         except HTTPException:
@@ -681,8 +694,8 @@ class FileStorage:
         scan = self.scanner.scan(data, content_type) if policy.requires_scan else ScanResult("not_required", "none")
         if scan.status != "clean" and policy.requires_scan:
             # Keep the local forensic quarantine for local/test storage only.
-            # R2-backed public images must not touch the Render filesystem,
-            # including when an upload is rejected.
+            # R2-backed images must not touch the Render filesystem, including
+            # when an upload is rejected.
             if not self._uses_r2_for_policy(policy):
                 self._ensure_root()
                 quarantine_relative = self._quarantine_target(policy)
@@ -700,8 +713,8 @@ class FileStorage:
         final_relative = self._policy_target(policy, extension)
         checksum = hashlib.sha256(data).hexdigest()
         if self._uses_r2_for_policy(policy):
-            # Public images go straight from memory to Cloudflare R2. A local
-            # quarantine/final copy would violate the production storage
+            # R2-backed files go straight from memory to Cloudflare R2. A
+            # local quarantine/final copy would violate the production storage
             # contract and make Render responsible for image persistence.
             self._upload_to_r2(
                 key=final_relative,
@@ -713,7 +726,11 @@ class FileStorage:
             public_base_url = str(self.settings.r2_public_base_url).rstrip("/")
             return StoredFile(
                 relative_path=final_relative,
-                public_url=f"{public_base_url}/{final_relative}",
+                public_url=(
+                    f"{public_base_url}/{final_relative}"
+                    if policy.visibility == "public"
+                    else None
+                ),
                 storage_provider="cloudflare_r2",
                 storage_bucket=str(self.settings.r2_bucket),
                 content_type=content_type,

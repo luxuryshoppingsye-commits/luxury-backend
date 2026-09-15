@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import cached_property, lru_cache
 import os
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     jwt_secret: str = Field(alias="JWT_SECRET", min_length=32)
     jwt_access_token_minutes: int = Field(30, alias="JWT_ACCESS_TOKEN_MINUTES", ge=5, le=1440)
     jwt_refresh_token_days: int = Field(365, alias="JWT_REFRESH_TOKEN_DAYS", ge=1, le=365)
+    auth_session_max_hours: int = Field(5, alias="AUTH_SESSION_MAX_HOURS", ge=1, le=5)
     upload_dir: Path = Field(Path("backend/data/uploads"), alias="UPLOAD_DIR")
     upload_fallback_dir: Path | None = Field(None, alias="UPLOAD_FALLBACK_DIR")
     storage_provider: str = Field("local", alias="STORAGE_PROVIDER")
@@ -118,6 +120,8 @@ class Settings(BaseSettings):
     resource_max_filters: int = Field(10, alias="RESOURCE_MAX_FILTERS", ge=1, le=100)
     customer_write_rate_limit: int = Field(120, alias="CUSTOMER_WRITE_RATE_LIMIT", ge=1)
     merchant_write_rate_limit: int = Field(120, alias="MERCHANT_WRITE_RATE_LIMIT", ge=1)
+    partner_subscription_amount_yer: Decimal = Field(Decimal("5000.00"), alias="PARTNER_SUBSCRIPTION_AMOUNT_YER", gt=0)
+    partner_subscription_period_days: int = Field(30, alias="PARTNER_SUBSCRIPTION_PERIOD_DAYS", ge=1, le=366)
     admin_write_rate_limit: int = Field(240, alias="ADMIN_WRITE_RATE_LIMIT", ge=1)
     finance_write_rate_limit: int = Field(120, alias="FINANCE_WRITE_RATE_LIMIT", ge=1)
     internal_worker_rate_limit: int = Field(600, alias="INTERNAL_WORKER_RATE_LIMIT", ge=1)

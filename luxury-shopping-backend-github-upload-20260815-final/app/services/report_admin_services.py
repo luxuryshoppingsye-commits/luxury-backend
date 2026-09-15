@@ -9,13 +9,13 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, literal_column, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -23,7 +23,7 @@ from ..models import MODEL_BY_TABLE
 from ..models.domain import FileAsset, Order, OrderItem, Product, Profile, User, UserRole
 from ..repositories.resources import serialize_record
 from ..services.catalog_policy import build_public_product_rows, public_product_clauses
-from ..services.financial_calculator import advisory_xact_lock, money
+from ..services.financial_calculator import advisory_xact_lock, local_request_total, money
 from ..services.notification_service import NotificationPayload, NotificationService
 from ..services.realtime import RealtimeEventService, realtime_hub
 
@@ -39,6 +39,9 @@ REPORT_STATUSES = frozenset({"requested", "queued", "generating", "ready", "fail
 REPORT_FORMATS = frozenset({"csv", "pdf"})
 RECOGNIZED_PAYMENT_STATUSES = frozenset(
     {"paid", "confirmed", "approved", "captured", "settled", "completed", "partially_refunded"}
+)
+PENDING_PAYMENT_STATUSES = frozenset(
+    {"pending", "unpaid", "awaiting_payment", "under_review", "reviewing", "uploaded", "pending_review"}
 )
 SUCCESSFUL_REFUND_STATUSES = frozenset(
     {"completed", "succeeded", "provider_succeeded", "manual_completed", "approved", "refunded"}
@@ -190,7 +193,7 @@ class RevenueRecognitionService:
         return list((await session.execute(statement.order_by(Order.created_at.desc()))).scalars())
 
     @staticmethod
-    async def order_rows(
+    async def _regular_order_rows(
         session: AsyncSession,
         *,
         start: Any = None,
@@ -215,16 +218,11 @@ class RevenueRecognitionService:
             if not orders:
                 return []
         order_ids = [row.id for row in orders]
-        payment_model = MODEL_BY_TABLE["order_payments"]
+        # The checkout flow records verified payments in ``payments`` while
+        # manual/admin settlement flows record them in ``order_payments``.
+        # Finance orders already reconciles both sources; accounting must use
+        # the same ledger or its recognised revenue can incorrectly be zero.
         refund_model = MODEL_BY_TABLE["refunds"]
-        payments_result = await session.execute(
-            select(payment_model)
-            .where(
-                payment_model.order_id.in_(order_ids),
-                payment_model.deleted_at.is_(None),
-                func.lower(payment_model.status).in_(tuple(RECOGNIZED_PAYMENT_STATUSES)),
-            )
-        )
         refunds_result = await session.execute(
             select(refund_model)
             .where(
@@ -237,8 +235,20 @@ class RevenueRecognitionService:
         payments_by_order: dict[uuid.UUID, Decimal] = {}
         refunds_by_order: dict[uuid.UUID, Decimal] = {}
         partner_share_by_order: dict[uuid.UUID, Decimal] = {}
-        for payment in payments_result.scalars():
-            payments_by_order[payment.order_id] = money(payments_by_order.get(payment.order_id, 0) + money(payment.amount or 0))
+        for table_name in ("order_payments", "payments"):
+            payment_model = MODEL_BY_TABLE[table_name]
+            payments_result = await session.execute(
+                select(payment_model)
+                .where(
+                    payment_model.order_id.in_(order_ids),
+                    payment_model.deleted_at.is_(None),
+                    func.lower(payment_model.status).in_(tuple(RECOGNIZED_PAYMENT_STATUSES)),
+                )
+            )
+            for payment in payments_result.scalars():
+                payments_by_order[payment.order_id] = money(
+                    payments_by_order.get(payment.order_id, 0) + money(payment.amount or 0)
+                )
         for refund in refunds_result.scalars():
             refunds_by_order[refund.order_id] = money(refunds_by_order.get(refund.order_id, 0) + money(refund.amount or 0))
         for item in item_result.scalars():
@@ -277,6 +287,233 @@ class RevenueRecognitionService:
             )
         return rows
 
+    @staticmethod
+    async def _supplemental_orders(
+        session: AsyncSession,
+        *,
+        start: Any = None,
+        end: Any = None,
+    ) -> list[tuple[str, Any]]:
+        """Load local and international orders that use separate ledgers."""
+
+        start_dt, end_dt = _date_range(start, end)
+        records: list[tuple[str, Any]] = []
+        for table in ("local_shopping_requests", "international_orders"):
+            model = MODEL_BY_TABLE[table]
+            clauses = [
+                model.deleted_at.is_(None),
+                ~func.lower(model.status).in_(tuple(EXCLUDED_ORDER_STATUSES)),
+            ]
+            if start_dt is not None:
+                clauses.append(model.created_at >= start_dt)
+            if end_dt is not None:
+                clauses.append(model.created_at <= end_dt)
+            result = await session.execute(select(model).where(*clauses).order_by(model.created_at.desc()))
+            records.extend((table, record) for record in result.scalars())
+        return records
+
+    @staticmethod
+    def _supplemental_payload_total(payload: dict[str, Any]) -> Decimal:
+        """Resolve the customer-facing amount from compatibility payload fields."""
+
+        for field in ("final_cost", "finalCost", "estimated_cost", "estimatedCost"):
+            candidate = payload.get(field)
+            try:
+                resolved = money(candidate or 0)
+            except HTTPException:
+                resolved = Decimal("0.00")
+            if resolved > 0:
+                return resolved
+        local_total = local_request_total(payload)
+        if local_total > 0:
+            return local_total
+        for field in (
+            "shipping_cost",
+            "shippingCost",
+            "service_fee",
+            "serviceFee",
+            "customs_cost",
+            "customsCost",
+            "amount",
+            "total",
+        ):
+            candidate = payload.get(field)
+            try:
+                resolved = money(candidate or 0)
+            except HTTPException:
+                resolved = Decimal("0.00")
+            if resolved > 0:
+                return resolved
+        return Decimal("0.00")
+
+    @classmethod
+    async def _supplemental_order_rows(
+        cls,
+        session: AsyncSession,
+        *,
+        start: Any = None,
+        end: Any = None,
+        partner_id: uuid.UUID | None = None,
+    ) -> list[RecognizedOrderRevenue]:
+        if partner_id is not None:
+            return []
+
+        records = await cls._supplemental_orders(session, start=start, end=end)
+        if not records:
+            return []
+
+        local_records = [record for table, record in records if table == "local_shopping_requests"]
+        international_records = [record for table, record in records if table == "international_orders"]
+        paid_by_local: dict[str, Decimal] = {}
+        if local_records:
+            payment_model = MODEL_BY_TABLE["order_payments"]
+            local_request_id = payment_model.extra_data.op("->>")(literal_column("'local_request_id'"))
+            result = await session.execute(
+                select(local_request_id, func.coalesce(func.sum(payment_model.amount), 0))
+                .where(
+                    payment_model.deleted_at.is_(None),
+                    local_request_id.in_([str(record.id) for record in local_records]),
+                    func.lower(payment_model.status).in_(tuple(RECOGNIZED_PAYMENT_STATUSES)),
+                )
+                .group_by(local_request_id)
+            )
+            paid_by_local = {
+                str(request_id): money(amount or 0)
+                for request_id, amount in result.all()
+                if request_id
+            }
+
+        paid_by_international: dict[str, Decimal] = {}
+        if international_records:
+            payment_model = MODEL_BY_TABLE["international_order_payments"]
+            result = await session.execute(
+                select(payment_model.order_id, func.coalesce(func.sum(payment_model.amount), 0))
+                .where(
+                    payment_model.deleted_at.is_(None),
+                    payment_model.order_id.in_([record.id for record in international_records]),
+                    func.lower(payment_model.status).in_(tuple(RECOGNIZED_PAYMENT_STATUSES)),
+                )
+                .group_by(payment_model.order_id)
+            )
+            paid_by_international = {
+                str(order_id): money(amount or 0)
+                for order_id, amount in result.all()
+                if order_id
+            }
+
+        rows: list[RecognizedOrderRevenue] = []
+        for table, record in records:
+            payload = serialize_record(record)
+            order_total = cls._supplemental_payload_total(payload)
+            payment_total = (
+                paid_by_local.get(str(record.id), Decimal("0.00"))
+                if table == "local_shopping_requests"
+                else paid_by_international.get(str(record.id), Decimal("0.00"))
+            )
+            payment_status = str(
+                payload.get("payment_status") or payload.get("paymentStatus") or ""
+            ).strip().lower()
+            if payment_total <= 0 and payment_status in RECOGNIZED_PAYMENT_STATUSES:
+                payment_total = order_total
+            if payment_total <= 0:
+                continue
+            if order_total <= 0:
+                # A legacy record can contain a payment without a quoted total;
+                # the ledger amount is the only safe amount available then.
+                order_total = payment_total
+            order_number = str(
+                payload.get("order_number")
+                or payload.get("orderNumber")
+                or f"{'LS' if table == 'local_shopping_requests' else 'IO'}-{str(record.id)[:8].upper()}"
+            )
+            currency_code = str(
+                payload.get("currency_code")
+                or payload.get("currencyCode")
+                or "YER"
+            )
+            rows.append(
+                RecognizedOrderRevenue(
+                    order_id=record.id,
+                    order_number=order_number,
+                    order_total=order_total,
+                    partner_share_gross=order_total,
+                    payment_total=payment_total,
+                    refund_total=Decimal("0.00"),
+                    net_revenue=money(min(order_total, payment_total)),
+                    currency_code=currency_code,
+                    status=str(getattr(record, "status", "") or ""),
+                    payment_status=payment_status or "paid",
+                )
+            )
+        return rows
+
+    @classmethod
+    async def order_rows(
+        cls,
+        session: AsyncSession,
+        *,
+        start: Any = None,
+        end: Any = None,
+        partner_id: uuid.UUID | None = None,
+    ) -> list[RecognizedOrderRevenue]:
+        regular_rows = await cls._regular_order_rows(
+            session,
+            start=start,
+            end=end,
+            partner_id=partner_id,
+        )
+        supplemental_rows = await cls._supplemental_order_rows(
+            session,
+            start=start,
+            end=end,
+            partner_id=partner_id,
+        )
+        return regular_rows + supplemental_rows
+
+    @classmethod
+    async def pending_payment_amount(
+        cls,
+        session: AsyncSession,
+        *,
+        start: Any = None,
+        end: Any = None,
+    ) -> Decimal:
+        """Return outstanding order balances plus unreviewed payment receipts."""
+
+        paid_by_order: dict[str, Decimal] = {}
+        for row in await cls.order_rows(session, start=start, end=end):
+            key = str(row.order_id)
+            paid_by_order[key] = money(paid_by_order.get(key, 0) + row.payment_total)
+
+        outstanding = Decimal("0.00")
+        for order in await cls.eligible_orders(session, start=start, end=end):
+            total = money(order.total or 0)
+            outstanding += max(total - paid_by_order.get(str(order.id), Decimal("0.00")), Decimal("0.00"))
+
+        for _, record in await cls._supplemental_orders(session, start=start, end=end):
+            payload = serialize_record(record)
+            total = cls._supplemental_payload_total(payload)
+            outstanding += max(total - paid_by_order.get(str(record.id), Decimal("0.00")), Decimal("0.00"))
+
+        start_dt, end_dt = _date_range(start, end)
+        receipt_model = MODEL_BY_TABLE["payment_receipts"]
+        receipt_clauses = [
+            receipt_model.deleted_at.is_(None),
+            # Order-linked receipts are already represented by the order's
+            # outstanding balance; only standalone receipts (for example a
+            # merchant subscription) belong in this extra total.
+            receipt_model.order_id.is_(None),
+            func.lower(receipt_model.status).in_(tuple(PENDING_PAYMENT_STATUSES)),
+        ]
+        if start_dt is not None:
+            receipt_clauses.append(receipt_model.created_at >= start_dt)
+        if end_dt is not None:
+            receipt_clauses.append(receipt_model.created_at <= end_dt)
+        receipt_total = await session.execute(
+            select(func.coalesce(func.sum(receipt_model.amount), 0)).where(*receipt_clauses)
+        )
+        return money(outstanding + money(receipt_total.scalar_one() or 0))
+
     @classmethod
     async def summary(cls, session: AsyncSession, *, start: Any = None, end: Any = None, partner_id: uuid.UUID | None = None) -> dict[str, Any]:
         rows = await cls.order_rows(session, start=start, end=end, partner_id=partner_id)
@@ -285,7 +522,7 @@ class RevenueRecognitionService:
         net = money(sum((row.net_revenue for row in rows), Decimal("0.00")))
         paid = money(sum((row.payment_total for row in rows), Decimal("0.00")))
         return {
-            "date_basis": "orders.created_at plus successful payment/refund status",
+            "date_basis": "order records created_at plus successful payment/refund status",
             "order_count": len(rows),
             "eligible_order_count": len(rows),
             "gross_revenue": format(gross, "f"),
@@ -569,12 +806,16 @@ class ReportGenerationService:
     @staticmethod
     def _render_pdf(report_type: str, rows: list[dict[str, Any]], columns: tuple[str, ...], metadata: dict[str, Any]) -> bytes:
         try:
-            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.colors import HexColor, white
             from reportlab.pdfbase import pdfmetrics
             from reportlab.pdfbase.ttfonts import TTFont
             from reportlab.pdfgen import canvas
+            from arabic_reshaper import ArabicReshaper
+            from bidi.algorithm import get_display
         except Exception as exc:
             raise HTTPException(status_code=503, detail="pdf_renderer_unavailable") from exc
+        arabic_text_reshaper = ArabicReshaper({"use_unshaped_instead_of_isolated": True})
         font_name = "Helvetica"
         font_path = Path(__file__).resolve().parents[3] / "assets" / "fonts" / "Tajawal-Regular.ttf"
         if font_path.is_file():
@@ -584,33 +825,435 @@ class ReportGenerationService:
             except Exception:
                 font_name = "Helvetica"
         buffer = io.BytesIO()
-        doc = canvas.Canvas(buffer, pagesize=A4)
-        width, height = A4
-        y = height - 50
+        page_size = landscape(A4) if report_type in {"sales", "orders", "customers", "merchant_revenue"} else A4
+        doc = canvas.Canvas(buffer, pagesize=page_size)
+        width, height = page_size
+        if report_type in {"sales", "orders"}:
+            if font_name == "Helvetica":
+                raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
+
+            def rtl(value: Any) -> str:
+                return get_display(arabic_text_reshaper.reshape(str(value)))
+
+            def amount(value: Any) -> str:
+                try:
+                    return f"{Decimal(str(value)).quantize(Decimal('0.01')):,.2f} ريال يمني"
+                except (InvalidOperation, ValueError):
+                    return "-"
+
+            def count(value: Any) -> str:
+                try:
+                    return f"{int(Decimal(str(value or 0))):,}"
+                except (InvalidOperation, ValueError):
+                    return "0"
+
+            order_status_labels = {
+                "accepted": "مقبول",
+                "cancelled": "ملغى",
+                "completed": "مكتمل",
+                "confirmed": "مؤكد",
+                "delivered": "تم التسليم",
+                "new": "جديد",
+                "out_for_delivery": "قيد التوصيل",
+                "pending": "قيد الانتظار",
+                "processing": "قيد المعالجة",
+                "ready_for_shipment": "جاهز للشحن",
+                "rejected": "مرفوض",
+                "shipped": "تم الشحن",
+                "under_review": "قيد المراجعة",
+            }
+            payment_status_labels = {
+                "cancelled": "ملغى",
+                "failed": "فشل الدفع",
+                "paid": "مدفوع",
+                "partially_paid": "مدفوع جزئيًا",
+                "pending": "قيد الانتظار",
+                "refunded": "مسترد",
+                "unpaid": "غير مدفوع",
+            }
+
+            def status_label(value: Any, labels: dict[str, str]) -> str:
+                normalized = str(value or "").strip().lower()
+                return labels.get(normalized, "غير محدد")
+
+            margin = 30
+            right = width - margin
+            content_width = width - (margin * 2)
+            doc.setTitle("تقرير رفاهية التسوق - المبيعات" if report_type == "sales" else "تقرير رفاهية التسوق - الطلبات")
+            doc.setAuthor("رفاهية التسوق")
+
+            def draw_page_background() -> None:
+                doc.setFillColor(white)
+                doc.rect(0, 0, width, height, fill=1, stroke=0)
+
+            draw_page_background()
+            doc.setFillColor(HexColor("#1b202a"))
+            doc.roundRect(margin, height - 98, content_width, 54, 10, fill=1, stroke=0)
+            doc.setFillColor(HexColor("#f5c542"))
+            doc.setFont(font_name, 18)
+            doc.drawRightString(right - 16, height - 70, rtl("تقرير رفاهية التسوق"))
+            doc.setFillColor(HexColor("#d9dee8"))
+            doc.setFont(font_name, 11)
+            doc.drawRightString(right - 16, height - 87, rtl("تقرير المبيعات" if report_type == "sales" else "تقرير الطلبات"))
+
+            summary_cards = (
+                ("إجمالي الإيرادات", amount(metadata.get("gross_revenue"))),
+                ("إجمالي المبالغ المدفوعة", amount(metadata.get("paid_amount"))),
+                ("صافي الإيرادات", amount(metadata.get("net_revenue"))),
+                ("عدد الطلبات", count(metadata.get("order_count"))),
+            )
+            card_gap = 12
+            card_width = (content_width - (card_gap * 3)) / 4
+            card_y = height - 160
+            for index, (label, value) in enumerate(summary_cards):
+                card_x = margin + index * (card_width + card_gap)
+                doc.setFillColor(HexColor("#f3f5f8"))
+                doc.setStrokeColor(HexColor("#e4e7ec"))
+                doc.roundRect(card_x, card_y, card_width, 48, 7, fill=1, stroke=1)
+                doc.setFillColor(HexColor("#667085"))
+                doc.setFont(font_name, 8)
+                doc.drawCentredString(card_x + card_width / 2, card_y + 31, rtl(label))
+                doc.setFillColor(HexColor("#11141b"))
+                doc.setFont(font_name, 9)
+                doc.drawCentredString(card_x + card_width / 2, card_y + 14, rtl(value))
+
+            doc.setFillColor(HexColor("#344054"))
+            doc.setFont(font_name, 9)
+            doc.drawRightString(
+                right,
+                height - 180,
+                rtl("أساس التقرير: تاريخ إنشاء الطلب مع احتساب الدفع والاسترداد الناجحين"),
+            )
+            doc.setStrokeColor(HexColor("#d0d5dd"))
+            doc.line(margin, height - 190, right, height - 190)
+
+            table_columns = (
+                ("net", "الصافي", "amount", 100),
+                ("refunds", "المسترد", "amount", 100),
+                ("paid", "المدفوع", "amount", 100),
+                ("gross", "الإجمالي", "amount", 100),
+                ("payment_status", "حالة الدفع", "payment_status", 104),
+                ("status", "حالة الطلب", "status", 112),
+                ("order_number", "رقم الطلب", "order_number", 138),
+                ("rank", "#", "rank", 28),
+            )
+            row_height = 26
+
+            def draw_table_header(table_y: float) -> float:
+                x = margin
+                doc.setFillColor(HexColor("#1b202a"))
+                doc.setStrokeColor(HexColor("#1b202a"))
+                doc.setFont(font_name, 8)
+                for _, label, _, column_width in table_columns:
+                    doc.rect(x, table_y - row_height, column_width, row_height, fill=1, stroke=1)
+                    doc.setFillColor(white)
+                    doc.drawCentredString(x + column_width / 2, table_y - 17, rtl(label))
+                    doc.setFillColor(HexColor("#1b202a"))
+                    x += column_width
+                return table_y - row_height
+
+            def draw_footer(page_number: int) -> None:
+                doc.setFillColor(HexColor("#667085"))
+                doc.setFont(font_name, 8)
+                doc.drawRightString(right, 20, rtl("تم إنشاء التقرير من المركز المحاسبي"))
+                doc.drawString(margin, 20, str(page_number))
+
+            y = draw_table_header(height - 204)
+            page_number = 1
+            for index, row in enumerate(rows, start=1):
+                if y < 42:
+                    draw_footer(page_number)
+                    doc.showPage()
+                    page_number += 1
+                    draw_page_background()
+                    y = draw_table_header(height - 44)
+                x = margin
+                for key, _, kind, column_width in table_columns:
+                    if index % 2 == 1:
+                        doc.setFillColor(HexColor("#f3f5f8"))
+                    else:
+                        doc.setFillColor(white)
+                    doc.rect(x, y - row_height, column_width, row_height, fill=1, stroke=0)
+                    if kind == "amount":
+                        value = rtl(amount(row.get(key)))
+                    elif kind == "payment_status":
+                        value = rtl(status_label(row.get(key), payment_status_labels))
+                    elif kind == "status":
+                        value = rtl(status_label(row.get(key), order_status_labels))
+                    elif kind == "order_number":
+                        value = str(row.get(key) or row.get("order_id") or "-")
+                    else:
+                        value = str(index)
+                    doc.setFillColor(HexColor("#11141b"))
+                    doc.setFont(font_name, 8 if kind == "order_number" else 9)
+                    doc.drawCentredString(x + column_width / 2, y - 17, value)
+                    x += column_width
+                y -= row_height
+            draw_footer(page_number)
+            doc.save()
+            return buffer.getvalue()
+        if report_type == "summary":
+            if font_name == "Helvetica":
+                raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
+
+            def rtl(value: Any) -> str:
+                return get_display(arabic_text_reshaper.reshape(str(value)))
+
+            def amount(value: Any) -> str:
+                try:
+                    return f"{Decimal(str(value)).quantize(Decimal('0.01')):,.2f} ريال يمني"
+                except (InvalidOperation, ValueError):
+                    return _safe_csv_cell(value)
+
+            def summary_value(key: str, value: Any) -> str:
+                if key in {"order_count", "eligible_order_count"}:
+                    try:
+                        return f"{int(Decimal(str(value or 0))):,}"
+                    except (InvalidOperation, ValueError):
+                        return _safe_csv_cell(value)
+                if key in {"gross_revenue", "paid_amount", "refund_amount", "net_revenue"}:
+                    return amount(value)
+                if key == "currency_code":
+                    return "ريال يمني" if str(value or "").upper() == "YER" else _safe_csv_cell(value)
+                if key == "date_basis":
+                    return "تاريخ إنشاء الطلب مع احتساب الدفع والاسترداد الناجحين"
+                if key == "partner_scope":
+                    return "كافة الشركاء" if not value else str(value)
+                return _safe_csv_cell(value) or "—"
+
+            labels = {
+                "date_basis": "أساس احتساب التاريخ",
+                "order_count": "عدد الطلبات",
+                "eligible_order_count": "عدد الطلبات المؤهلة",
+                "gross_revenue": "إجمالي الإيرادات",
+                "paid_amount": "إجمالي المبالغ المدفوعة",
+                "refund_amount": "إجمالي المبالغ المستردة",
+                "net_revenue": "صافي الإيرادات",
+                "currency_code": "العملة",
+                "partner_scope": "نطاق الشركاء",
+            }
+            margin = 44
+            right = width - margin
+            content_width = width - (margin * 2)
+            doc.setTitle("تقرير رفاهية التسوق - الملخص المالي")
+            doc.setAuthor("رفاهية التسوق")
+            doc.setFillColor(white)
+            doc.rect(0, 0, width, height, fill=1, stroke=0)
+            doc.setFillColor(HexColor("#1b202a"))
+            doc.roundRect(margin, height - 112, content_width, 56, 10, fill=1, stroke=0)
+            doc.setFillColor(HexColor("#f5c542"))
+            doc.setFont(font_name, 18)
+            doc.drawRightString(right - 16, height - 80, rtl("تقرير رفاهية التسوق"))
+            doc.setFillColor(HexColor("#d9dee8"))
+            doc.setFont(font_name, 11)
+            doc.drawRightString(right - 16, height - 98, rtl("الملخص المالي"))
+
+            y = height - 146
+            doc.setFillColor(HexColor("#f5c542"))
+            doc.setFont(font_name, 12)
+            doc.drawRightString(right, y, rtl("تفاصيل التقرير"))
+            y -= 14
+            doc.setStrokeColor(HexColor("#343b49"))
+            doc.line(margin, y, right, y)
+            y -= 22
+            doc.setFont(font_name, 10)
+            for index, (key, value) in enumerate(metadata.items()):
+                if y < 86:
+                    doc.showPage()
+                    doc.setFillColor(white)
+                    doc.rect(0, 0, width, height, fill=1, stroke=0)
+                    doc.setFont(font_name, 10)
+                    y = height - 56
+                if index % 2 == 0:
+                    doc.setFillColor(HexColor("#f3f5f8"))
+                    doc.roundRect(margin, y - 8, content_width, 28, 5, fill=1, stroke=0)
+                doc.setFillColor(HexColor("#344054"))
+                doc.drawRightString(right - 12, y, rtl(labels.get(key, key)))
+                doc.setFillColor(HexColor("#11141b"))
+                doc.drawString(margin + 12, y, rtl(summary_value(key, value)))
+                y -= 34
+            doc.setFillColor(HexColor("#667085"))
+            doc.setFont(font_name, 8)
+            doc.drawRightString(right, 42, rtl("تم إنشاء التقرير من المركز المحاسبي"))
+            doc.save()
+            return buffer.getvalue()
+        if font_name == "Helvetica":
+            raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
+
+        def rtl(value: Any) -> str:
+            return get_display(arabic_text_reshaper.reshape(str(value)))
+
+        def localized_value(key: str, value: Any) -> str:
+            if value is None or str(value).strip() == "":
+                return "—"
+            if key in {"orders", "order_count", "eligible_order_count", "quantity"}:
+                try:
+                    return f"{int(Decimal(str(value))):,}"
+                except (InvalidOperation, ValueError):
+                    return _safe_csv_cell(value)
+            if key in {
+                "gross_revenue",
+                "paid_amount",
+                "refund_amount",
+                "net_revenue",
+                "gross",
+                "paid",
+                "refunds",
+                "net",
+                "merchant_gross",
+                "total_spent",
+                "total_price",
+                "revenue",
+            }:
+                try:
+                    return f"{Decimal(str(value)).quantize(Decimal('0.01')):,.2f} ريال يمني"
+                except (InvalidOperation, ValueError):
+                    return _safe_csv_cell(value)
+            if key == "currency_code":
+                return "ريال يمني" if str(value).upper() == "YER" else _safe_csv_cell(value)
+            if key == "date_basis":
+                return "تاريخ إنشاء الطلب مع احتساب الدفع والاسترداد الناجحين"
+            if key == "partner_scope":
+                return "كافة الشركاء" if not value else _safe_csv_cell(value)
+            if key in {"status", "payment_status", "classification"}:
+                labels = {
+                    "accepted": "مقبول",
+                    "cancelled": "ملغى",
+                    "completed": "مكتمل",
+                    "confirmed": "مؤكد",
+                    "delivered": "تم التسليم",
+                    "failed": "فشل",
+                    "normal": "عادي",
+                    "paid": "مدفوع",
+                    "pending": "قيد الانتظار",
+                    "processing": "قيد المعالجة",
+                    "ready_for_shipment": "جاهز للشحن",
+                    "rejected": "مرفوض",
+                    "refunded": "مسترد",
+                    "vip": "مميز",
+                }
+                return labels.get(str(value).strip().lower(), _safe_csv_cell(value))
+            return _safe_csv_cell(value)
+
+        labels = {
+            "date_basis": "أساس احتساب التاريخ",
+            "order_count": "عدد الطلبات",
+            "eligible_order_count": "عدد الطلبات المؤهلة",
+            "gross_revenue": "إجمالي الإيرادات",
+            "paid_amount": "إجمالي المبالغ المدفوعة",
+            "refund_amount": "إجمالي المبالغ المستردة",
+            "net_revenue": "صافي الإيرادات",
+            "currency_code": "العملة",
+            "partner_scope": "نطاق الشركاء",
+            "order_id": "معرّف الطلب",
+            "order_number": "رقم الطلب",
+            "status": "حالة الطلب",
+            "payment_status": "حالة الدفع",
+            "gross": "الإجمالي",
+            "paid": "المدفوع",
+            "refunds": "المسترد",
+            "net": "الصافي",
+            "customer_id": "معرّف العميل",
+            "name": "اسم العميل",
+            "email": "البريد الإلكتروني",
+            "classification": "التصنيف",
+            "created_at": "تاريخ الإنشاء",
+            "orders": "عدد الطلبات",
+            "total_spent": "إجمالي الإنفاق",
+            "merchant_gross": "إجمالي التاجر",
+            "revenue": "الإيراد",
+            "quantity": "الكمية",
+            "total_price": "الإجمالي",
+            "metric": "المؤشر",
+            "value": "القيمة",
+        }
+        titles = {
+            "revenue": ("تقرير الإيرادات", "تحليل الإيرادات للفترة المحددة"),
+            "customers": ("تقرير العملاء", "ملخص العملاء والإنفاق للفترة المحددة"),
+            "merchant_revenue": ("تقرير إيرادات التاجر", "ملخص مستحقات التاجر للفترة المحددة"),
+        }
+        title, subtitle = titles.get(report_type, ("التقرير المالي", "تقرير مالي مختصر"))
+        margin = 36
+        right = width - margin
+        content_width = width - (margin * 2)
+        doc.setTitle(f"تقرير رفاهية التسوق - {title}")
+        doc.setAuthor("رفاهية التسوق")
+
+        def draw_background() -> None:
+            doc.setFillColor(white)
+            doc.rect(0, 0, width, height, fill=1, stroke=0)
+
+        def draw_header() -> None:
+            doc.setFillColor(HexColor("#1b202a"))
+            doc.roundRect(margin, height - 94, content_width, 54, 10, fill=1, stroke=0)
+            doc.setFillColor(HexColor("#f5c542"))
+            doc.setFont(font_name, 18)
+            doc.drawRightString(right - 16, height - 66, rtl("تقرير رفاهية التسوق"))
+            doc.setFillColor(HexColor("#d9dee8"))
+            doc.setFont(font_name, 11)
+            doc.drawRightString(right - 16, height - 83, rtl(subtitle))
+
+        draw_background()
+        draw_header()
+        y = height - 126
+        doc.setFillColor(HexColor("#f5c542"))
         doc.setFont(font_name, 14)
-        doc.drawString(40, y, f"Luxury Report: {report_type}")
+        doc.drawRightString(right, y, rtl(title))
+        y -= 16
+        doc.setStrokeColor(HexColor("#d0d5dd"))
+        doc.line(margin, y, right, y)
         y -= 24
         doc.setFont(font_name, 9)
-        for key, value in metadata.items():
-            doc.drawString(40, y, f"{key}: {_safe_csv_cell(value)}")
-            y -= 14
-            if y < 80:
+        for index, (key, value) in enumerate(metadata.items()):
+            if y < 86:
                 doc.showPage()
+                draw_background()
+                y = height - 46
                 doc.setFont(font_name, 9)
-                y = height - 50
-        y -= 10
-        header = " | ".join(columns)
-        doc.drawString(40, y, header[:140])
-        y -= 16
-        for row in rows:
-            values = " | ".join(_safe_csv_cell(row.get(column)) for column in columns)
-            for start in range(0, len(values), 140):
-                doc.drawString(40, y, values[start : start + 140])
-                y -= 13
-                if y < 50:
+            if index % 2 == 0:
+                doc.setFillColor(HexColor("#f3f5f8"))
+                doc.roundRect(margin, y - 8, content_width, 28, 5, fill=1, stroke=0)
+            doc.setFillColor(HexColor("#344054"))
+            doc.drawRightString(right - 12, y, rtl(labels.get(key, key)))
+            doc.setFillColor(HexColor("#11141b"))
+            doc.drawString(margin + 12, y, rtl(localized_value(key, value)))
+            y -= 34
+
+        if rows:
+            if y < 100:
+                doc.showPage()
+                draw_background()
+                y = height - 46
+            y -= 8
+            doc.setFillColor(HexColor("#f5c542"))
+            doc.setFont(font_name, 12)
+            doc.drawRightString(right, y, rtl("تفاصيل التقرير"))
+            y -= 20
+            for row_index, row in enumerate(rows, start=1):
+                block_height = 24 + (len(columns) * 18)
+                if y - block_height < 46:
+                    doc.setFillColor(HexColor("#667085"))
+                    doc.setFont(font_name, 8)
+                    doc.drawRightString(right, 24, rtl("تم إنشاء التقرير من المركز المحاسبي"))
                     doc.showPage()
-                    doc.setFont(font_name, 9)
-                    y = height - 50
+                    draw_background()
+                    y = height - 46
+                if row_index % 2 == 1:
+                    doc.setFillColor(HexColor("#f3f5f8"))
+                    doc.roundRect(margin, y - block_height + 8, content_width, block_height, 6, fill=1, stroke=0)
+                line_y = y - 10
+                for key in columns:
+                    doc.setFillColor(HexColor("#344054"))
+                    doc.setFont(font_name, 8)
+                    doc.drawRightString(right - 12, line_y, rtl(labels.get(key, key)))
+                    doc.setFillColor(HexColor("#11141b"))
+                    doc.setFont(font_name, 8)
+                    doc.drawString(margin + 12, line_y, rtl(localized_value(key, row.get(key))))
+                    line_y -= 18
+                y -= block_height
+        doc.setFillColor(HexColor("#667085"))
+        doc.setFont(font_name, 8)
+        doc.drawRightString(right, 24, rtl("تم إنشاء التقرير من المركز المحاسبي"))
         doc.save()
         return buffer.getvalue()
 
@@ -692,6 +1335,7 @@ class AdminCustomerAccessService:
         rows = []
         for user, profile in result.all():
             user_ids.append(user.id)
+            profile_extra = dict(profile.extra_data or {}) if profile else {}
             row = {
                 "id": str(user.id),
                 "user_id": str(user.id),
@@ -710,9 +1354,9 @@ class AdminCustomerAccessService:
                 "full_name": profile.full_name if profile else None,
                 "phone": profile.phone if profile else None,
                 "city": profile.city if profile else None,
+                "governorate": profile_extra.get("governorate"),
             }
             if full:
-                profile_extra = dict(profile.extra_data or {}) if profile else {}
                 row["roles"] = []
                 row["profile"].update(
                     {
@@ -722,6 +1366,59 @@ class AdminCustomerAccessService:
                     }
                 )
             rows.append(row)
+        if user_ids:
+            address_model = MODEL_BY_TABLE["customer_addresses"]
+            address_result = await session.execute(
+                select(address_model)
+                .where(
+                    address_model.deleted_at.is_(None),
+                    address_model.user_id.in_(user_ids),
+                )
+                .order_by(address_model.is_default.desc(), address_model.updated_at.desc())
+            )
+            addresses_by_user: dict[uuid.UUID, Any] = {}
+            for address in address_result.scalars():
+                addresses_by_user.setdefault(address.user_id, address)
+            for row in rows:
+                address = addresses_by_user.get(uuid.UUID(row["user_id"]))
+                if address is None:
+                    continue
+                address_city = str(getattr(address, "city", None) or "").strip()
+                address_governorate = str(getattr(address, "governorate", None) or "").strip()
+                row["city"] = row["city"] or address_city or address_governorate or None
+                row["governorate"] = row["governorate"] or address_governorate or None
+                row["profile"]["city"] = row["profile"]["city"] or row["city"]
+
+            # The customer-management UI derives its order cards from these
+            # fields. Keep the aggregation on the canonical orders table so
+            # it follows the same eligibility rules as admin reports.
+            order_stats_result = await session.execute(
+                select(
+                    Order.user_id,
+                    func.count(Order.id),
+                    func.coalesce(func.sum(Order.total), 0),
+                    func.max(Order.created_at),
+                )
+                .where(
+                    Order.deleted_at.is_(None),
+                    Order.user_id.in_(user_ids),
+                    ~func.lower(Order.status).in_(tuple(EXCLUDED_ORDER_STATUSES)),
+                )
+                .group_by(Order.user_id)
+            )
+            order_stats = {
+                user_id: (int(order_count or 0), money(total_spent or 0), last_order_date)
+                for user_id, order_count, total_spent, last_order_date in order_stats_result.all()
+            }
+            for row in rows:
+                order_count, total_spent, last_order_date = order_stats.get(
+                    uuid.UUID(row["user_id"]),
+                    (0, Decimal("0.00"), None),
+                )
+                row["order_count"] = order_count
+                row["total_orders"] = order_count
+                row["total_spent"] = format(total_spent, "f")
+                row["last_order_date"] = last_order_date.isoformat() if last_order_date else None
         if full and user_ids:
             role_result = await session.execute(select(UserRole.user_id, UserRole.role).where(UserRole.user_id.in_(user_ids)))
             role_map: dict[uuid.UUID, list[str]] = {}

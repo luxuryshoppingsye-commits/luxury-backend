@@ -46,6 +46,11 @@ def _product(
         "CODEX_CUSTOMER_E2E_product",
         "Summer TEST product",
         "Visible RUN_ID product",
+        "منتج اختبار",
+        "منتج تجريبي",
+        "منتج غير متوفر",
+        "المنتج غير متاح حاليا",
+        "Product unavailable",
         "9b65f599-0f01-4b24-8b0c-dcb409721885",
     ],
 )
@@ -58,6 +63,27 @@ def test_public_product_can_use_verified_english_name_when_arabic_name_is_missin
     assert _row_has_safe_public_product_text(
         {"name": "", "name_en": "Luxury leather handbag"}
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "name_en"),
+    [
+        ("منتج اختبار", "Real product"),
+        ("Real product", "Product unavailable"),
+    ],
+)
+def test_any_internal_localized_product_name_blocks_public_visibility(
+    name: str,
+    name_en: str,
+) -> None:
+    assert not _row_has_safe_public_product_text(
+        {"name": name, "name_en": name_en}
+    )
+    with pytest.raises(HTTPException) as error:
+        _ensure_product_content_for_public_visibility(
+            _product(name=name, name_en=name_en)
+        )
+    assert error.value.status_code == 422
 
 
 @pytest.mark.parametrize(

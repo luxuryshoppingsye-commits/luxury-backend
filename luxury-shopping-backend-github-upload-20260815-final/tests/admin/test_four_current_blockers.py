@@ -170,6 +170,7 @@ async def test_order_linking_round_trip_is_persistent_and_one_to_one() -> None:
             extra_data={"order_linking_candidate": True},
         )
         international_order = international_model(
+            order_number=f"QA-INTL-{suffix}",
             user_id=admin.id,
             status="pending",
             description=f"طلب دولي قابل للربط {suffix}",
@@ -330,19 +331,11 @@ async def test_theme_history_and_contact_reply_are_persisted_in_isolated_flow() 
     theme_key = f"qa-four-defects-{suffix}"
     contact_model = MODEL_BY_TABLE["contact_messages"]
     outbox_model = MODEL_BY_TABLE["email_outbox"]
+    notification_model = MODEL_BY_TABLE["notifications"]
+    notification_outbox_model = MODEL_BY_TABLE["notification_outbox"]
     theme_model = MODEL_BY_TABLE["theme_settings"]
-    async with SessionFactory() as session:
-        contact = contact_model(
-            user_id=admin.id,
-            name="عميل اختبار البريد",
-            email=f"contact-{suffix}@example.com",
-            subject="اختبار الدعم",
-            message="رسالة اختبار معزولة",
-            status="new",
-        )
-        session.add(contact)
-        await session.commit()
-        contact_id = contact.id
+    contact_id: uuid.UUID | None = None
+    contact_email = admin.email
 
     try:
         async with SessionFactory() as session:
@@ -365,6 +358,20 @@ async def test_theme_history_and_contact_reply_are_persisted_in_isolated_flow() 
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
             headers = await _login(client, admin.email, password)
+            created = await client.post(
+                "/api/communication/contact",
+                headers=headers,
+                json={
+                    "name": "عميل اختبار البريد",
+                    "email": contact_email,
+                    "subject": "اختبار الدعم",
+                    "message": "رسالة اختبار معزولة",
+                },
+            )
+            assert created.status_code == 201, created.text
+            created_contact = created.json()["data"]
+            contact_id = uuid.UUID(created_contact["id"])
+            assert created_contact["user_id"] == str(admin.id)
             reply = await client.post(
                 f"/api/admin/contact-messages/{contact_id}/reply",
                 headers=headers,
@@ -382,16 +389,55 @@ async def test_theme_history_and_contact_reply_are_persisted_in_isolated_flow() 
             queued = (
                 await session.execute(
                     select(outbox_model).where(
-                        outbox_model.email == f"contact-{suffix}@example.com",
+                        outbox_model.email == contact_email,
+                        outbox_model.extra_data["contact_message_id"].astext == str(contact_id),
                         outbox_model.status == "queued",
                     )
                 )
             ).scalar_one()
             assert queued.extra_data["contact_message_id"] == str(contact_id)
+            assert queued.user_id == admin.id
+            reply_notification = (
+                await session.execute(
+                    select(notification_model).where(
+                        notification_model.user_id == admin.id,
+                        notification_model.deduplication_key.like(f"contact-reply:{contact_id}:%"),
+                    )
+                )
+            ).scalar_one()
+            assert reply_notification.type == "support_reply"
+            assert reply_notification.title == "رد اختبار معزول"
+            notification_queue = (
+                await session.execute(
+                    select(notification_outbox_model).where(
+                        notification_outbox_model.user_id == admin.id,
+                        notification_outbox_model.extra_data["dedupe_key"].astext == reply_notification.deduplication_key,
+                    )
+                )
+            ).scalar_one()
+            assert notification_queue.event_type == "notification.support_reply"
     finally:
         async with SessionFactory() as session:
-            await session.execute(delete(contact_model).where(contact_model.id == contact_id))
-            await session.execute(delete(outbox_model).where(outbox_model.email == f"contact-{suffix}@example.com"))
+            if contact_id is not None:
+                await session.execute(delete(contact_model).where(contact_model.id == contact_id))
+                email_rows = (
+                    await session.execute(select(outbox_model).where(outbox_model.email == contact_email))
+                ).scalars().all()
+                for row in email_rows:
+                    if (row.extra_data or {}).get("contact_message_id") == str(contact_id):
+                        await session.delete(row)
+                notification_rows = (
+                    await session.execute(select(notification_model).where(notification_model.user_id == admin.id))
+                ).scalars().all()
+                for row in notification_rows:
+                    if str(row.deduplication_key or "").startswith(f"contact-reply:{contact_id}:"):
+                        await session.delete(row)
+                notification_queue_rows = (
+                    await session.execute(select(notification_outbox_model).where(notification_outbox_model.user_id == admin.id))
+                ).scalars().all()
+                for row in notification_queue_rows:
+                    if str((row.extra_data or {}).get("dedupe_key") or "").startswith(f"contact-reply:{contact_id}:"):
+                        await session.delete(row)
             await session.execute(delete(theme_model).where(theme_model.name.like(f"%{suffix}%")))
             await session.execute(delete(MODEL_BY_TABLE["audit_logs"]).where(MODEL_BY_TABLE["audit_logs"].user_id == admin.id))
             await session.commit()

@@ -234,6 +234,9 @@ class ProfileUpdateRequest(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     city: str | None = Field(default=None, max_length=160)
     avatar_url: str | None = Field(default=None, max_length=2000)
+    store_name: str | None = Field(default=None, min_length=2, max_length=240)
+    store_logo_url: str | None = Field(default=None, max_length=2000)
+    store_description: str | None = Field(default=None, max_length=5000)
     address: str | None = Field(default=None, max_length=1000)
     governorate: str | None = Field(default=None, max_length=160)
     district: str | None = Field(default=None, max_length=160)
@@ -263,6 +266,16 @@ class ProfileUpdateRequest(BaseModel):
         parsed = urlparse(value.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("invalid_avatar_url")
+        return value.strip()
+
+    @field_validator("store_logo_url")
+    @classmethod
+    def validate_store_logo_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        parsed = urlparse(value.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("invalid_store_logo_url")
         return value.strip()
 
 

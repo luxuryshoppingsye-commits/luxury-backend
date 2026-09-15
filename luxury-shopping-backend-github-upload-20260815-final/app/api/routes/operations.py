@@ -14,11 +14,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +30,7 @@ from ...models.domain import FileAsset, Order, OrderItem, Product, ProductVarian
 from ...repositories.resources import (
     ResourceRepository,
     _notify_customer_resource_update,
+    _resource_order_status_labels,
     serialize_record,
 )
 from ...security.tokens import decode_token
@@ -46,6 +47,7 @@ from ...services.auth_service import (
 from ...services.staff_permissions import require_staff_permission
 from ...services.store_review_compat import (
     create_handover_store_review,
+    fetch_admin_store_reviews,
     fetch_public_store_reviews,
     fetch_user_store_review,
     mask_store_review_name,
@@ -78,6 +80,7 @@ from ...services.financial_calculator import (
     loyalty_program_settings,
     loyalty_tier_catalog,
     loyalty_tier_for_points,
+    LOCAL_PAYMENT_SUCCESS_STATUSES,
     money,
     reconcile_loyalty_for_user,
     receipt_amount_for_order,
@@ -88,8 +91,14 @@ from ...services.financial_calculator import (
     _coupon_discount,
 )
 from ...services.outbox_service import process_email_outbox, process_whatsapp_outbox
-from ...services.notification_service import NotificationPayload, NotificationService, customer_notification_visible_clause
+from ...services.notification_service import (
+    NotificationPayload,
+    NotificationService,
+    create_payment_status_notification,
+    customer_notification_visible_clause,
+)
 from ...services.payment_refund_security import (
+    RECEIPT_PENDING_STATUSES,
     create_payment_receipt,
     create_refund_request,
     issue_signed_receipt_url,
@@ -100,11 +109,18 @@ from ...services.payment_refund_security import (
     update_refund_workflow_status,
 )
 from ...services.payment_methods import (
+    COD_PAYMENT_METHOD,
     PAYMENT_METHODS_SETTING_KEY,
     normalize_payment_method_rows,
+    normalize_payment_method_key,
     payment_account_options,
+    payment_method_has_recipient,
     payment_methods_payload,
     read_payment_method_rows,
+)
+from ...services.partner_subscription import (
+    subscription_payload,
+    update_partner_subscription,
 )
 from ...services.public_read_cache import cache_key, public_read_cache
 from ...services.product_identifier import decode_compact_uuid
@@ -120,6 +136,7 @@ from ...services.report_admin_services import (
     AdminCustomerAccessService,
     BootstrapVisibilityService,
     CampaignService,
+    COURIER_ACTIVE_STATUSES,
     CourierLocationService,
     FormSettingsPersistenceService,
     LoyaltyTierService,
@@ -134,7 +151,12 @@ from ...services.report_admin_services import (
 from ...services.r2_migration import R2MigrationService
 from ...services.secure_backup import BackupCoordinator
 from ...storage import FileStorage, StoragePolicyRegistry
-from .commerce import _delete_product_file_assets, _serialize_orders_with_financials, _validated_cart_lines
+from .commerce import (
+    _courier_assignment_payload,
+    _delete_product_file_assets,
+    _serialize_orders_with_financials,
+    _validated_cart_lines,
+)
 
 
 router = APIRouter(tags=["operations"])
@@ -168,6 +190,8 @@ PARTNER_NOTIFICATION_TYPES = frozenset(
         "product_submitted_for_review",
         "product_approved",
         "product_rejected",
+        "storefront_approved",
+        "storefront_rejected",
         "store_review_approved",
         "support_reply",
     }
@@ -176,6 +200,7 @@ PARTNER_NOTIFICATION_ENTITY_TYPES = frozenset(
     {
         "products",
         "partner_applications",
+        "partner_storefronts",
         "partner_coupons",
         "partner_order_requests",
         "partner_contracts",
@@ -515,6 +540,15 @@ def _first_text(*values: Any, default: str = "") -> str:
     return default
 
 
+def _international_order_number_value(order_id: Any, created_at: Any) -> str:
+    if isinstance(created_at, datetime):
+        created_date = created_at.astimezone(timezone.utc).strftime("%Y%m%d")
+    else:
+        created_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    normalized_id = str(order_id or uuid.uuid4()).replace("-", "").upper()
+    return f"INTL-{created_date}-{normalized_id}"
+
+
 _PARTNER_COUPON_TYPES = frozenset({"percentage", "fixed"})
 _PARTNER_COUPON_SCOPES = frozenset({"all", "products", "categories"})
 _PARTNER_COUPON_AUDIENCES = frozenset({"all", "new_customers", "loyalty_members"})
@@ -758,6 +792,33 @@ def _partner_coupon_notification_content(
     )
 
 
+def _partner_coupon_notification_revision(campaign: dict[str, Any]) -> str:
+    revision_fields = {
+        key: campaign.get(key)
+        for key in (
+            "title",
+            "code",
+            "discount_type",
+            "discount_value",
+            "minimum_order_amount",
+            "max_uses",
+            "valid_from",
+            "valid_until",
+            "scope",
+            "product_ids",
+            "category_ids",
+            "audience",
+        )
+    }
+    serialized = json.dumps(
+        revision_fields,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
 async def _notify_coupon_customers(
     session: AsyncSession,
     *,
@@ -765,7 +826,7 @@ async def _notify_coupon_customers(
     coupon: Any,
     campaign: dict[str, Any],
 ) -> int:
-    """Create an opt-in in-app/push announcement once for a new campaign."""
+    """Create an opt-in in-app/push announcement for the selected audience."""
     if not campaign.get("notify_customers"):
         return 0
     preferences = MODEL_BY_TABLE["notification_preferences"]
@@ -818,6 +879,7 @@ async def _notify_coupon_customers(
         coupon_code=str(coupon.code),
         partner_id=actor.id,
     )
+    notification_revision = _partner_coupon_notification_revision(campaign)
     payloads = [
         NotificationPayload(
             user_id=customer_id,
@@ -831,7 +893,7 @@ async def _notify_coupon_customers(
             payload=payload,
             created_by=actor.id,
             source="partner_coupon_campaign",
-            deduplication_key=f"coupon-campaign:{coupon.id}:{customer_id}",
+            deduplication_key=f"coupon-campaign:{coupon.id}:{notification_revision}:{customer_id}",
             delivery_channels=("in_app", "mobile_push"),
         )
         for customer_id in customer_ids
@@ -842,8 +904,54 @@ async def _notify_coupon_customers(
     return len(payloads)
 
 
+def _global_site_logo_url(value: Any) -> str | None:
+    """Return a browser-safe URL for legacy and current site-assets refs."""
+    raw = _first_text(value)
+    if not raw or raw.lower().startswith("file:"):
+        return None
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return raw
+    path = "/" + (parsed.path or raw.split("?", 1)[0]).replace("\\", "/").lstrip("/")
+    marker = "/site-assets/"
+    marker_index = path.lower().find(marker)
+    if marker_index < 0:
+        return raw
+    known_hosts = {
+        "api.luxuryshoppings.com",
+        "images.luxuryshoppings.com",
+        "luxuryshoppings.com",
+        "www.luxuryshoppings.com",
+        "localhost",
+        "127.0.0.1",
+    }
+    if parsed.netloc and (parsed.hostname or "").lower() not in known_hosts:
+        return raw
+    relative = "site-assets/" + path[marker_index + len(marker) :].lstrip("/")
+    parts = [part for part in relative.split("/") if part]
+    if not parts or ".." in parts:
+        return None
+    encoded = "/".join(quote(part, safe="") for part in parts)
+    settings = get_settings()
+    api_base = str(settings.api_base_url or "").rstrip("/")
+    if settings.app_env == "production" and api_base:
+        return f"{api_base}/api/catalog/image-proxy/{encoded}"
+    return f"/api/catalog/image-proxy/{encoded}"
+
+
+def _normalize_global_site_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if "logo_url" in payload:
+        normalized = _global_site_logo_url(payload.get("logo_url"))
+        if normalized:
+            payload["logo_url"] = normalized
+    return payload
+
+
 async def _public_resource_rows(session: AsyncSession, table: str, *, limit: int = 500) -> list[dict[str, Any]]:
     rows = [serialize_record(row) for row in await _rows(session, table, limit=limit)]
+    if table == "global_sites":
+        rows = [_normalize_global_site_payload(row) for row in rows]
     return _sort_public_listing_rows([row for row in rows if _is_public_listing_row(row)])
 
 
@@ -1165,17 +1273,92 @@ def _site_content_payload(row: Any) -> dict[str, Any]:
     return payload
 
 
+async def _site_content_compat_rows(session: AsyncSession) -> list[dict[str, Any]]:
+    """Return the content-page contract from every supported storage seam.
+
+    The web content editor historically used ``site_content`` while the live
+    storefront stores the hero in ``theme_settings`` and the logo/contact
+    values in ``site_settings``.  Keep the editor contract stable and read
+    the live values when the compatibility table has no corresponding row.
+    """
+    payloads = [_site_content_payload(row) for row in await _public_rows(session, "site_content")]
+    by_key = {
+        str(payload.get("key") or payload.get("name") or ""): payload
+        for payload in payloads
+        if str(payload.get("key") or payload.get("name") or "")
+    }
+
+    theme_model = MODEL_BY_TABLE["theme_settings"]
+    hero_rows = await _public_rows(
+        session,
+        "theme_settings",
+        clauses=(theme_model.name == "hero",),
+        limit=1,
+    )
+    legacy_hero = by_key.get("hero_banner") or {}
+    if hero_rows:
+        theme_record = serialize_record(hero_rows[0])
+        theme_value = theme_record.get("value")
+        if not isinstance(theme_value, dict):
+            theme_value = {}
+        legacy_metadata = legacy_hero.get("metadata") if isinstance(legacy_hero.get("metadata"), dict) else {}
+        metadata = {
+            **legacy_metadata,
+            "buttonText": theme_value.get("buttonText") or legacy_metadata.get("buttonText") or "",
+            "buttonLink": theme_value.get("buttonLink") or legacy_metadata.get("buttonLink") or "/products",
+        }
+        by_key["hero_banner"] = {
+            **legacy_hero,
+            **theme_record,
+            "key": "hero_banner",
+            "title": theme_value.get("title") or legacy_hero.get("title") or "",
+            "content": theme_value.get("subtitle") or theme_value.get("content") or legacy_hero.get("content") or "",
+            "image_url": theme_value.get("imageUrl") or theme_value.get("image_url") or legacy_hero.get("image_url") or legacy_hero.get("imageUrl") or "",
+            "metadata": metadata,
+        }
+
+    settings_model = MODEL_BY_TABLE["site_settings"]
+    setting_rows = await _public_rows(
+        session,
+        "site_settings",
+        clauses=(settings_model.name.in_(("header_logo", "contact_phone", "contact_email", "contact_whatsapp")),),
+        limit=20,
+    )
+    setting_values: dict[str, dict[str, Any]] = {}
+    for row in setting_rows:
+        record = serialize_record(row)
+        setting_key = str(record.get("name") or record.get("setting_key") or "")
+        value = record.get("setting_value") or record.get("value")
+        if isinstance(value, dict):
+            setting_values[setting_key] = value
+
+    logo_value = setting_values.get("header_logo") or {}
+    logo_url = str(logo_value.get("url") or logo_value.get("value") or "").strip()
+    if logo_url:
+        by_key["logo"] = {"key": "logo", "image_url": logo_url, "metadata": {}}
+
+    contact = dict((by_key.get("contact_info") or {}).get("metadata") or {})
+    for setting_key, field in (("contact_phone", "phone"), ("contact_email", "email"), ("contact_whatsapp", "whatsapp")):
+        value = setting_values.get(setting_key) or {}
+        candidate = value.get("number") or value.get("email") or value.get("value") or ""
+        if candidate:
+            contact[field] = candidate
+    if contact:
+        by_key["contact_info"] = {"key": "contact_info", "metadata": contact}
+
+    return list(by_key.values())
+
+
 @router.get("/api/content/site")
 @router.get("/content/site")
 async def public_site_content(session: AsyncSession = Depends(get_session)):
-    return await public_read_cache.get_or_set(
-        cache_key("content-site"),
-        lambda: _public_site_content_uncached(session),
-    )
+    # Content edits are user-visible immediately; do not let a process-local
+    # snapshot hide a newly uploaded logo or hero banner.
+    return await _public_site_content_uncached(session)
 
 
 async def _public_site_content_uncached(session: AsyncSession) -> dict[str, Any]:
-    return {"data": [_site_content_payload(row) for row in await _public_rows(session, "site_content")]}
+    return {"data": await _site_content_compat_rows(session)}
 
 
 @router.get("/content/menus")
@@ -1230,18 +1413,58 @@ async def _public_setting_uncached(setting_key: str, session: AsyncSession) -> d
         clauses.append(columns.name == setting_key)
     if "setting_key" in columns:
         clauses.append(columns.setting_key == setting_key)
+    if "extra_data" in columns:
+        # Older deployments kept the key inside the JSON compatibility
+        # column.  Include it as a fallback, but prefer the canonical name
+        # below so a legacy duplicate cannot hide the saved value.
+        clauses.append(columns.extra_data["setting_key"].astext == setting_key)
     if not clauses:
         return {"data": None}
-    result = await session.execute(select(model).where(or_(*clauses)).limit(1))
-    row = result.scalar_one_or_none()
+    order_by = []
+    if "name" in columns:
+        order_by.append((columns.name == setting_key).desc())
+    if "updated_at" in columns:
+        order_by.append(columns.updated_at.desc())
+    result = await session.execute(
+        select(model)
+        .where(or_(*clauses))
+        .order_by(*order_by)
+        .limit(1)
+    )
+    row = result.scalars().first()
     if row is None:
         return {"data": None}
     record = serialize_record(row)
     return {"data": {"setting_key": setting_key, "setting_value": record.get("setting_value") or record.get("value") or record.get("extra_data") or record}}
 
 
+async def _public_sections_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    session: AsyncSession = Depends(get_session),
+) -> User | None:
+    try:
+        return await optional_user(request=request, credentials=credentials, session=session)
+    except HTTPException:
+        return None
+
+
 @router.get("/content/sections")
-async def public_page_sections(page: str = "home", session: AsyncSession = Depends(get_session)):
+async def public_page_sections(
+    page: str = "home",
+    admin: bool = False,
+    user: User | None = Depends(_public_sections_user),
+    session: AsyncSession = Depends(get_session),
+):
+    if admin:
+        if user is None:
+            raise HTTPException(status_code=401, detail="authentication_required")
+        roles = set(await roles_for(session, user.id))
+        if not roles.intersection({"admin", "manager", "staff", "employee"}):
+            raise HTTPException(status_code=403, detail="insufficient_permissions")
+        if page == "home":
+            await _ensure_home_page_sections(session)
+        return await _public_page_sections_uncached(page, session)
     return await public_read_cache.get_or_set(
         cache_key("content-sections", page=page),
         lambda: _public_page_sections_uncached(page, session),
@@ -1266,7 +1489,17 @@ async def _public_page_sections_uncached(page: str, session: AsyncSession) -> di
     if "sort_order" in columns:
         statement = statement.order_by(columns.sort_order)
     result = await session.execute(statement.limit(500))
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    records = [serialize_record(row) for row in result.scalars()]
+    for record in records:
+        visible = record.get("is_visible")
+        if visible is None:
+            visible = record.get("is_active", True)
+        record["is_visible"] = _blog_bool(visible, default=True)
+        try:
+            record["sort_order"] = int(record.get("sort_order") or 0)
+        except (TypeError, ValueError):
+            record["sort_order"] = 0
+    return {"data": records}
 
 
 @router.get("/content/pages/{slug}")
@@ -1281,6 +1514,8 @@ async def _public_static_page_uncached(slug: str, session: AsyncSession) -> dict
     model = MODEL_BY_TABLE["static_pages"]
     columns = model.__table__.c
     clauses = [columns.slug == slug]
+    if "deleted_at" in columns:
+        clauses.append(columns.deleted_at.is_(None))
     if "is_active" in columns:
         clauses.append(columns.is_active.is_(True))
     if "status" in columns:
@@ -1345,16 +1580,69 @@ async def supplier_order_counts(session: AsyncSession = Depends(get_session)):
     return {"data": {str(partner_id): int(count) for partner_id, count in result.all() if partner_id}}
 
 
+def _partner_storefront_payload(row: Any | None, profile: Profile | None = None) -> dict[str, Any]:
+    payload = serialize_record(row) if row is not None else {}
+    storefront_name = _first_text(
+        payload.get("store_name"),
+        payload.get("storeName"),
+        payload.get("name"),
+        payload.get("business_name"),
+    )
+    profile_name = _first_text(getattr(profile, "store_name", None))
+    owner_name = _first_text(getattr(profile, "full_name", None))
+    if profile_name and (
+        not storefront_name
+        or storefront_name in {"متجر", "متجر التاجر"}
+        or storefront_name == owner_name
+    ):
+        store_name = profile_name
+    else:
+        store_name = storefront_name or profile_name or "متجر"
+    logo_url = _first_text(
+        payload.get("logo_url"),
+        payload.get("store_logo_url"),
+        payload.get("logoUrl"),
+        payload.get("storeLogoUrl"),
+        getattr(profile, "store_logo_url", None),
+    )
+    description = _first_text(
+        payload.get("description"),
+        payload.get("store_description"),
+        payload.get("storeDescription"),
+        getattr(profile, "store_description", None),
+    )
+    payload.update(
+        {
+            "name": store_name,
+            "store_name": store_name,
+            "storeName": store_name,
+            "logo_url": logo_url,
+            "store_logo_url": logo_url,
+            "logoUrl": logo_url,
+            "storeLogoUrl": logo_url,
+            "description": description,
+            "store_description": description,
+            "storeDescription": description,
+        }
+    )
+    return payload
+
+
 @router.get("/partner/storefront")
 async def get_partner_storefront(user: User = Depends(require_partner), session: AsyncSession = Depends(get_session)):
     model = MODEL_BY_TABLE["partner_storefronts"]
     result = await session.execute(select(model).where(or_(model.user_id == user.id, model.partner_id == user.id)).limit(1))
     row = result.scalar_one_or_none()
+    profile = (
+        await session.execute(
+            select(Profile).where(Profile.user_id == user.id, Profile.deleted_at.is_(None)).limit(1)
+        )
+    ).scalar_one_or_none()
     # Keep the read response aligned with the write response and the web API
     # client.  Previously PUT returned {data: ...}, while GET returned the
     # record directly.  That made a successful save look lost after reload in
     # clients that correctly read response.data.
-    return {"data": serialize_record(row) if row else {}}
+    return {"data": _partner_storefront_payload(row, profile)}
 
 
 @router.put("/partner/storefront")
@@ -1363,19 +1651,57 @@ async def save_partner_storefront(request: Request, user: User = Depends(require
     model = MODEL_BY_TABLE["partner_storefronts"]
     result = await session.execute(select(model).where(or_(model.user_id == user.id, model.partner_id == user.id)).with_for_update())
     row = result.scalar_one_or_none()
+    profile = (
+        await session.execute(
+            select(Profile).where(Profile.user_id == user.id, Profile.deleted_at.is_(None)).with_for_update().limit(1)
+        )
+    ).scalar_one_or_none()
     if row is None:
         row = model(
             user_id=user.id,
             partner_id=user.id,
-            name=str(body.get("storeName") or body.get("name") or "متجر"),
+            name=_first_text(body.get("storeName"), body.get("store_name"), body.get("name"), default="متجر"),
             status="pending",
             is_active=False,
         )
         session.add(row)
-    mapping = {"storeName": "name", "name": "name", "email": "email", "phone": "phone", "description": "description", "storeDescription": "description", "logoUrl": "logo_url", "storeLogoUrl": "logo_url"}
+    mapping = {
+        "storeName": "name",
+        "store_name": "name",
+        "name": "name",
+        "email": "email",
+        "phone": "phone",
+        "description": "description",
+        "storeDescription": "description",
+        "store_description": "description",
+        "logoUrl": "logo_url",
+        "logo_url": "logo_url",
+        "storeLogoUrl": "logo_url",
+        "store_logo_url": "logo_url",
+    }
     for source, target in mapping.items():
         if source in body:
             setattr(row, target, body[source])
+    if profile is not None:
+        if "storeName" in body or "store_name" in body or "name" in body:
+            profile.store_name = _first_text(
+                body.get("storeName"), body.get("store_name"), body.get("name"), default=""
+            ) or None
+        if "logoUrl" in body or "logo_url" in body or "storeLogoUrl" in body or "store_logo_url" in body:
+            profile.store_logo_url = _first_text(
+                body.get("logoUrl"),
+                body.get("logo_url"),
+                body.get("storeLogoUrl"),
+                body.get("store_logo_url"),
+                default="",
+            ) or None
+        if "description" in body or "storeDescription" in body or "store_description" in body:
+            profile.store_description = _first_text(
+                body.get("description"),
+                body.get("storeDescription"),
+                body.get("store_description"),
+                default="",
+            ) or None
     if "storeCategories" in body or "store_categories" in body:
         raw_categories = body.get("storeCategories", body.get("store_categories"))
         if not isinstance(raw_categories, list):
@@ -1399,7 +1725,11 @@ async def save_partner_storefront(request: Request, user: User = Depends(require
             **(row.extra_data or {}),
             "store_categories": categories,
         }
-    for source, target, maximum in (("storeCity", "store_city", 120), ("storeAddress", "store_address", 500)):
+    for source, target, maximum in (
+        ("storeCity", "store_city", 120),
+        ("storeAddress", "store_address", 500),
+        ("storeGovernorate", "store_governorate", 160),
+    ):
         if source in body:
             value = str(body[source] or "").strip()
             if len(value) > maximum:
@@ -1411,7 +1741,7 @@ async def save_partner_storefront(request: Request, user: User = Depends(require
     await session.flush()
     await session.commit()
     await session.refresh(row)
-    return {"data": serialize_record(row)}
+    return {"data": _partner_storefront_payload(row, profile)}
 
 
 @router.get("/admin/partner-storefronts")
@@ -1665,8 +1995,19 @@ async def accept_partner_agreement(
         session.add(row)
     row.status = "active"
     row.is_active = True
+    existing_extra_data = row.extra_data if isinstance(row.extra_data, dict) else {}
+    subscription_data = {}
+    if not str(existing_extra_data.get("subscription_status") or "").strip():
+        subscription_data = {
+            "subscription_status": "pending_payment",
+            "subscription_plan": "monthly",
+            "subscription_amount": str(get_settings().partner_subscription_amount_yer),
+            "subscription_currency": "YER",
+            "subscription_period_days": get_settings().partner_subscription_period_days,
+        }
     row.extra_data = {
-        **(row.extra_data or {}),
+        **existing_extra_data,
+        **subscription_data,
         "version": str(body.get("version") or "1.0"),
         "accepted": True,
         "accepted_at": now,
@@ -1677,6 +2018,280 @@ async def accept_partner_agreement(
     payload = serialize_record(row)
     payload.update(row.extra_data or {})
     payload["accepted"] = True
+    return {"data": payload}
+
+
+async def _latest_partner_contract(
+    session: AsyncSession,
+    partner_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+):
+    model = MODEL_BY_TABLE["partner_contracts"]
+    statement = (
+        select(model)
+        .where(model.partner_id == partner_id, model.deleted_at.is_(None))
+        .order_by(model.updated_at.desc())
+        .limit(1)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return (await session.execute(statement)).scalar_one_or_none()
+
+
+@router.get("/partner/subscription")
+@router.get("/api/partner/subscription")
+async def get_partner_subscription(
+    user: User = Depends(require_partner),
+    session: AsyncSession = Depends(get_session),
+):
+    contract = await _latest_partner_contract(session, user.id)
+    receipt_model = MODEL_BY_TABLE["payment_receipts"]
+    pending_receipt = (
+        await session.execute(
+            select(receipt_model)
+            .where(
+                receipt_model.user_id == user.id,
+                receipt_model.deleted_at.is_(None),
+                receipt_model.status.in_(tuple(RECEIPT_PENDING_STATUSES)),
+                receipt_model.extra_data["payment_type"].astext == "merchant_subscription",
+            )
+            .order_by(receipt_model.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return {
+        "data": {
+            **subscription_payload(
+                contract,
+                pending_payment_id=str(pending_receipt.id) if pending_receipt is not None else None,
+            ),
+            "payment_methods": payment_methods_payload(await read_payment_method_rows(session)),
+        }
+    }
+
+
+@router.post("/partner/subscription/payment", status_code=201)
+@router.post("/api/partner/subscription/payment", status_code=201)
+async def submit_partner_subscription_payment(
+    request: Request,
+    user: User = Depends(require_partner),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    contract = await _latest_partner_contract(session, user.id, for_update=True)
+    current_subscription = subscription_payload(contract)
+    form = await request.form()
+    candidate = form.get("file") or form.get("receipt") or form.get("proof")
+    if not isinstance(candidate, UploadFile) and not (hasattr(candidate, "filename") and hasattr(candidate, "read")):
+        raise HTTPException(status_code=422, detail="payment_proof_file_required")
+    method_key = normalize_payment_method_key(form.get("paymentMethod") or form.get("payment_method"))
+    if not method_key or method_key == COD_PAYMENT_METHOD:
+        raise HTTPException(status_code=422, detail="subscription_payment_method_required")
+    configured_method = next(
+        (
+            row
+            for row in await read_payment_method_rows(session)
+            if row.get("provider_key") == method_key and row.get("is_active") is True
+        ),
+        None,
+    )
+    if configured_method is None:
+        raise HTTPException(status_code=409, detail="payment_method_disabled")
+    if not payment_method_has_recipient(configured_method):
+        raise HTTPException(status_code=409, detail="payment_method_recipient_unconfigured")
+
+    receipt_model = MODEL_BY_TABLE["payment_receipts"]
+    existing_pending = (
+        await session.execute(
+            select(receipt_model.id)
+            .where(
+                receipt_model.user_id == user.id,
+                receipt_model.deleted_at.is_(None),
+                receipt_model.status.in_(tuple(RECEIPT_PENDING_STATUSES)),
+                receipt_model.extra_data["payment_type"].astext == "merchant_subscription",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing_pending is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "subscription_payment_already_pending",
+                "payment_id": str(existing_pending),
+            },
+        )
+
+    expected_amount = current_subscription["amount"]
+    period_days = current_subscription["period_days"]
+    upload = await _secure_upload_from_request(
+        request,
+        user=user,
+        roles=roles,
+        session=session,
+        forced_policy="payment_receipt",
+        commit=False,
+    )
+    asset = await session.get(FileAsset, _uuid(upload["id"], "file_id"), with_for_update=True)
+    if asset is None:
+        raise HTTPException(status_code=422, detail="payment_proof_file_required")
+    row = receipt_model(
+        order_id=None,
+        user_id=user.id,
+        status="pending_review",
+        image_url=None,
+        amount=Decimal(str(expected_amount)),
+        extra_data={
+            "payment_type": "merchant_subscription",
+            "partner_id": str(user.id),
+            "payment_method": method_key,
+            "transaction_reference": str(
+                form.get("transactionReference") or form.get("transaction_reference") or ""
+            ).strip()[:160] or None,
+            "period_days": period_days,
+            "subscription_status": current_subscription["status"],
+            "file_asset_id": str(asset.id),
+            "mime_type": asset.content_type,
+            "size_bytes": asset.size_bytes,
+            "checksum_sha256": asset.checksum_sha256,
+            "receipt_payload_policy": "metadata_only_no_embedded_payload_no_external_url",
+        },
+    )
+    session.add(row)
+    await session.flush()
+    asset.entity_type = "merchant_subscription"
+    asset.entity_id = row.id
+    row.image_url = f"receipt:{row.id}"
+    _add_audit_log(
+        session,
+        user.id,
+        "partner.subscription_payment.uploaded",
+        f"Uploaded merchant subscription payment proof {row.id}",
+    )
+    await session.commit()
+    return {
+        "data": {
+            "id": str(row.id),
+            "payment_id": str(row.id),
+            "status": row.status,
+            "amount": expected_amount,
+            "payment_method": method_key,
+            "subscription": subscription_payload(contract, pending_payment_id=str(row.id)),
+        }
+    }
+
+
+@router.get("/api/admin/partner-subscriptions")
+async def admin_partner_subscriptions(
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    require_finance_actor(roles)
+    storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+    contract_model = MODEL_BY_TABLE["partner_contracts"]
+    receipt_model = MODEL_BY_TABLE["payment_receipts"]
+    storefronts = list(
+        (
+            await session.execute(
+                select(storefront_model)
+                .where(storefront_model.deleted_at.is_(None))
+                .order_by(storefront_model.name.asc())
+                .limit(1000)
+            )
+        ).scalars()
+    )
+    partner_ids = {
+        getattr(storefront, "partner_id", None) or getattr(storefront, "user_id", None)
+        for storefront in storefronts
+        if getattr(storefront, "partner_id", None) or getattr(storefront, "user_id", None)
+    }
+    contracts = {}
+    if partner_ids:
+        contract_rows = (
+            await session.execute(
+                select(contract_model)
+                .where(contract_model.partner_id.in_(partner_ids), contract_model.deleted_at.is_(None))
+                .order_by(contract_model.updated_at.desc())
+            )
+        ).scalars()
+        for contract in contract_rows:
+            contracts.setdefault(contract.partner_id, contract)
+    pending_by_partner = {}
+    if partner_ids:
+        receipt_rows = (
+            await session.execute(
+                select(receipt_model)
+                .where(
+                    receipt_model.user_id.in_(partner_ids),
+                    receipt_model.deleted_at.is_(None),
+                    receipt_model.status.in_(tuple(RECEIPT_PENDING_STATUSES)),
+                    receipt_model.extra_data["payment_type"].astext == "merchant_subscription",
+                )
+                .order_by(receipt_model.created_at.desc())
+            )
+        ).scalars()
+        for receipt in receipt_rows:
+            partner_id = str((receipt.extra_data or {}).get("partner_id") or receipt.user_id)
+            pending_by_partner.setdefault(partner_id, receipt)
+    data = []
+    for storefront in storefronts:
+        partner_id = getattr(storefront, "partner_id", None) or getattr(storefront, "user_id", None)
+        contract = contracts.get(partner_id)
+        pending_receipt = pending_by_partner.get(str(partner_id))
+        data.append(
+            {
+                "partner_id": str(partner_id),
+                "partnerId": str(partner_id),
+                "store_name": getattr(storefront, "name", None) or "متجر التاجر",
+                "storeName": getattr(storefront, "name", None) or "متجر التاجر",
+                "storefront_status": getattr(storefront, "status", None),
+                "subscription": subscription_payload(
+                    contract,
+                    pending_payment_id=str(pending_receipt.id) if pending_receipt is not None else None,
+                ),
+                "pending_payment_id": str(pending_receipt.id) if pending_receipt is not None else None,
+            }
+        )
+    return {"data": data}
+
+
+@router.patch("/api/admin/partner-subscriptions/{partner_id}")
+async def update_admin_partner_subscription(
+    partner_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    require_finance_actor(roles)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="subscription_payload_required")
+    status_value = str(body.get("status") or "").strip().lower()
+    if not status_value:
+        raise HTTPException(status_code=422, detail="subscription_status_required")
+    try:
+        payload = await update_partner_subscription(
+            session,
+            partner_id=partner_id,
+            status=status_value,
+            actor_id=staff.id,
+            expires_at=body.get("expiresAt") or body.get("expires_at"),
+            period_days=body.get("periodDays") or body.get("period_days"),
+            amount=body.get("amount"),
+            reason=body.get("reason"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _add_audit_log(
+        session,
+        staff.id,
+        "admin.partner_subscription.update",
+        f"Updated merchant subscription {partner_id} to {status_value}",
+    )
+    await session.commit()
     return {"data": payload}
 
 
@@ -1694,6 +2309,24 @@ def _partner_option_table(option: str) -> str:
     return table
 
 
+def _partner_option_permission(option: str, action: str) -> str:
+    scope = "brands" if option.strip().lower() == "brands" else "product_options"
+    return f"{scope}.{action}"
+
+
+def _partner_option_owner_id(row: Any) -> str:
+    payload = dict(row) if isinstance(row, dict) else serialize_record(row)
+    extra_data = payload.get("extra_data")
+    extra_data = extra_data if isinstance(extra_data, dict) else {}
+    owner_id = (
+        payload.get("partner_id")
+        or payload.get("partnerId")
+        or extra_data.get("partner_id")
+        or extra_data.get("partnerId")
+    )
+    return str(owner_id or "")
+
+
 def _partner_option_clause(model: Any, partner_id: uuid.UUID):
     return model.extra_data["partner_id"].astext == str(partner_id)
 
@@ -1706,19 +2339,7 @@ def _partner_option_response(row: Any, partner_id: uuid.UUID) -> dict[str, Any]:
     that could expose edit or delete actions for a default value.
     """
     payload = dict(row) if isinstance(row, dict) else serialize_record(row)
-    extra_data = (
-        getattr(row, "extra_data", None)
-        if not isinstance(row, dict)
-        else payload.get("extra_data")
-    )
-    extra_data = extra_data if isinstance(extra_data, dict) else {}
-    owner_id = (
-        payload.get("partner_id")
-        or payload.get("partnerId")
-        or extra_data.get("partner_id")
-        or extra_data.get("partnerId")
-    )
-    can_manage = str(owner_id or "") == str(partner_id)
+    can_manage = _partner_option_owner_id(payload) == str(partner_id)
     payload["can_manage"] = can_manage
     payload["is_default"] = not can_manage
     return payload
@@ -1727,6 +2348,7 @@ def _partner_option_response(row: Any, partner_id: uuid.UUID) -> dict[str, Any]:
 @router.get("/partner/product-options/{option}")
 async def list_partner_product_options(
     option: str,
+    include_inactive: bool = False,
     user: User = Depends(require_partner),
     session: AsyncSession = Depends(get_session),
 ):
@@ -1736,10 +2358,9 @@ async def list_partner_product_options(
     # also see options it owns, but never options created by another merchant.
     visible_rows = []
     for row in rows:
-        if getattr(row, "is_active", True) is False:
+        if not include_inactive and getattr(row, "is_active", True) is False:
             continue
-        extra_data = getattr(row, "extra_data", None) or {}
-        owner_id = extra_data.get("partner_id") if isinstance(extra_data, dict) else None
+        owner_id = _partner_option_owner_id(row)
         if owner_id in (None, "", str(user.id)):
             visible_rows.append(row)
     return {"data": [_partner_option_response(row, user.id) for row in visible_rows]}
@@ -1750,9 +2371,16 @@ async def create_partner_product_option(
     option: str,
     request: Request,
     user: User = Depends(require_partner),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
     table = _partner_option_table(option)
+    await require_staff_permission(
+        session,
+        user.id,
+        roles,
+        _partner_option_permission(option, "create"),
+    )
     body = await request.json()
     name = _first_text(body.get("name"), body.get("label"))
     if not name:
@@ -1781,12 +2409,19 @@ async def update_partner_product_option(
     record_id: uuid.UUID,
     request: Request,
     user: User = Depends(require_partner),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
     table = _partner_option_table(option)
+    await require_staff_permission(
+        session,
+        user.id,
+        roles,
+        _partner_option_permission(option, "update"),
+    )
     model = MODEL_BY_TABLE[table]
     row = await session.get(model, record_id, with_for_update=True)
-    if row is None or (row.extra_data or {}).get("partner_id") != str(user.id):
+    if row is None or _partner_option_owner_id(row) != str(user.id):
         raise HTTPException(status_code=404, detail="partner_option_not_found")
     body = await request.json()
     row.name = _first_text(body.get("name"), body.get("label"), row.name)
@@ -1803,12 +2438,19 @@ async def delete_partner_product_option(
     option: str,
     record_id: uuid.UUID,
     user: User = Depends(require_partner),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
     table = _partner_option_table(option)
+    await require_staff_permission(
+        session,
+        user.id,
+        roles,
+        _partner_option_permission(option, "delete"),
+    )
     model = MODEL_BY_TABLE[table]
     row = await session.get(model, record_id, with_for_update=True)
-    if row is None or (row.extra_data or {}).get("partner_id") != str(user.id):
+    if row is None or _partner_option_owner_id(row) != str(user.id):
         raise HTTPException(status_code=404, detail="partner_option_not_found")
     await session.delete(row)
     await session.commit()
@@ -1988,6 +2630,7 @@ async def update_partner_coupon(
         "customer_coupon_id": str(customer_coupon_id) if customer_coupon_id else None,
     }
     customer_model = MODEL_BY_TABLE["coupons"]
+    customer_coupon = None
     if customer_coupon_id is not None:
         customer_coupon = await session.get(customer_model, customer_coupon_id, with_for_update=True)
         if customer_coupon is not None:
@@ -2021,16 +2664,30 @@ async def update_partner_coupon(
         session.add(customer_coupon)
         await session.flush()
         row.extra_data = {**campaign, "customer_coupon_id": str(customer_coupon.id)}
+    notified_customers = (
+        await _notify_coupon_customers(
+            session,
+            actor=user,
+            coupon=customer_coupon,
+            campaign=campaign,
+        )
+        if customer_coupon is not None
+        else 0
+    )
     await session.commit()
-    return {"data": serialize_record(row)}
+    payload = serialize_record(row)
+    payload["notified_customers"] = notified_customers
+    return {"data": payload}
 
 
 @router.delete("/partner/coupons/{record_id}")
 async def delete_partner_coupon(
     record_id: uuid.UUID,
     user: User = Depends(require_partner),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
+    await require_staff_permission(session, user.id, roles, "coupons.delete")
     model = MODEL_BY_TABLE["partner_coupons"]
     row = await session.get(model, record_id, with_for_update=True)
     if row is None or row.partner_id != user.id:
@@ -2127,6 +2784,38 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
                 **store_details,
                 **({"business_type": business_type} if business_type else {}),
                 **({"store_categories": list(dict.fromkeys(store_categories))} if store_categories else {}),
+            }
+        contract_model = MODEL_BY_TABLE["partner_contracts"]
+        contract_result = await session.execute(
+            select(contract_model)
+            .where(contract_model.partner_id == application.user_id, contract_model.deleted_at.is_(None))
+            .order_by(contract_model.updated_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        contract = contract_result.scalar_one_or_none()
+        if contract is None:
+            contract = contract_model(
+                partner_id=application.user_id,
+                status="active",
+                is_active=True,
+                extra_data={
+                    "subscription_status": "pending_payment",
+                    "subscription_plan": "monthly",
+                    "subscription_amount": str(get_settings().partner_subscription_amount_yer),
+                    "subscription_currency": "YER",
+                    "subscription_period_days": get_settings().partner_subscription_period_days,
+                },
+            )
+            session.add(contract)
+        elif not str((contract.extra_data or {}).get("subscription_status") or "").strip():
+            contract.extra_data = {
+                **(contract.extra_data or {}),
+                "subscription_status": "pending_payment",
+                "subscription_plan": "monthly",
+                "subscription_amount": str(get_settings().partner_subscription_amount_yer),
+                "subscription_currency": "YER",
+                "subscription_period_days": get_settings().partner_subscription_period_days,
             }
     elif status == "rejected" and application.user_id:
         rejected_user = await session.get(User, application.user_id, with_for_update=True)
@@ -2239,6 +2928,84 @@ async def admin_account_deletion_requests(
     return {"data": data}
 
 
+async def _hide_user_store_data(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    now: datetime,
+) -> dict[str, int]:
+    """Soft-disable a deleted user's stores and hide their catalog products."""
+    storefront_count = 0
+    local_merchant_ids: set[uuid.UUID] = set()
+    product_owner_ids: set[uuid.UUID] = {user_id}
+
+    for table_name in ("partner_storefronts", "local_merchants"):
+        model = MODEL_BY_TABLE.get(table_name)
+        if model is None:
+            continue
+        owner_clauses = []
+        user_column = getattr(model, "user_id", None)
+        partner_column = getattr(model, "partner_id", None)
+        if user_column is not None:
+            owner_clauses.append(user_column == user_id)
+        if partner_column is not None:
+            owner_clauses.append(partner_column == user_id)
+        if not owner_clauses:
+            continue
+
+        rows = (
+            await session.execute(
+                select(model)
+                .where(or_(*owner_clauses), model.deleted_at.is_(None))
+                .with_for_update()
+            )
+        ).scalars().all()
+        for row in rows:
+            row.is_active = False
+            row.status = "deleted"
+            row.deleted_at = now
+            if table_name == "local_merchants":
+                local_merchant_ids.add(row.id)
+            for owner_id in (
+                getattr(row, "user_id", None),
+                getattr(row, "partner_id", None),
+            ):
+                if owner_id:
+                    product_owner_ids.add(owner_id)
+            if "extra_data" in row.__table__.c:
+                metadata = dict(getattr(row, "extra_data", None) or {})
+                metadata.update(
+                    {
+                        "account_deletion": True,
+                        "account_deletion_at": now.isoformat(),
+                    }
+                )
+                row.extra_data = metadata
+            storefront_count += 1
+
+    product_clauses = [Product.partner_id.in_(product_owner_ids)]
+    if local_merchant_ids:
+        product_clauses.append(Product.supplier_id.in_(local_merchant_ids))
+    products = (
+        await session.execute(
+            select(Product)
+            .where(
+                Product.deleted_at.is_(None),
+                or_(*product_clauses),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    for product in products:
+        product.is_active = False
+        product.approval_status = "deleted"
+        product.approval_notes = "تم إخفاء المنتج بعد حذف حساب مالكه."
+
+    return {
+        "storefronts": storefront_count,
+        "products": len(products),
+    }
+
+
 @router.patch("/api/admin/account-deletion-requests/{request_id}")
 async def review_account_deletion_request(
     request_id: uuid.UUID,
@@ -2272,11 +3039,13 @@ async def review_account_deletion_request(
         deletion_request.extra_data = metadata
 
     account_state = await account_security_for(session, target_user.id, for_update=True)
+    hidden_store_data = {"storefronts": 0, "products": 0}
     if next_status == "approved":
         target_user.is_active = False
         target_user.deleted_at = now
         account_state.account_status = "deleted"
         account_state.disabled_at = now
+        hidden_store_data = await _hide_user_store_data(session, target_user.id, now)
         await bump_security_version(session, target_user, reason="account_deletion_approved")
         await revoke_all_refresh_tokens(session, target_user.id, now=now)
     else:
@@ -2286,8 +3055,55 @@ async def review_account_deletion_request(
         account_state.disabled_at = None
         await bump_security_version(session, target_user, reason="account_deletion_rejected")
 
+    rejection_reason = str(body.get("reason") or "").strip()
+    notification_title = (
+        "تمت الموافقة على حذف حسابك"
+        if next_status == "approved"
+        else "تم رفض طلب حذف حسابك"
+    )
+    notification_body = (
+        "تم حذف حسابك وإيقاف متجرك وإخفاء منتجاته. تم الاحتفاظ بسجلات الطلبات والفواتير اللازمة."
+        if next_status == "approved"
+        else "تم رفض طلب حذف الحساب. حسابك ما زال فعالًا ويمكنك تسجيل الدخول بشكل طبيعي."
+    )
+    if next_status == "rejected" and rejection_reason:
+        notification_body = f"{notification_body} سبب الرفض: {rejection_reason}"
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=target_user.id,
+            title=notification_title,
+            body=notification_body,
+            notification_type=f"account_deletion_{next_status}",
+            category="account_security",
+            priority="high",
+            action_url="/account" if next_status == "rejected" else "/",
+            entity_type="account_deletion_requests",
+            entity_id=str(deletion_request.id),
+            payload={
+                "status": next_status,
+                "title_en": (
+                    "Your account deletion request was approved"
+                    if next_status == "approved"
+                    else "Your account deletion request was rejected"
+                ),
+                "body_en": (
+                    "Your account and store were disabled. Order and invoice records were retained."
+                    if next_status == "approved"
+                    else "Your account remains active and you can sign in normally."
+                ),
+            },
+            created_by=admin.id,
+            source="account_deletion_review",
+            deduplication_key=f"account-deletion-review:{deletion_request.id}:{next_status}",
+        )
+    )
+
     await session.commit()
-    return {"data": serialize_record(deletion_request), "status": next_status}
+    return {
+        "data": serialize_record(deletion_request),
+        "status": next_status,
+        "hidden_store_data": hidden_store_data,
+    }
 
 
 SECTION_TABLES = {
@@ -3021,8 +3837,22 @@ async def api_dashboard_financial_reconciliation(staff: User = Depends(require_s
 
 
 @router.get("/api/dashboard/inventory-alerts")
-async def api_dashboard_inventory_alerts(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": {"inventory": await _canonical_inventory_payloads(session), "movements": [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=200)]}}
+async def api_dashboard_inventory_alerts(
+    warehouse_id: str | None = Query(default=None, alias="warehouseId"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    movement_payloads = [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=200)]
+    if warehouse_id:
+        movement_payloads = [
+            payload
+            for payload in movement_payloads
+            if _inventory_reference_id(payload, "warehouse_id", "warehouseId") == warehouse_id
+        ]
+    return {"data": {
+        "inventory": await _canonical_inventory_payloads(session, warehouse_id),
+        "movements": movement_payloads,
+    }}
 
 
 @router.get("/api/dashboard/customer-insights")
@@ -3206,6 +4036,7 @@ async def api_admin_update_customer(
     if row is None:
         raise HTTPException(status_code=404, detail="profile_not_found")
     body = await request.json()
+    previous_classification = getattr(row, "classification", None)
     extra = dict(getattr(row, "extra_data", {}) or {})
     for key, value in body.items():
         if key in model.__table__.c and key not in {"id", "created_at", "user_id"}:
@@ -3214,6 +4045,14 @@ async def api_admin_update_customer(
             extra[key] = _jsonable(value)
     if "extra_data" in model.__table__.c:
         row.extra_data = extra
+    await _notify_customer_resource_update(
+        session,
+        "profiles",
+        row,
+        {"classification": previous_classification},
+        body,
+        staff.id,
+    )
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -3323,6 +4162,7 @@ async def api_partnership_partners(staff: User = Depends(require_staff), session
             "productsCount": product_counts.get(partner_id, 0),
             "commissionRate": rate,
             "status": row.get("status") or ("active" if row.get("is_active") else "inactive"),
+            "subscription": subscription_payload(contract),
         })
     return {"data": data}
 
@@ -3532,6 +4372,76 @@ async def api_user_local_shopping_request_detail(
     return {"data": serialized[0]}
 
 
+@router.get("/api/shopping/local/requests/{request_id}/attachments/{file_id}")
+async def api_local_shopping_attachment(
+    request_id: uuid.UUID,
+    file_id: uuid.UUID,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve a request image only after checking the request and asset owner."""
+
+    local_request = await session.get(MODEL_BY_TABLE["local_shopping_requests"], request_id)
+    asset = await session.get(FileAsset, file_id)
+    staff_access = bool(roles.intersection({"admin", "manager", "staff", "finance"}))
+    if (
+        local_request is None
+        or local_request.deleted_at is not None
+        or asset is None
+        or asset.deleted_at is not None
+        or asset.policy_key != "customer_request_attachment"
+        or asset.status != "available"
+        or asset.scan_status not in {"clean", "not_required"}
+        or (not staff_access and local_request.user_id != user.id)
+        or (not staff_access and asset.owner_user_id not in {None, local_request.user_id})
+    ):
+        raise HTTPException(status_code=404, detail="local_attachment_not_found")
+    response_headers = {
+        "Cache-Control": "private, max-age=0, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if asset.storage_provider == "cloudflare_r2":
+        try:
+            r2_response = storage._r2_client().get_object(
+                Bucket=str(storage.settings.r2_bucket),
+                Key=str(asset.storage_key),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="local_attachment_not_found") from exc
+        body = r2_response.get("Body")
+        if body is None:
+            raise HTTPException(status_code=404, detail="local_attachment_not_found")
+        content_length = r2_response.get("ContentLength")
+        if content_length is not None:
+            response_headers["Content-Length"] = str(content_length)
+
+        def stream_r2_body():
+            try:
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                body.close()
+
+        return StreamingResponse(
+            stream_r2_body(),
+            media_type=asset.content_type,
+            headers=response_headers,
+        )
+
+    if asset.storage_provider != "local_uploads":
+        raise HTTPException(status_code=503, detail="local_attachment_storage_unavailable")
+    target = storage._safe_join(asset.storage_key)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="local_attachment_not_found")
+    return FileResponse(target, media_type=asset.content_type, headers=response_headers)
+
+
 @router.post("/api/shopping/local/requests", status_code=201)
 async def api_create_local_shopping_request(
     request: Request,
@@ -3690,7 +4600,7 @@ async def api_admin_purchase_details(purchase_id: uuid.UUID, staff: User = Depen
     order_rows = [
         row
         for row in await _rows(session, "international_orders", limit=500)
-        if _international_purchase_link_id(row) == str(purchase_id)
+        if _international_purchase_link_id(row) == _canonical_order_link_id(purchase_id)
     ]
     orders = await _international_order_payloads(session, order_rows)
     items: list[dict[str, Any]] = []
@@ -3741,9 +4651,24 @@ ORDER_LINK_LOCAL_KEYS = (
 )
 
 
+def _canonical_order_link_id(value: Any) -> str | None:
+    """Normalize historical link values before comparing UUIDs from extra_data."""
+    text_value = _first_text(value)
+    if not text_value:
+        return None
+    try:
+        return str(uuid.UUID(text_value))
+    except (TypeError, ValueError, AttributeError):
+        return text_value.casefold()
+
+
 def _order_link_value(row: Any, keys: tuple[str, ...]) -> str | None:
-    extra = dict(getattr(row, "extra_data", None) or {}) if not isinstance(row, dict) else row
-    return _first_text(*(extra.get(key) for key in keys)) or None
+    if isinstance(row, dict):
+        nested = row.get("extra_data") or row.get("extraData")
+        extra = nested if isinstance(nested, dict) else row
+    else:
+        extra = dict(getattr(row, "extra_data", None) or {})
+    return _canonical_order_link_id(_first_text(*(extra.get(key) for key in keys)))
 
 
 def _linked_international_ids(
@@ -3751,7 +4676,7 @@ def _linked_international_ids(
     local_rows: list[Any],
 ) -> set[str]:
     """Resolve both directions of the persisted one-to-one link contract."""
-    local_ids = {str(row.id) for row in local_rows}
+    local_ids = {_canonical_order_link_id(row.id) for row in local_rows}
     linked_ids: set[str] = set()
     for local_row in local_rows:
         international_id = _order_link_value(local_row, ORDER_LINK_INTERNATIONAL_KEYS)
@@ -3760,20 +4685,39 @@ def _linked_international_ids(
     for international_row in international_rows:
         local_id = _order_link_value(international_row, ORDER_LINK_LOCAL_KEYS)
         if local_id and local_id in local_ids:
-            linked_ids.add(str(international_row.id))
+            international_id = _canonical_order_link_id(international_row.id)
+            if international_id:
+                linked_ids.add(international_id)
+    return linked_ids
+
+
+def _purchase_linked_international_ids(
+    international_rows: list[Any],
+    purchase_rows: list[Any],
+) -> set[str]:
+    """Return international orders that reference an existing grouped purchase."""
+    purchase_ids = {_canonical_order_link_id(row.id) for row in purchase_rows}
+    linked_ids: set[str] = set()
+    for international_row in international_rows:
+        purchase_id = _international_purchase_link_id(international_row)
+        international_id = _canonical_order_link_id(international_row.id)
+        if purchase_id in purchase_ids and international_id:
+            linked_ids.add(international_id)
     return linked_ids
 
 
 async def _unlinked_international_count(session: AsyncSession) -> int:
     international_rows = await _rows(session, "international_orders", limit=1000)
     local_rows = await _rows(session, "orders", limit=2000)
+    purchase_rows = await _rows(session, "international_purchases", limit=500)
     linked_ids = _linked_international_ids(international_rows, local_rows)
+    linked_ids.update(_purchase_linked_international_ids(international_rows, purchase_rows))
     terminal_statuses = {"cancelled", "canceled", "returned", "refunded"}
     return sum(
         1
         for row in international_rows
         if str(row.status or "").strip().lower() not in terminal_statuses
-        and str(row.id) not in linked_ids
+        and _canonical_order_link_id(row.id) not in linked_ids
     )
 
 
@@ -3781,33 +4725,56 @@ async def _unlinked_international_count(session: AsyncSession) -> int:
 async def api_admin_order_links(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     international_rows = await _rows(session, "international_orders", limit=500)
     local_rows = await _rows(session, "orders", limit=1000)
+    purchase_rows = await _rows(session, "international_purchases", limit=500)
     linked_ids = _linked_international_ids(international_rows, local_rows)
+    purchase_linked_ids = _purchase_linked_international_ids(international_rows, purchase_rows)
+    linked_ids.update(purchase_linked_ids)
     linked_by_international: dict[str, dict[str, Any]] = {}
     for local_row in local_rows:
         international_id = _order_link_value(local_row, ORDER_LINK_INTERNATIONAL_KEYS)
         if international_id:
             linked_by_international.setdefault(international_id, serialize_record(local_row))
-    local_by_id = {str(row.id): row for row in local_rows}
+    local_by_id = {_canonical_order_link_id(row.id): row for row in local_rows}
     for international_row in international_rows:
         local_id = _order_link_value(international_row, ORDER_LINK_LOCAL_KEYS)
         if local_id and local_id in local_by_id:
             linked_by_international.setdefault(
-                str(international_row.id),
+                _canonical_order_link_id(international_row.id),
                 serialize_record(local_by_id[local_id]),
             )
+    purchase_linked_by_international = {
+        _canonical_order_link_id(row.id): _international_purchase_link_id(row)
+        for row in international_rows
+        if _canonical_order_link_id(row.id) in purchase_linked_ids
+    }
     international_payloads = await _international_order_payloads(session, international_rows)
     for payload in international_payloads:
-        linked_local = linked_by_international.get(str(payload.get("id")))
+        international_id = _canonical_order_link_id(payload.get("id"))
+        linked_local = linked_by_international.get(international_id)
         payload["linked_order_id"] = linked_local.get("id") if linked_local else None
         payload["linked_local_order_id"] = linked_local.get("id") if linked_local else None
+        payload["linked_purchase_id"] = purchase_linked_by_international.get(international_id)
+    international_ids = {_canonical_order_link_id(row.id) for row in international_rows}
+    linked_count = len(linked_ids.intersection(international_ids))
     return {
         "data": international_payloads,
         "meta": {
             "total": len(international_payloads),
-            "linked": len(linked_ids.intersection({str(row.id) for row in international_rows})),
-            "unlinked": len(international_payloads) - len(linked_ids.intersection({str(row.id) for row in international_rows})),
+            "linked": linked_count,
+            "unlinked": len(international_payloads) - linked_count,
         },
     }
+
+
+def _loyalty_settings_payload(row: Any) -> dict[str, Any]:
+    """Expose the saved compatibility fields with their latest values."""
+
+    payload = serialize_record(row)
+    extra = getattr(row, "extra_data", None)
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            payload[key] = _jsonable(value)
+    return payload
 
 
 @router.get("/api/loyalty/tiers")
@@ -3817,7 +4784,7 @@ async def api_loyalty_tiers(session: AsyncSession = Depends(get_session)):
 
 @router.get("/api/loyalty/settings")
 async def api_loyalty_settings(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "loyalty_settings", limit=50)]}
+    return {"data": [_loyalty_settings_payload(row) for row in await _rows(session, "loyalty_settings", limit=50)]}
 
 
 INVENTORY_OUT_MOVEMENT_TYPES = frozenset({"out", "remove", "decrease"})
@@ -3887,20 +4854,31 @@ async def _canonical_inventory_payloads(
     session: AsyncSession,
     warehouse_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Build one inventory row per catalog product from the same stock source."""
+    """Build one inventory row per product from warehouse stock plus legacy stock.
+
+    ``products.stock_quantity`` is the aggregate stock used by older records,
+    while ``inventory_locations`` stores the warehouse split.  A product can
+    therefore have both assigned and still-unassigned stock.  The projection
+    keeps that remainder visible instead of silently dropping it.
+    """
     product_rows = await _rows(session, "products", limit=5000)
     products, warehouses = await _inventory_reference_maps(session)
     location_payloads = [serialize_record(row) for row in await _rows(session, "inventory_locations", limit=5000)]
     if not location_payloads:
         location_payloads = [serialize_record(row) for row in await _rows(session, "inventory", limit=5000)]
+    is_unassigned = warehouse_id == "unassigned"
     grouped: dict[str, list[dict[str, Any]]] = {}
     for payload in location_payloads:
         product_id = _inventory_reference_id(payload, "product_id", "productId")
         if not product_id:
             continue
         row_warehouse_id = _inventory_reference_id(payload, "warehouse_id", "warehouseId")
-        if warehouse_id and row_warehouse_id != warehouse_id:
-            continue
+        if warehouse_id:
+            if is_unassigned:
+                if row_warehouse_id:
+                    continue
+            elif row_warehouse_id != warehouse_id:
+                continue
         grouped.setdefault(product_id, []).append(payload)
 
     result: list[dict[str, Any]] = []
@@ -3910,14 +4888,67 @@ async def _canonical_inventory_payloads(
         if product is None:
             continue
         rows = grouped.get(product_id, [])
-        if rows:
-            quantity = sum(_inventory_quantity(row.get("quantity")) for row in rows)
-            source = rows[0]
-            source_warehouse_id = warehouse_id or _inventory_reference_id(source, "warehouse_id", "warehouseId")
+        all_rows = [
+            payload
+            for payload in location_payloads
+            if _inventory_reference_id(payload, "product_id", "productId") == product_id
+        ]
+        assigned_rows = [
+            payload
+            for payload in all_rows
+            if (
+                _inventory_reference_id(payload, "warehouse_id", "warehouseId")
+                in warehouses
+            )
+        ]
+        assigned_quantity = sum(
+            _inventory_quantity(row.get("quantity")) for row in assigned_rows
+        )
+        all_location_quantity = sum(
+            _inventory_quantity(row.get("quantity")) for row in all_rows
+        )
+        aggregate_quantity = max(
+            _inventory_quantity(product.get("stock_quantity")),
+            all_location_quantity,
+        )
+
+        if warehouse_id:
+            if is_unassigned:
+                # The product column is the aggregate; subtract only stock
+                # already assigned to a real warehouse.  This also keeps a
+                # product with no location row visible as unassigned.
+                quantity = max(aggregate_quantity - assigned_quantity, 0)
+                if not all_rows and aggregate_quantity == 0:
+                    continue
+                source = rows[0] if rows else {}
+                source_warehouse_id = None
+                warehouse_label = "غير موزع"
+            else:
+                if not rows:
+                    # A selected warehouse must contain an explicit product
+                    # location; do not manufacture a zero-stock assignment.
+                    continue
+                quantity = sum(_inventory_quantity(row.get("quantity")) for row in rows)
+                source = rows[0]
+                source_warehouse_id = warehouse_id
+                warehouse_label = None
         else:
-            quantity = 0 if warehouse_id else _inventory_quantity(product.get("stock_quantity"))
-            source = {}
-            source_warehouse_id = warehouse_id
+            quantity = aggregate_quantity
+            source = all_rows[0] if all_rows else {}
+            assigned_warehouse_ids = list(dict.fromkeys(
+                _inventory_reference_id(row, "warehouse_id", "warehouseId")
+                for row in assigned_rows
+            ))
+            unassigned_quantity = max(aggregate_quantity - assigned_quantity, 0)
+            if len(assigned_warehouse_ids) == 1 and unassigned_quantity == 0:
+                source_warehouse_id = assigned_warehouse_ids[0]
+                warehouse_label = None
+            elif assigned_warehouse_ids:
+                source_warehouse_id = None
+                warehouse_label = "متعدد المستودعات" if unassigned_quantity == 0 else "متعدد المستودعات / غير موزع"
+            else:
+                source_warehouse_id = None
+                warehouse_label = "غير موزع"
         payload = {
             "id": source.get("id") or f"product:{product_id}",
             "product_id": product_id,
@@ -3928,8 +4959,83 @@ async def _canonical_inventory_payloads(
         }
         if source_warehouse_id and source_warehouse_id in warehouses:
             payload["warehouse"] = warehouses[source_warehouse_id]
+        elif warehouse_label:
+            # The frontend can now distinguish an unassigned product from a
+            # missing API value without pretending it belongs to a warehouse.
+            payload["warehouse"] = {"id": None, "name": warehouse_label}
+            payload["warehouse_name"] = warehouse_label
         result.append(_enrich_inventory_payload(payload, products, warehouses))
     return result
+
+
+async def _warehouse_summary_payloads(session: AsyncSession) -> list[dict[str, Any]]:
+    """Add current stored-product counts to the warehouse listing response."""
+    warehouse_rows = await _rows(session, "warehouses", limit=500)
+    product_rows = await _rows(session, "products", limit=5000)
+    location_rows = await _rows(session, "inventory_locations", limit=5000)
+    if not location_rows:
+        location_rows = await _rows(session, "inventory", limit=5000)
+
+    warehouse_ids = {str(row.id) for row in warehouse_rows}
+    summary: dict[str, dict[str, Any]] = {}
+    product_locations: dict[str, list[dict[str, Any]]] = {}
+    for row in location_rows:
+        payload = serialize_record(row)
+        warehouse_id = _inventory_reference_id(payload, "warehouse_id", "warehouseId")
+        product_id = _inventory_reference_id(payload, "product_id", "productId")
+        if not product_id:
+            continue
+        product_locations.setdefault(product_id, []).append(payload)
+        if not warehouse_id or warehouse_id not in warehouse_ids:
+            continue
+        quantity = _inventory_quantity(payload.get("quantity"))
+        warehouse_summary = summary.setdefault(
+            warehouse_id,
+            {"product_ids": set(), "total_quantity": 0},
+        )
+        # A linked product remains a warehouse product even when its current
+        # quantity is zero.  The quantity and the relationship are separate
+        # facts and must not be conflated in the summary.
+        warehouse_summary["product_ids"].add(product_id)
+        warehouse_summary["total_quantity"] += quantity
+
+    unassigned_product_count = 0
+    unassigned_quantity = 0
+    for product in product_rows:
+        product_id = str(product.id)
+        locations = product_locations.get(product_id, [])
+        assigned_quantity = sum(
+            _inventory_quantity(payload.get("quantity"))
+            for payload in locations
+            if _inventory_reference_id(payload, "warehouse_id", "warehouseId")
+            in warehouse_ids
+        )
+        location_quantity = sum(
+            _inventory_quantity(payload.get("quantity")) for payload in locations
+        )
+        aggregate_quantity = max(
+            _inventory_quantity(getattr(product, "stock_quantity", 0)),
+            location_quantity,
+        )
+        quantity = max(aggregate_quantity - assigned_quantity, 0)
+        if quantity > 0:
+            unassigned_product_count += 1
+            unassigned_quantity += quantity
+
+    data = []
+    for row in warehouse_rows:
+        payload = serialize_record(row)
+        warehouse_summary = summary.get(
+            str(payload.get("id") or ""),
+            {"product_ids": set(), "total_quantity": 0},
+        )
+        payload["product_count"] = len(warehouse_summary["product_ids"])
+        payload["products_count"] = payload["product_count"]
+        payload["total_quantity"] = int(warehouse_summary["total_quantity"])
+        payload["unassigned_product_count"] = unassigned_product_count
+        payload["unassigned_quantity"] = unassigned_quantity
+        data.append(payload)
+    return data
 
 
 def _canonical_inventory_stock_counts(payloads: list[dict[str, Any]]) -> dict[str, int]:
@@ -3948,7 +5054,9 @@ def _canonical_inventory_stock_counts(payloads: list[dict[str, Any]]) -> dict[st
 
 @router.get("/api/admin/inventory/warehouses")
 async def api_inventory_warehouses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "warehouses", limit=500)]}
+    # Keep the dropdown and the warehouses page on the same relationship-aware
+    # response so neither view can report a different product count.
+    return {"data": await _warehouse_summary_payloads(session)}
 
 
 @router.get("/api/admin/inventory/products")
@@ -3994,6 +5102,14 @@ async def api_create_inventory_movement(request: Request, staff: User = Depends(
     if not warehouse_id:
         raise HTTPException(status_code=422, detail="warehouse_required")
     try:
+        warehouse_uuid = uuid.UUID(warehouse_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="warehouse_invalid") from exc
+    warehouse_model = MODEL_BY_TABLE["warehouses"]
+    warehouse = await session.get(warehouse_model, warehouse_uuid)
+    if warehouse is None or getattr(warehouse, "deleted_at", None) is not None:
+        raise HTTPException(status_code=404, detail="warehouse_not_found")
+    try:
         product_id = uuid.UUID(str(body.get("product_id") or body.get("productId")))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="product_required") from exc
@@ -4004,12 +5120,36 @@ async def api_create_inventory_movement(request: Request, staff: User = Depends(
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="quantity_must_be_positive")
     movement_type = str(body.get("movement_type") or body.get("type") or "in").strip().lower()
-    if movement_type not in {"in", "out", "remove", "decrease", "adjustment"}:
+    if movement_type not in {"in", "out", "remove", "decrease", "adjustment", "assignment"}:
         raise HTTPException(status_code=422, detail="movement_type_invalid")
     product = await session.get(Product, product_id, with_for_update=True)
     if product is None or product.deleted_at is not None:
         raise HTTPException(status_code=404, detail="product_not_found")
     loc_model = MODEL_BY_TABLE["inventory_locations"]
+    all_locations = await _rows(
+        session,
+        "inventory_locations",
+        clauses=(loc_model.extra_data["product_id"].astext == str(product_id),),
+        limit=5000,
+    )
+    aggregate_quantity_before = max(
+        _inventory_quantity(getattr(product, "stock_quantity", 0)),
+        sum(_inventory_quantity(dict(row.extra_data or {}).get("quantity")) for row in all_locations),
+    )
+    if movement_type == "assignment":
+        assigned_quantity = sum(
+            _inventory_quantity(dict(row.extra_data or {}).get("quantity"))
+            for row in all_locations
+            if _inventory_reference_id(
+                serialize_record(row), "warehouse_id", "warehouseId"
+            )
+        )
+        available_unassigned = max(
+            aggregate_quantity_before - assigned_quantity,
+            0,
+        )
+        if quantity > available_unassigned:
+            raise HTTPException(status_code=409, detail="insufficient_unassigned_inventory")
     clauses = (loc_model.extra_data["warehouse_id"].astext == warehouse_id, loc_model.extra_data["product_id"].astext == str(product_id))
     locations = await _rows(session, "inventory_locations", clauses=clauses, limit=1)
     location = locations[0] if locations else loc_model(name=f"{warehouse_id}:{product_id}", status="active", is_active=True, extra_data={"warehouse_id": warehouse_id, "product_id": str(product_id), "quantity": 0})
@@ -4023,13 +5163,11 @@ async def api_create_inventory_movement(request: Request, staff: User = Depends(
         raise HTTPException(status_code=409, detail="insufficient_inventory")
     extra["quantity"] = current + delta
     location.extra_data = extra
-    all_locations = await _rows(
-        session,
-        "inventory_locations",
-        clauses=(loc_model.extra_data["product_id"].astext == str(product_id),),
-        limit=5000,
-    )
-    product.stock_quantity = sum(_inventory_quantity(dict(row.extra_data or {}).get("quantity")) for row in all_locations)
+    if movement_type != "assignment":
+        # Product.stock_quantity is the aggregate balance and may include a
+        # legacy/unassigned remainder. Replacing it with the location sum
+        # would silently discard that remainder after a warehouse movement.
+        product.stock_quantity = max(aggregate_quantity_before + delta, 0)
     row = await _api_create(session, "inventory_movements", {
         "product_id": product_id,
         "quantity": quantity,
@@ -4210,7 +5348,8 @@ async def api_admin_list_currencies(staff: User = Depends(require_staff), sessio
 
 @router.get("/api/admin/global-sites")
 async def api_list_global_sites(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "global_sites", limit=500)]}
+    rows = [serialize_record(row) for row in await _rows(session, "global_sites", limit=500)]
+    return {"data": [_normalize_global_site_payload(row) for row in rows]}
 
 
 @router.get("/api/admin/local-merchants")
@@ -4220,12 +5359,50 @@ async def api_list_local_merchants(staff: User = Depends(require_staff), session
 
 @router.get("/api/admin/warehouses")
 async def api_list_warehouses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "warehouses", limit=500)]}
+    return {"data": await _warehouse_summary_payloads(session)}
 
 
 @router.get("/api/admin/couriers")
 async def api_list_admin_couriers(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "couriers", limit=500)]}
+    courier_rows = await _rows(session, "couriers", limit=500)
+    if not courier_rows:
+        return {"data": []}
+    assignment_model = MODEL_BY_TABLE["courier_assignments"]
+    active_assignment_rows = list(
+        (
+            await session.execute(
+                select(
+                    assignment_model.id,
+                    assignment_model.courier_id,
+                    assignment_model.user_id,
+                    assignment_model.extra_data,
+                ).where(
+                    assignment_model.deleted_at.is_(None),
+                    assignment_model.status.in_(tuple(COURIER_ACTIVE_STATUSES)),
+                )
+            )
+        ).all()
+    )
+    assignment_ids_by_key: dict[str, set[str]] = {}
+    for assignment_id, courier_id, user_id, extra_data in active_assignment_rows:
+        if isinstance(extra_data, dict) and extra_data.get("is_current") is False:
+            continue
+        for key in (courier_id, user_id):
+            if key:
+                assignment_ids_by_key.setdefault(str(key), set()).add(str(assignment_id))
+    data = []
+    for courier in courier_rows:
+        payload = serialize_record(courier)
+        status = str(payload.get("status") or "active").strip().lower()
+        payload["is_active"] = bool(payload.get("is_active", status not in {"inactive", "disabled"}))
+        courier_assignment_ids = set()
+        for key in (courier.id, getattr(courier, "user_id", None)):
+            if key:
+                courier_assignment_ids.update(assignment_ids_by_key.get(str(key), set()))
+        payload["active_assignments"] = len(courier_assignment_ids)
+        payload["account_linked"] = bool(payload.get("user_id"))
+        data.append(payload)
+    return {"data": data}
 
 
 @router.get("/api/suppliers")
@@ -4409,6 +5586,285 @@ async def api_list_vouchers(
     return {"data": [_financial_voucher_payload(row) for row in rows]}
 
 
+def _voucher_email_candidate(*values: Any) -> str:
+    for value in values:
+        candidate = str(value or "").strip()
+        if candidate and re.fullmatch(r"[^@\s\r\n]+@[^@\s\r\n]+\.[^@\s\r\n]+", candidate):
+            return candidate
+    return ""
+
+
+def _voucher_phone_candidates(*values: Any) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        compact = re.sub(r"[\s\-().]", "", raw)
+        digits = compact[1:] if compact.startswith("+") else compact
+        if not digits.isdigit() or not 8 <= len(digits) <= 15:
+            continue
+        for item in (raw, compact, digits, f"+{digits}"):
+            if item and item not in candidates:
+                candidates.append(item)
+        if digits.startswith("967") and len(digits) == 12:
+            local = digits[3:]
+            for item in (local, f"+967{local}"):
+                if item not in candidates:
+                    candidates.append(item)
+    return tuple(candidates)
+
+
+async def _resolve_financial_voucher_recipient(
+    session: AsyncSession,
+    payload: dict[str, Any],
+) -> tuple[uuid.UUID | None, str, str]:
+    extra = payload.get("extra_data") if isinstance(payload.get("extra_data"), dict) else {}
+    email = _voucher_email_candidate(
+        payload.get("beneficiary_email"),
+        extra.get("beneficiary_email"),
+        payload.get("email"),
+        extra.get("email"),
+        payload.get("beneficiary_name"),
+    )
+    phone_values = _voucher_phone_candidates(
+        payload.get("beneficiary_phone"),
+        extra.get("beneficiary_phone"),
+        payload.get("phone"),
+        extra.get("phone"),
+    )
+    recipient_user: User | None = None
+    recipient_profile: Profile | None = None
+    if phone_values:
+        result = await session.execute(
+            select(User, Profile)
+            .join(Profile, Profile.user_id == User.id)
+            .where(
+                User.is_active.is_(True),
+                User.deleted_at.is_(None),
+                Profile.deleted_at.is_(None),
+                Profile.phone.in_(phone_values),
+            )
+            .limit(1)
+        )
+        match = result.first()
+        if match:
+            recipient_user, recipient_profile = match
+    if recipient_user is None and email:
+        result = await session.execute(
+            select(User, Profile)
+            .outerjoin(Profile, Profile.user_id == User.id)
+            .where(
+                User.is_active.is_(True),
+                User.deleted_at.is_(None),
+                or_(
+                    func.lower(User.email) == email.lower(),
+                    func.lower(Profile.email) == email.lower(),
+                ),
+            )
+            .limit(1)
+        )
+        match = result.first()
+        if match:
+            recipient_user, recipient_profile = match
+    if recipient_user is None:
+        beneficiary_name = _first_text(payload.get("beneficiary_name"), extra.get("beneficiary_name"))
+        if beneficiary_name:
+            result = await session.execute(
+                select(User, Profile)
+                .join(Profile, Profile.user_id == User.id)
+                .where(
+                    User.is_active.is_(True),
+                    User.deleted_at.is_(None),
+                    Profile.deleted_at.is_(None),
+                    func.lower(Profile.full_name) == beneficiary_name.lower(),
+                )
+                .limit(1)
+            )
+            match = result.first()
+            if match:
+                recipient_user, recipient_profile = match
+
+    resolved_email = _voucher_email_candidate(
+        email,
+        getattr(recipient_user, "email", None),
+        getattr(recipient_profile, "email", None),
+    )
+    resolved_phone = _first_text(
+        payload.get("beneficiary_phone"),
+        extra.get("beneficiary_phone"),
+        payload.get("phone"),
+        extra.get("phone"),
+        getattr(recipient_profile, "phone", None),
+    )
+    return getattr(recipient_user, "id", None), resolved_email, resolved_phone
+
+
+def _financial_voucher_delivery_message(payload: dict[str, Any]) -> str:
+    voucher_type = str(payload.get("voucher_type") or payload.get("type") or "receipt").strip().lower()
+    voucher_label = "سند قبض" if voucher_type == "receipt" else "سند صرف"
+    payment_labels = {
+        "cash": "نقداً",
+        "bank_transfer": "تحويل بنكي",
+        "wallet": "محفظة إلكترونية",
+        "check": "شيك",
+    }
+    try:
+        amount = f"{Decimal(str(payload.get('amount') or 0)):,.2f}"
+    except (ArithmeticError, TypeError, ValueError):
+        amount = "0.00"
+    issued = _first_text(payload.get("issued_date"), payload.get("created_at"), default="-")
+    try:
+        issued = datetime.fromisoformat(issued.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except (AttributeError, TypeError, ValueError):
+        issued = issued[:10]
+    beneficiary = _first_text(payload.get("beneficiary_name"), default="عميلنا الكريم")
+    voucher_number = _first_text(payload.get("voucher_number"), default="-")
+    payment_method = payment_labels.get(
+        str(payload.get("payment_method") or "cash").strip().lower(),
+        _first_text(payload.get("payment_method"), default="غير محددة"),
+    )
+    description = _first_text(payload.get("description"))
+    details = f"\nالبيان: {description}" if description else ""
+    return (
+        f"مرحباً {beneficiary}،\n\n"
+        f"تم إصدار {voucher_label} رقم {voucher_number}.\n"
+        f"المبلغ: {amount} {payload.get('currency_code') or 'YER'}\n"
+        f"طريقة الدفع: {payment_method}\n"
+        f"تاريخ الإصدار: {issued}{details}\n\n"
+        "هذه رسالة آلية من رفاهية التسوق."
+    )
+
+
+def _voucher_delivery_override(body: Any, channel: str) -> str:
+    """Validate an optional contact supplied for a one-off voucher delivery.
+
+    Older vouchers may not contain a contact even though the voucher itself is
+    valid.  The delivery action can therefore supply the missing contact while
+    retaining the normal recipient lookup as the first choice.
+    """
+    if not isinstance(body, dict):
+        return ""
+    if channel == "email":
+        raw_value = body.get("recipient_email") or body.get("email")
+        if raw_value in (None, ""):
+            return ""
+        value = str(raw_value).strip()
+        candidate = _voucher_email_candidate(value)
+        if not candidate:
+            raise HTTPException(status_code=422, detail="voucher_recipient_email_invalid")
+        return candidate
+
+    raw_value = body.get("recipient_phone") or body.get("phone")
+    if raw_value in (None, ""):
+        return ""
+    value = str(raw_value).strip()
+    candidates = _voucher_phone_candidates(value)
+    if not candidates:
+        raise HTTPException(status_code=422, detail="voucher_recipient_phone_invalid")
+    return next((candidate for candidate in candidates if not re.search(r"[\s\-().]", candidate)), candidates[0])
+
+
+async def _queue_financial_voucher_delivery(
+    voucher_id: uuid.UUID,
+    channel: str,
+    staff: User,
+    session: AsyncSession,
+    delivery_override: str = "",
+) -> dict[str, Any]:
+    voucher_model = MODEL_BY_TABLE["financial_vouchers"]
+    row = await session.get(voucher_model, voucher_id)
+    if row is None or getattr(row, "deleted_at", None) is not None:
+        raise HTTPException(status_code=404, detail="voucher_not_found")
+    payload = _financial_voucher_payload(row)
+    recipient_user_id, recipient_email, recipient_phone = await _resolve_financial_voucher_recipient(session, payload)
+    if channel == "email" and delivery_override:
+        recipient_email = delivery_override
+    if channel == "whatsapp" and delivery_override:
+        recipient_phone = delivery_override
+    if channel == "email" and not recipient_email:
+        raise HTTPException(status_code=422, detail="voucher_recipient_email_required")
+    if channel == "whatsapp" and not recipient_phone:
+        raise HTTPException(status_code=422, detail="voucher_recipient_phone_required")
+
+    target = recipient_email.lower() if channel == "email" else re.sub(r"\s+", "", recipient_phone)
+    dedupe_key = f"financial-voucher:{voucher_id}:{channel}:{target}"
+    outbox_table = "email_outbox" if channel == "email" else "whatsapp_outbox"
+    outbox_model = MODEL_BY_TABLE[outbox_table]
+    existing = (
+        await session.execute(
+            select(outbox_model)
+            .where(
+                outbox_model.extra_data["dedupe_key"].astext == dedupe_key,
+                outbox_model.deleted_at.is_(None),
+            )
+            .order_by(outbox_model.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    active_statuses = {"pending", "queued", "processing", "failed_retryable", "provider_accepted", "sent", "delivered"}
+    if existing is not None and str(getattr(existing, "status", "")).lower() in active_statuses:
+        return {"queued": True, "duplicate": True, "channel": channel, "status": existing.status}
+
+    owner_id = recipient_user_id or staff.id
+    voucher_label = "سند قبض" if payload.get("voucher_type") == "receipt" else "سند صرف"
+    values: dict[str, Any] = {
+        "user_id": owner_id,
+        "title": f"{voucher_label} رقم {_first_text(payload.get('voucher_number'), default='-')}",
+        "status": "queued",
+        "message": _financial_voucher_delivery_message(payload),
+        "extra_data": {
+            "category": "finance",
+            "consent_required": False,
+            "dedupe_key": dedupe_key,
+            "template": "financial_voucher",
+            "voucher_id": str(voucher_id),
+            "voucher_number": payload.get("voucher_number"),
+            "channel": channel,
+        },
+    }
+    values["email" if channel == "email" else "phone"] = recipient_email if channel == "email" else recipient_phone
+    if delivery_override:
+        current_extra_data = getattr(row, "extra_data", None)
+        if not isinstance(current_extra_data, dict):
+            current_extra_data = {}
+        contact_key = "beneficiary_email" if channel == "email" else "beneficiary_phone"
+        row.extra_data = {**current_extra_data, contact_key: delivery_override}
+    session.add(outbox_model(**values))
+    await session.commit()
+    return {"queued": True, "duplicate": False, "channel": channel, "status": "queued"}
+
+
+@router.post("/api/finance/vouchers/{voucher_id}/email", status_code=202)
+async def api_email_financial_voucher(
+    voucher_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    delivery_override = _voucher_delivery_override(body, "email")
+    return await _queue_financial_voucher_delivery(voucher_id, "email", staff, session, delivery_override)
+
+
+@router.post("/api/finance/vouchers/{voucher_id}/whatsapp", status_code=202)
+async def api_whatsapp_financial_voucher(
+    voucher_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    delivery_override = _voucher_delivery_override(body, "whatsapp")
+    return await _queue_financial_voucher_delivery(voucher_id, "whatsapp", staff, session, delivery_override)
+
+
 @router.get("/support/tickets")
 async def api_list_support_tickets(
     staff: User = Depends(require_staff),
@@ -4537,9 +5993,84 @@ def _normalize_marketer_body(body: Any, *, for_create: bool = False) -> dict[str
     return values
 
 
+async def _resolve_marketer_user_reference(session: AsyncSession, body: Any) -> Any:
+    """Allow the admin form to identify a registered account by email."""
+    if not isinstance(body, dict):
+        return body
+    raw_user_id = body.get("user_id") or body.get("userId")
+    candidates = (raw_user_id, body.get("email"))
+    if raw_user_id not in (None, ""):
+        try:
+            uuid.UUID(str(raw_user_id))
+            return body
+        except (TypeError, ValueError):
+            pass
+    for candidate in candidates:
+        email = _first_text(candidate)
+        if not email or "@" not in email:
+            continue
+        result = await session.execute(
+            select(User.id)
+            .where(func.lower(User.email) == email.lower(), User.deleted_at.is_(None))
+            .limit(1)
+        )
+        resolved_user_id = result.scalar_one_or_none()
+        if resolved_user_id is not None:
+            values = dict(body)
+            values["user_id"] = resolved_user_id
+            values.pop("userId", None)
+            return values
+    return body
+
+
 @router.get("/api/marketing/marketers")
 async def api_marketers(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return {"data": [_marketer_payload(row) for row in await _rows(session, "marketers", limit=500)]}
+
+
+@router.get("/api/marketing/users/options")
+async def api_marketer_user_options(
+    current_id: uuid.UUID | None = Query(None),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return active login accounts for the marketer selector.
+
+    The dashboard should never require staff to know or type an internal UUID.
+    Keep the current marketer available while editing, but hide accounts that
+    are already assigned to another active marketer.
+    """
+    marketer_model = MODEL_BY_TABLE["marketers"]
+    assigned_ids = select(marketer_model.user_id).where(
+        marketer_model.deleted_at.is_(None),
+        marketer_model.user_id.is_not(None),
+    )
+    filters = [User.deleted_at.is_(None), User.is_active.is_(True)]
+    if current_id is None:
+        filters.append(User.id.not_in(assigned_ids))
+    else:
+        filters.append(or_(User.id.not_in(assigned_ids), User.id == current_id))
+    rows = (
+        await session.execute(
+            select(User, Profile)
+            .outerjoin(Profile, Profile.user_id == User.id)
+            .where(*filters)
+            .order_by(Profile.full_name.asc().nullslast(), User.email.asc())
+            .limit(1000)
+        )
+    ).all()
+    return {
+        "data": [
+            {
+                "id": str(user.id),
+                "user_id": str(user.id),
+                "email": user.email,
+                "full_name": getattr(profile, "full_name", None) or user.email,
+                "phone": getattr(profile, "phone", None),
+            }
+            for user, profile in rows
+        ]
+    }
 
 
 def _marketer_commission_payload(value: Any, marketers_by_user: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -4583,8 +6114,34 @@ async def api_marketer_commissions(
 
 
 @router.get("/api/finance/orders")
-async def api_finance_orders(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    rows = await _rows(session, "orders", limit=500)
+async def api_finance_orders(
+    date_from: str | None = Query(None, alias="dateFrom"),
+    date_to: str | None = Query(None, alias="dateTo"),
+    ascending: bool = Query(False),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    # The finance screen sends the selected period to this endpoint.  The
+    # previous implementation ignored those query parameters, so its cards,
+    # chart, and exported rows could describe a different period than the
+    # accounting summary.
+    start_dt, end_dt = _date_range(date_from, date_to)
+    order_model = MODEL_BY_TABLE["orders"]
+    clauses = tuple(
+        clause
+        for clause in (
+            order_model.created_at >= start_dt if start_dt else None,
+            order_model.created_at <= end_dt if end_dt else None,
+        )
+        if clause is not None
+    )
+    rows = await _rows(
+        session,
+        "orders",
+        clauses=clauses,
+        order_desc=not ascending,
+        limit=500,
+    )
     return {"data": await _serialize_orders_with_financials(session, rows)}
 
 
@@ -4771,13 +6328,17 @@ async def api_finance_summary(
         ),
         Decimal("0"),
     )
-    pending_receipt_statuses = ("pending", "uploaded", "reviewing")
-    pending_payments = await _sum_amount(
+    # The accounting card must reflect outstanding order balances and receipt
+    # reviews.  Reading only ``payment_receipts`` made it show zero for orders
+    # whose checkout ledger was still pending.
+    pending_payments = await RevenueRecognitionService.pending_payment_amount(
         session,
-        "payment_receipts",
-        MODEL_BY_TABLE["payment_receipts"].status.in_(pending_receipt_statuses),
+        start=date_from,
+        end=date_to,
     )
     net_income = Decimal(revenue["net_revenue"])
+    gross_sales = Decimal(revenue["gross_revenue"])
+    collected_income = Decimal(revenue["paid_amount"])
     return {
         "data": {
             # The legacy keys remain available to existing admin screens.
@@ -4785,6 +6346,13 @@ async def api_finance_summary(
             "recognized_revenue": revenue,
             "payments": float(Decimal(revenue["paid_amount"])),
             "refunds": float(Decimal(revenue["refund_amount"])),
+            # Explicit names prevent the finance screen's gross sales figure
+            # from being confused with recognised/collected income.
+            "grossSales": float(gross_sales),
+            "collectedIncome": float(collected_income),
+            "recognizedIncome": float(net_income),
+            "remainingReceivable": float(max(gross_sales - collected_income, Decimal("0"))),
+            "currencyCode": revenue["currency_code"],
             "expenses": float(total_expenses),
             # These are the stable dashboard contract consumed by the web UI.
             "totalIncome": float(net_income),
@@ -4812,6 +6380,24 @@ async def api_finance_today_stats(staff: User = Depends(require_staff), session:
         session,
         list((await session.execute(statement)).scalars()),
     )
+    regular_order_ids = {str(order.get("id")) for order in orders if order.get("id")}
+    for row in await RevenueRecognitionService.order_rows(session, start=today):
+        if str(row.order_id) in regular_order_ids:
+            continue
+        orders.append(
+            {
+                "id": str(row.order_id),
+                "order_id": str(row.order_id),
+                "order_number": row.order_number,
+                "status": row.status,
+                "payment_status": "paid",
+                "currency_code": row.currency_code,
+                "total": float(row.order_total),
+                "paid_amount": float(row.payment_total),
+                "refund_amount": float(row.refund_total),
+                "remaining_balance": float(max(row.order_total - row.payment_total, Decimal("0"))),
+            }
+        )
     return {
         "data": {
             "orders": orders,
@@ -4907,25 +6493,49 @@ async def api_dashboard_kpis(staff: User = Depends(require_staff), session: Asyn
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     month = today.replace(day=1)
     yesterday = today - timedelta(days=1)
+    last_month = (month - timedelta(days=1)).replace(day=1)
     order_model = MODEL_BY_TABLE["orders"]
     user_model = MODEL_BY_TABLE["users"]
     product_model = MODEL_BY_TABLE["products"]
     today_revenue_data = await RevenueRecognitionService.summary(session, start=today)
-    yesterday_revenue_data = await RevenueRecognitionService.summary(session, start=yesterday, end=today)
+    yesterday_revenue_data = await RevenueRecognitionService.summary(
+        session,
+        start=yesterday,
+        end=today - timedelta(microseconds=1),
+    )
     month_revenue_data = await RevenueRecognitionService.summary(session, start=month)
+    last_month_revenue_data = await RevenueRecognitionService.summary(
+        session,
+        start=last_month,
+        end=month - timedelta(microseconds=1),
+    )
     today_revenue = Decimal(today_revenue_data["net_revenue"])
     yesterday_revenue = Decimal(yesterday_revenue_data["net_revenue"])
     month_revenue = Decimal(month_revenue_data["net_revenue"])
     today_orders = await _count(session, "orders", order_model.created_at >= today)
     inventory_counts = _canonical_inventory_stock_counts(await _canonical_inventory_payloads(session))
     expense_tables = ("general_expenses", "employee_payments", "partner_payments", "marketer_payments")
-    monthly_expenses = sum(
-        (
-            await _sum_amount(session, table, MODEL_BY_TABLE[table].created_at >= month)
-            for table in expense_tables
-        ),
-        Decimal("0"),
-    )
+    monthly_expenses = Decimal("0")
+    for table in expense_tables:
+        monthly_expenses += await _sum_amount(
+            session,
+            table,
+            MODEL_BY_TABLE[table].created_at >= month,
+        )
+    weekly = []
+    for offset in range(6, -1, -1):
+        day_start = today - timedelta(days=offset)
+        day_end = day_start + timedelta(days=1) - timedelta(microseconds=1)
+        day_summary = await RevenueRecognitionService.summary(
+            session,
+            start=day_start,
+            end=day_end,
+        )
+        weekly.append({
+            "date": day_start.date().isoformat(),
+            "revenue": float(Decimal(day_summary["net_revenue"])),
+            "orders": int(day_summary["order_count"]),
+        })
     gross_month_revenue = Decimal(month_revenue_data["gross_revenue"])
     collection_rate = (
         float((Decimal(month_revenue_data["paid_amount"]) / gross_month_revenue) * 100)
@@ -4933,13 +6543,14 @@ async def api_dashboard_kpis(staff: User = Depends(require_staff), session: Asyn
         else 0.0
     )
     return {"data": {
-        "revenue": {"today": float(today_revenue), "yesterday": float(yesterday_revenue), "thisMonth": float(month_revenue), "lastMonth": 0, "trend": float(today_revenue - yesterday_revenue)},
+        "revenue": {"today": float(today_revenue), "yesterday": float(yesterday_revenue), "thisMonth": float(month_revenue), "lastMonth": float(Decimal(last_month_revenue_data["net_revenue"])), "trend": float(today_revenue - yesterday_revenue)},
         "orders": {"today": today_orders, "pending": await _count(session, "orders", order_model.status.in_(("pending", "new"))), "processing": await _count(session, "orders", order_model.status == "processing"), "completed": await _count(session, "orders", order_model.status.in_(("delivered", "completed"))), "trend": 0},
         "customers": {"total": await _customer_count(session), "new_today": await _customer_count(session, user_model.created_at >= today), "new_this_month": await _customer_count(session, user_model.created_at >= month), "trend": 0},
         "products": {"total": await _count(session, "products"), "low_stock": inventory_counts["low_stock"], "out_of_stock": inventory_counts["out_of_stock"], "pending_approval": await _count(session, "products", product_model.approval_status.in_(("pending", "reviewing")))},
         "payments": {"pending_amount": float(await _sum_amount(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing")))), "pending_count": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))), "collected_today": float(await _sum_amount(session, "order_payments", MODEL_BY_TABLE["order_payments"].created_at >= today)), "collection_rate": round(collection_rate, 2)},
         "expenses": {"today": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= today)), "thisMonth": float(monthly_expenses), "general": float(await _sum_amount(session, "general_expenses")), "employees": float(await _sum_amount(session, "employee_payments")), "partners": float(await _sum_amount(session, "partner_payments")), "marketers": float(await _sum_amount(session, "marketer_payments")), "netProfit": float(month_revenue - monthly_expenses)},
         "partners": {"total": await _count(session, "partner_storefronts"), "active": await _count(session, "partner_storefronts", MODEL_BY_TABLE["partner_storefronts"].status.in_(("active", "approved"))), "pending_settlements": await _count(session, "partner_settlements", MODEL_BY_TABLE["partner_settlements"].status.in_(("pending", "unpaid")))},
+        "weekly": weekly,
     }}
 
 
@@ -4989,7 +6600,7 @@ async def api_store_reviews_eligibility(
 
 @router.get("/api/reviews/store/admin")
 async def api_store_reviews_admin(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "store_reviews", limit=500)]}
+    return {"data": await fetch_admin_store_reviews(session)}
 
 
 @router.get("/api/dashboard/sales-forecasts")
@@ -5065,9 +6676,115 @@ async def api_generate_sales_forecasts(staff: User = Depends(require_staff), ses
     return {"data": [serialize_record(row) for row in generated]}
 
 
+_SECURITY_AUDIT_TABLE_LABELS = (
+    ("payment_receipt", "السندات المالية"),
+    ("payment_method", "طرق الدفع"),
+    ("shipping", "الشحن"),
+    ("inventory", "المخزون"),
+    ("warehouse", "المستودعات"),
+    ("international_order", "الطلبات الدولية"),
+    ("local_shopping", "التسوق المحلي"),
+    ("order", "الطلبات"),
+    ("product", "المنتجات"),
+    ("category", "الأقسام"),
+    ("brand", "الماركات"),
+    ("supplier", "الموردون"),
+    ("merchant", "التجار"),
+    ("partner", "الشركاء"),
+    ("courier", "مناديب التوصيل"),
+    ("customer", "العملاء"),
+    ("profile", "الملفات الشخصية"),
+    ("user", "المستخدمون"),
+    ("loyalty", "برنامج الولاء"),
+    ("theme", "التصميم والمظهر"),
+    ("setting", "الإعدادات"),
+    ("banner", "البنرات"),
+    ("campaign", "الحملات التسويقية"),
+    ("file", "الملفات"),
+)
+
+
+def _security_audit_table_label(type_value: Any, description: Any) -> str:
+    searchable = f"{type_value or ''} {description or ''}".strip().lower()
+    for token, label in _SECURITY_AUDIT_TABLE_LABELS:
+        if token in searchable:
+            return label
+    return "النظام"
+
+
+def _security_audit_action(type_value: Any, description: Any) -> str:
+    searchable = f"{type_value or ''} {description or ''}".strip().lower()
+    if any(token in searchable for token in ("delete", "deleted", "remove", "removed", "حذف", "إزالة")):
+        return "delete"
+    if any(
+        token in searchable
+        for token in (
+            "status",
+            "activate",
+            "deactivate",
+            "disable",
+            "enable",
+            "approve",
+            "reject",
+            "حالة",
+            "تفعيل",
+            "تعطيل",
+            "اعتماد",
+            "رفض",
+        )
+    ):
+        return "status_change"
+    return "update"
+
+
+def _security_audit_changed_fields(row: Any) -> dict[str, bool]:
+    extra_data = getattr(row, "extra_data", None)
+    if not isinstance(extra_data, dict):
+        return {}
+    for key in ("changed_fields", "changedFields", "fields"):
+        value = extra_data.get(key)
+        if isinstance(value, dict):
+            return {str(field): True for field in value}
+        if isinstance(value, list):
+            return {str(field): True for field in value if str(field).strip()}
+    return {}
+
+
+def _security_audit_payload(row: Any, *, include_description: bool = True) -> dict[str, Any]:
+    type_value = getattr(row, "type", "")
+    description = str(getattr(row, "description", "") or "").strip()
+    created_at = getattr(row, "created_at", None)
+    return {
+        "id": str(getattr(row, "id", "")),
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        "table_name": _security_audit_table_label(type_value, description),
+        "action": _security_audit_action(type_value, description),
+        "changed_fields": _security_audit_changed_fields(row),
+        "description": description if include_description else "",
+    }
+
+
 @router.get("/api/dashboard/sensitive-data-changes")
 async def api_sensitive_data_changes(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "security_events", limit=500)]}
+    # This page is an audit trail. The previous implementation returned raw
+    # rate-limit events, which do not contain the fields expected by the UI
+    # and produced hundreds of timestamp-only rows.
+    audit_rows = await _rows(session, "audit_logs", limit=50)
+    data = [_security_audit_payload(row) for row in audit_rows]
+
+    # Keep blocked security events visible when there is no audit trail, while
+    # excluding successful API rate-limit noise and sensitive raw metadata.
+    if not data:
+        security_rows = await _rows(session, "security_events", limit=100)
+        data = [
+            _security_audit_payload(row, include_description=False)
+            for row in security_rows
+            if not (
+                str(getattr(row, "type", "") or "").strip().lower() == "api_rate_limit"
+                and str(getattr(row, "status", "") or "").strip().lower() in {"allowed", "ok", "success"}
+            )
+        ][:50]
+    return {"data": data}
 
 
 @router.get("/api/suppliers/counts/products")
@@ -5095,6 +6812,80 @@ async def api_supplier_order_counts(staff: User = Depends(require_staff)):
     return {"data": {}}
 
 
+def _analytics_event_payload(row: Any) -> dict[str, Any]:
+    """Expose the analytics contract from the compatibility table.
+
+    The deployed schema stores the event name in ``type`` and the rest of the
+    event payload in ``extra_data``. Older clients queried the logical names
+    ``event_type``, ``page_path``, ``metadata`` and ``session_id`` directly,
+    which made a valid row look empty to the dashboard.
+    """
+    payload = serialize_record(row)
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    event_type = _first_text(
+        payload.get("event_type"),
+        payload.get("type"),
+        payload.get("event"),
+        default="event",
+    )
+    page_path = _first_text(
+        payload.get("page_path"),
+        payload.get("path"),
+        metadata.get("page_path"),
+        payload.get("description") if str(payload.get("description") or "").startswith("/") else None,
+        default="/",
+    )
+    session_id = _first_text(payload.get("session_id"), metadata.get("session_id")) or None
+    if session_id is None and event_type in {
+        "page_view",
+        "product_view",
+        "add_to_cart",
+        "cart_add",
+        "checkout",
+        "checkout_start",
+        "checkout_shipping",
+        "checkout_payment",
+        "purchase",
+        "order_placed",
+        "search",
+        "time_on_page",
+        "scroll_depth",
+    }:
+        session_id = _first_text(payload.get("user_id")) or None
+    payload["event_type"] = event_type
+    payload["page_path"] = page_path
+    payload["metadata"] = metadata
+    payload["session_id"] = session_id
+    return payload
+
+
+def _analytics_event_datetime(value: Any) -> datetime | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _analytics_event_type(payload: dict[str, Any]) -> str:
+    raw_type = _first_text(
+        payload.get("event_type"),
+        payload.get("type"),
+        payload.get("event"),
+    ).lower()
+    return {
+        "add_to_cart": "cart_add",
+        "checkout": "checkout_start",
+        "purchase": "order_placed",
+    }.get(raw_type, raw_type)
+
+
 @router.post("/api/analytics/events", status_code=202)
 async def api_create_analytics_events(
     request: Request,
@@ -5109,25 +6900,41 @@ async def api_create_analytics_events(
     for payload in payloads[:50]:
         if not isinstance(payload, dict):
             continue
-        event_type = str(payload.get("event_type") or "").strip()[:80]
-        page_path = str(payload.get("page_path") or "").strip()[:500]
-        if not event_type or not page_path:
-            continue
-        values: dict[str, Any] = {}
-        if "event_type" in columns:
-            values["event_type"] = event_type
-        if "page_path" in columns:
-            values["page_path"] = page_path
-        if "metadata" in columns:
-            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-            values["metadata"] = _jsonable(metadata)
-        if "session_id" in columns:
-            values["session_id"] = str(payload.get("session_id") or "")[:120] or None
+        event_type = _first_text(
+            payload.get("event_type"),
+            payload.get("type"),
+            payload.get("event"),
+            default="event",
+        )[:120]
+        page_path = _first_text(
+            payload.get("page_path"),
+            payload.get("path"),
+            payload.get("url"),
+            default="/",
+        )[:500]
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        extra = dict(payload.get("extra_data") or {}) if isinstance(payload.get("extra_data"), dict) else {}
+        for key, value in payload.items():
+            if key not in {"id", "user_id", "created_at", "updated_at", "deleted_at", "extra_data", "type", "description"}:
+                extra[key] = _jsonable(value)
+        extra.update(
+            {
+                "event_type": event_type,
+                "page_path": page_path,
+                "metadata": _jsonable(metadata),
+                "session_id": _first_text(payload.get("session_id"))[:120] or None,
+            }
+        )
+        values: dict[str, Any] = {
+            "type": event_type[:64],
+            "description": _first_text(payload.get("description"), page_path),
+            "extra_data": extra,
+        }
         if "user_id" in columns:
             values["user_id"] = user.id if user else None
         if "created_at" in columns:
-            values["created_at"] = datetime.now(timezone.utc)
-        row = analytics_model(**values)
+            values["created_at"] = _analytics_event_datetime(payload.get("created_at")) or datetime.now(timezone.utc)
+        row = analytics_model(**{key: value for key, value in values.items() if key in columns})
         session.add(row)
         created += 1
     if created:
@@ -5136,23 +6943,261 @@ async def api_create_analytics_events(
 
 
 @router.get("/api/analytics/events")
-async def api_analytics_events(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "analytics_events", limit=500)]}
+async def api_analytics_events(
+    from_date: str | None = Query(None, alias="from"),
+    to_date: str | None = Query(None, alias="to"),
+    limit: int = Query(10000, ge=1, le=10000),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    analytics_model = MODEL_BY_TABLE["analytics_events"]
+    clauses: list[Any] = [analytics_model.deleted_at.is_(None)]
+    start = _analytics_event_datetime(from_date)
+    end = _analytics_event_datetime(to_date)
+    if start is not None:
+        clauses.append(analytics_model.created_at >= start)
+    if end is not None:
+        clauses.append(analytics_model.created_at <= end)
+    result = await session.execute(
+        select(analytics_model)
+        .where(*clauses)
+        .order_by(analytics_model.created_at.asc())
+        .limit(limit)
+    )
+    event_payloads = [_analytics_event_payload(row) for row in result.scalars()]
+    # A completed order is a reliable conversion signal even when the
+    # storefront event queue was disabled in an older web build. Expose it as
+    # a compatibility event so the existing dashboard can show sales without
+    # counting an order twice when a purchase event already carries its id.
+    known_order_ids = {
+        _first_text((event.get("metadata") or {}).get("order_id"))
+        for event in event_payloads
+        if isinstance(event.get("metadata"), dict)
+    }
+    for order in await RevenueRecognitionService.eligible_orders(session, start=start, end=end):
+        order_id = str(order.id)
+        if order_id in known_order_ids:
+            continue
+        event_payloads.append(
+            {
+                "id": f"order:{order_id}",
+                "event_type": "purchase",
+                "page_path": "/checkout",
+                "metadata": {"source": "order_record", "order_id": order_id},
+                "session_id": str(order.user_id) if order.user_id else None,
+                "user_id": str(order.user_id) if order.user_id else None,
+                "created_at": order.created_at.isoformat(),
+            }
+        )
+    event_payloads.sort(key=lambda event: str(event.get("created_at") or ""))
+    return {"data": event_payloads[:limit]}
+
+
+@router.get("/api/analytics/summary")
+async def api_analytics_summary(
+    from_date: str | None = Query(None, alias="from"),
+    to_date: str | None = Query(None, alias="to"),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    now = datetime.now(timezone.utc)
+    end = _analytics_event_datetime(to_date) or now
+    start = _analytics_event_datetime(from_date) or end - timedelta(days=7)
+    if start > end:
+        start, end = end, start
+    analytics_model = MODEL_BY_TABLE["analytics_events"]
+    event_result = await session.execute(
+        select(analytics_model)
+        .where(
+            analytics_model.deleted_at.is_(None),
+            analytics_model.created_at >= start,
+            analytics_model.created_at <= end,
+        )
+        .order_by(analytics_model.created_at.asc())
+        .limit(10000)
+    )
+    events = [_analytics_event_payload(row) for row in event_result.scalars()]
+    sessions: set[str] = set()
+    page_counts: dict[str, int] = {}
+    search_counts: dict[str, int] = {}
+    daily_sessions: dict[str, set[str]] = {}
+    funnel_sessions = {key: set() for key in ("page_view", "product_view", "cart_add", "checkout_start", "checkout_shipping", "checkout_payment", "order_placed")}
+    total_page_views = 0
+    total_time = 0
+    time_samples = 0
+    mobile_devices = 0
+    desktop_devices = 0
+    for event in events:
+        event_type = _analytics_event_type(event)
+        session_id = _first_text(event.get("session_id"))
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        if session_id:
+            sessions.add(session_id)
+            if event_type in funnel_sessions:
+                funnel_sessions[event_type].add(session_id)
+        if metadata.get("is_mobile") is True:
+            mobile_devices += 1
+        elif metadata.get("is_mobile") is False:
+            desktop_devices += 1
+        if event_type == "page_view":
+            total_page_views += 1
+            page = _first_text(event.get("page_path"), default="/")
+            page_counts[page] = page_counts.get(page, 0) + 1
+            date_key = str(event.get("created_at") or "").split("T", 1)[0]
+            if date_key and session_id:
+                daily_sessions.setdefault(date_key, set()).add(session_id)
+        elif event_type == "search":
+            query = _first_text(metadata.get("query"))
+            if query:
+                search_counts[query] = search_counts.get(query, 0) + 1
+        elif event_type == "time_on_page":
+            try:
+                duration = float(metadata.get("duration_seconds") or 0)
+            except (TypeError, ValueError):
+                duration = 0
+            if duration > 0:
+                total_time += duration
+                time_samples += 1
+
+    orders = await RevenueRecognitionService.eligible_orders(session, start=start, end=end)
+    total_orders = len(orders)
+    funnel_sessions["order_placed"].update(str(order.user_id) for order in orders if order.user_id)
+    conversion_base = len(sessions)
+    top_pages = [
+        {"page": page, "views": count}
+        for page, count in sorted(page_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+    ]
+    top_searches = [
+        {"query": query, "count": count}
+        for query, count in sorted(search_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+    ]
+    funnel_keys = ("page_view", "product_view", "cart_add", "checkout_start", "checkout_shipping", "checkout_payment", "order_placed")
+    funnel = []
+    for index, key in enumerate(funnel_keys):
+        count = len(funnel_sessions[key])
+        previous = len(funnel_sessions[funnel_keys[index - 1]]) if index else count
+        funnel.append(
+            {
+                "step": key,
+                "label": {"page_view": "زيارة الموقع", "product_view": "مشاهدة منتج", "cart_add": "إضافة للسلة", "checkout_start": "بدء الدفع", "checkout_shipping": "بيانات الشحن", "checkout_payment": "اختيار الدفع", "order_placed": "إتمام الطلب"}[key],
+                "count": count,
+                "conversionRate": (count / previous * 100) if previous else 0,
+                "dropoffRate": ((previous - count) / previous * 100) if previous else 0,
+            }
+        )
+    return {
+        "data": {
+            "totalVisitors": total_page_views,
+            "uniqueVisitors": len(sessions),
+            "totalOrders": total_orders,
+            "conversionRate": (total_orders / conversion_base * 100) if conversion_base else 0,
+            "avgTimeOnSite": (total_time / time_samples) if time_samples else 0,
+            "topPages": top_pages,
+            "topSearches": top_searches,
+            "deviceBreakdown": {"mobile": mobile_devices, "desktop": desktop_devices},
+            "funnel": funnel,
+            "dailyVisitors": [
+                {"date": date_key, "count": len(visitor_sessions)}
+                for date_key, visitor_sessions in sorted(daily_sessions.items())
+            ],
+        }
+    }
+
+
+def _normalize_loyalty_tier_admin_body(body: Any, *, partial: bool) -> dict[str, Any]:
+    """Keep the admin loyalty form and the JSONB-backed tier contract aligned."""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="loyalty_tier_payload_required")
+
+    values = dict(body)
+    for source, target in {
+        "nameEn": "name_en",
+        "minPoints": "min_points",
+        "discountPercentage": "discount_percentage",
+        "sortOrder": "sort_order",
+        "isActive": "is_active",
+    }.items():
+        if source in values and target not in values:
+            values[target] = values.pop(source)
+
+    allowed = {
+        "name",
+        "name_en",
+        "min_points",
+        "discount_percentage",
+        "benefits",
+        "sort_order",
+        "status",
+        "is_active",
+        "amount",
+        "color",
+    }
+    values = {key: value for key, value in values.items() if key in allowed}
+
+    if not partial or "name" in values:
+        name = str(values.get("name") or "").strip()
+        if len(name) < 2:
+            raise HTTPException(status_code=422, detail="loyalty_tier_name_required")
+        values["name"] = name
+    if "name_en" in values and values["name_en"] is not None:
+        values["name_en"] = str(values["name_en"]).strip() or None
+
+    def normalize_number(field: str, *, integer: bool = False, maximum: Decimal | None = None) -> None:
+        if field not in values or values[field] is None or values[field] == "":
+            return
+        try:
+            number = Decimal(str(values[field]).strip())
+        except (ArithmeticError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=f"invalid_loyalty_{field}") from error
+        if not number.is_finite() or number < 0 or (maximum is not None and number > maximum):
+            raise HTTPException(status_code=422, detail=f"invalid_loyalty_{field}")
+        if integer:
+            if number != number.to_integral_value():
+                raise HTTPException(status_code=422, detail=f"invalid_loyalty_{field}")
+            values[field] = int(number)
+        else:
+            values[field] = float(number)
+
+    normalize_number("min_points", integer=True)
+    normalize_number("discount_percentage", maximum=Decimal("100"))
+    normalize_number("sort_order", integer=True)
+
+    if "benefits" in values:
+        benefits = values["benefits"]
+        if benefits is None:
+            values["benefits"] = []
+        elif isinstance(benefits, str):
+            values["benefits"] = [item.strip() for item in benefits.splitlines() if item.strip()]
+        elif isinstance(benefits, list):
+            values["benefits"] = [str(item).strip() for item in benefits if str(item).strip()]
+        else:
+            raise HTTPException(status_code=422, detail="invalid_loyalty_benefits")
+
+    return values
 
 
 @router.patch("/api/loyalty/admin/tiers/{tier_id}")
 async def api_loyalty_admin_update_tier(tier_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("loyalty_tiers", request, session, staff, tier_id, "update")
+    body = _normalize_loyalty_tier_admin_body(await request.json(), partial=True)
+    if not body:
+        raise HTTPException(status_code=422, detail="loyalty_tier_update_empty")
+    row = await _api_update(session, "loyalty_tiers", tier_id, body, staff, notify_customer=False)
+    await session.commit()
+    return {"data": row}
+
+
+@router.delete("/api/loyalty/admin/tiers/{tier_id}")
+async def api_loyalty_admin_delete_tier(tier_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await _api_delete(session, "loyalty_tiers", tier_id)
+    await session.commit()
+    return {"ok": True}
 
 
 @router.post("/api/loyalty/admin/tiers", status_code=201)
 async def api_loyalty_admin_create_tier(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    body = await request.json()
-    if not isinstance(body, dict) or len(str(body.get("name") or "").strip()) < 2:
-        raise HTTPException(status_code=422, detail="loyalty_tier_name_required")
+    body = _normalize_loyalty_tier_admin_body(await request.json(), partial=False)
     body = {
         **body,
-        "name": str(body.get("name") or "").strip(),
         "status": "active",
         "is_active": True,
     }
@@ -5169,9 +7214,13 @@ async def api_loyalty_admin_update_settings(request: Request, staff: User = Depe
     row = rows[0] if rows else model(name="default", status="active", is_active=True, extra_data={})
     if not rows:
         session.add(row)
+    raw_active = body.get("is_active", body.get("loyalty_active"))
+    if isinstance(raw_active, bool):
+        row.is_active = raw_active
+        row.status = "active" if raw_active else "inactive"
     row.extra_data = _jsonable(body)
     await session.commit()
-    return {"data": serialize_record(row)}
+    return {"data": _loyalty_settings_payload(row)}
 
 
 @router.post("/api/loyalty/admin/points", status_code=201)
@@ -6180,7 +8229,10 @@ async def _ensure_partner_account(
         storefront = storefront_model(
             user_id=partner_user.id,
             partner_id=partner_user.id,
-            name=_first_text(body.get("storeName"), body.get("store_name"), body.get("fullName"), body.get("name"), profile.full_name, default="متجر التاجر"),
+            # A merchant storefront must never be initialized from the
+            # account owner's personal name. Use an explicit store name or a
+            # neutral storefront placeholder until the merchant supplies one.
+            name=_first_text(body.get("storeName"), body.get("store_name"), default="متجر التاجر"),
             email=partner_user.email,
             phone=profile.phone,
             status="active",
@@ -6190,7 +8242,7 @@ async def _ensure_partner_account(
     else:
         storefront.user_id = storefront.user_id or partner_user.id
         storefront.partner_id = storefront.partner_id or partner_user.id
-        storefront.name = storefront.name or _first_text(body.get("storeName"), body.get("store_name"), profile.full_name, default="متجر التاجر")
+        storefront.name = storefront.name or _first_text(body.get("storeName"), body.get("store_name"), default="متجر التاجر")
         storefront.email = storefront.email or partner_user.email
         storefront.phone = storefront.phone or profile.phone
         storefront.status = "active"
@@ -6206,7 +8258,18 @@ async def _ensure_partner_account(
     )
     contract = contract_result.scalars().first()
     if contract is None:
-        contract = contract_model(partner_id=partner_user.id, status="active", is_active=True, extra_data={})
+        contract = contract_model(
+            partner_id=partner_user.id,
+            status="active",
+            is_active=True,
+            extra_data={
+                "subscription_status": "pending_payment",
+                "subscription_plan": "monthly",
+                "subscription_amount": str(get_settings().partner_subscription_amount_yer),
+                "subscription_currency": "YER",
+                "subscription_period_days": get_settings().partner_subscription_period_days,
+            },
+        )
         session.add(contract)
     rate = _partner_rate(body.get("commissionRate", body.get("commission_rate", body.get("rate"))))
     contract.status = "active"
@@ -6364,20 +8427,56 @@ async def api_delete_partner_contract(
 
 @router.post("/api/marketing/marketers", status_code=201)
 async def api_create_marketer(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    body = _normalize_marketer_body(await request.json(), for_create=True)
+    body = _normalize_marketer_body(
+        await _resolve_marketer_user_reference(session, await request.json()),
+        for_create=True,
+    )
     if await session.get(User, body["user_id"]) is None:
         raise HTTPException(status_code=404, detail="marketer_user_not_found")
+    marketer_model = MODEL_BY_TABLE["marketers"]
+    duplicate = await session.execute(
+        select(marketer_model.id)
+        .where(
+            marketer_model.user_id == body["user_id"],
+            marketer_model.deleted_at.is_(None),
+        )
+        .limit(1)
+    )
+    if duplicate.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=409, detail="marketer_user_already_assigned")
     row = await _api_create(session, "marketers", body, staff)
+    if await session.get(UserRole, {"user_id": body["user_id"], "role": "marketer"}) is None:
+        session.add(UserRole(user_id=body["user_id"], role="marketer"))
     await session.commit()
     return {"data": _marketer_payload(row)}
 
 
 @router.patch("/api/marketing/marketers/{marketer_id}")
 async def api_update_marketer(marketer_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    body = _normalize_marketer_body(await request.json())
+    marketer_model = MODEL_BY_TABLE["marketers"]
+    existing_row = await session.get(marketer_model, marketer_id, with_for_update=True)
+    if existing_row is None or existing_row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="marketer_not_found")
+    body = _normalize_marketer_body(
+        await _resolve_marketer_user_reference(session, await request.json())
+    )
     if "user_id" in body and await session.get(User, body["user_id"]) is None:
         raise HTTPException(status_code=404, detail="marketer_user_not_found")
+    next_user_id = body.get("user_id", existing_row.user_id)
+    duplicate = await session.execute(
+        select(marketer_model.id)
+        .where(
+            marketer_model.user_id == next_user_id,
+            marketer_model.id != marketer_id,
+            marketer_model.deleted_at.is_(None),
+        )
+        .limit(1)
+    )
+    if duplicate.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=409, detail="marketer_user_already_assigned")
     row = await _api_update(session, "marketers", marketer_id, body, staff)
+    if await session.get(UserRole, {"user_id": next_user_id, "role": "marketer"}) is None:
+        session.add(UserRole(user_id=next_user_id, role="marketer"))
     await session.commit()
     return {"data": _marketer_payload(row)}
 
@@ -6596,9 +8695,12 @@ async def api_resolve_operational_alert(alert_id: uuid.UUID, request: Request, s
 
 
 def _international_purchase_link_id(row: Any) -> str | None:
-    extra = dict(getattr(row, "extra_data", None) or {}) if not isinstance(row, dict) else row
-    value = _first_text(extra.get("purchase_id"), extra.get("purchaseId"))
-    return value or None
+    if isinstance(row, dict):
+        nested = row.get("extra_data") or row.get("extraData")
+        extra = nested if isinstance(nested, dict) else row
+    else:
+        extra = dict(getattr(row, "extra_data", None) or {})
+    return _canonical_order_link_id(_first_text(extra.get("purchase_id"), extra.get("purchaseId")))
 
 
 async def _international_order_payloads(session: AsyncSession, rows: list[Any]) -> list[dict[str, Any]]:
@@ -6614,6 +8716,11 @@ async def _international_order_payloads(session: AsyncSession, rows: list[Any]) 
             for profile in profile_result.scalars()
         }
     for row, payload in zip(rows, payloads):
+        if not _first_text(payload.get("order_number")):
+            payload["order_number"] = _international_order_number_value(
+                getattr(row, "id", None),
+                getattr(row, "created_at", None),
+            )
         profile = profiles_by_user.get(str(row.user_id)) if getattr(row, "user_id", None) else None
         payload["profiles"] = profile
         linked_purchase_id = _international_purchase_link_id(row)
@@ -6676,16 +8783,90 @@ async def api_international_order_context(order_id: uuid.UUID, staff: User = Dep
     purchase_payloads = [serialize_record(purchase) for purchase in purchases]
     payload["availablePurchases"] = purchase_payloads
     payload["linkedPurchase"] = next(
-        (purchase for purchase in purchase_payloads if str(purchase.get("id")) == linked_purchase_id),
+        (purchase for purchase in purchase_payloads if _canonical_order_link_id(purchase.get("id")) == linked_purchase_id),
         None,
     )
     return {"data": payload}
 
 
+async def _create_international_order_status_notification(
+    session: AsyncSession,
+    *,
+    order: Any,
+    previous_status: str,
+    next_status: str,
+    created_by: uuid.UUID,
+) -> None:
+    ar_status, en_status = _resource_order_status_labels(next_status)
+    await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=order.user_id,
+            title="تم تحديث حالة طلبك الدولي",
+            body=f"حالة طلبك الدولي الآن: {ar_status}.",
+            notification_type="order_status",
+            category="order",
+            priority="high",
+            action_type="open_resource",
+            action_url=f"/international-orders/{order.id}",
+            entity_type="international_orders",
+            entity_id=str(order.id),
+            order_id=order.id,
+            payload={
+                "orderId": str(order.id),
+                "status": next_status,
+                "order_status": next_status,
+                "title_en": "Your international order status was updated",
+                "body_en": f"Your international order status is now {en_status}.",
+                "deep_link": f"/international-orders/{order.id}",
+            },
+            created_by=created_by,
+            source="international_order_status",
+            deduplication_key=f"international-order-status:{order.id}:{previous_status}:{next_status}",
+        )
+    )
+
+
 @router.patch("/api/admin-shopping/international-orders/{order_id}/status")
 @router.patch("/api/admin-shopping/international-orders/{order_id}/assignment")
 async def api_patch_international_order(order_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return await _create_update_delete_resource("international_orders", request, session, staff, order_id, "update")
+    if not request.url.path.endswith("/status"):
+        return await _create_update_delete_resource("international_orders", request, session, staff, order_id, "update")
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="international_order_status_payload_required")
+
+    model = MODEL_BY_TABLE["international_orders"]
+    current = await session.get(model, order_id)
+    if current is None or current.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="international_order_not_found")
+
+    previous_status = str(current.status or "").strip().lower()
+    row = await _api_update(
+        session,
+        "international_orders",
+        order_id,
+        body,
+        staff,
+        notify_customer=False,
+    )
+    next_status = str(current.status or "").strip().lower()
+    notification_created = False
+    if "status" in body and current.user_id and previous_status != next_status:
+        await _create_international_order_status_notification(
+            session,
+            order=current,
+            previous_status=previous_status,
+            next_status=next_status,
+            created_by=staff.id,
+        )
+        notification_created = True
+
+    await session.commit()
+    return {
+        "data": row,
+        "notification": {"in_app": notification_created},
+    }
 
 
 @router.post("/api/admin-shopping/international-orders/{order_id}/pricing")
@@ -6892,10 +9073,25 @@ async def api_international_order_payment_status(order_id: uuid.UUID, request: R
     if row is None:
         raise HTTPException(status_code=404, detail="international_order_not_found")
     extra = dict(row.extra_data or {})
-    extra["payment_status"] = body.get("status") or "paid"
+    previous_status = str(extra.get("payment_status") or "pending").strip().lower()
+    next_status = str(body.get("status") or "paid").strip().lower()
+    extra["payment_status"] = next_status
     row.extra_data = extra
+    if row.user_id and next_status != previous_status:
+        await create_payment_status_notification(
+            session,
+            user_id=row.user_id,
+            status=next_status,
+            international=True,
+            entity_type="international_orders",
+            entity_id=str(row.id),
+            action_url=f"/international-orders/{row.id}",
+            created_by=staff.id,
+            source="international_order_payment",
+            deduplication_key=f"international-payment-status:{row.id}:{previous_status}:{next_status}",
+        )
     await session.commit()
-    return {"data": serialize_record(row)}
+    return {"data": serialize_record(row), "notification": {"in_app": bool(row.user_id and next_status != previous_status)}}
 
 
 @router.post("/api/admin-shopping/international-orders/{order_id}/link-purchase")
@@ -7021,10 +9217,11 @@ async def api_patch_local_shopping_request(request_id: uuid.UUID, request: Reque
     local_request = await session.get(model, request_id)
     if local_request is None:
         raise HTTPException(status_code=404, detail="record_not_found")
+    body = await request.json()
     previous_status = _local_request_status_key(local_request.status)
-    row = await _api_update(session, "local_shopping_requests", request_id, await request.json(), staff)
-    next_status = _local_request_status_key(local_request.status)
-    if next_status != previous_status and local_request.user_id is not None:
+    row = await _api_update(session, "local_shopping_requests", request_id, body, staff)
+    next_status = _local_request_status_key(body.get("status")) if isinstance(body, dict) and "status" in body else previous_status
+    if next_status != previous_status:
         await _create_local_request_notification(
             session,
             user_id=local_request.user_id,
@@ -7079,6 +9276,20 @@ async def api_create_local_payment(
         "local_request_id": str(request_id),
     }
     row = await _api_create(session, "order_payments", payload, staff)
+    payment_status = str(payload["status"] or "pending").strip().lower()
+    if payment_status in LOCAL_PAYMENT_SUCCESS_STATUSES:
+        await create_payment_status_notification(
+            session,
+            user_id=local_request.user_id,
+            status=payment_status,
+            international=False,
+            entity_type="local_shopping_requests",
+            entity_id=str(request_id),
+            action_url="/local-shopping",
+            created_by=staff.id,
+            source="local_shopping_payment",
+            deduplication_key=f"local-payment-created:{row.get('id')}:{payment_status}",
+        )
     await session.commit()
     return {"data": row}
 
@@ -7364,22 +9575,6 @@ async def api_import_products(request: Request, staff: User = Depends(require_st
         status_code=200,
         content={"data": {"success": success, "failed": failed, "errors": errors[:200], "truncated": len(products) > 5000}},
     )
-
-
-@router.post("/api/analytics/events", status_code=201)
-async def api_create_analytics_event(request: Request, user: User | None = Depends(optional_user), session: AsyncSession = Depends(get_session)):
-    body = await request.json()
-    events = body if isinstance(body, list) else [body]
-    rows = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        event_type = event.get("type") or event.get("event_type") or event.get("event") or "event"
-        description = event.get("description") or event.get("page_path") or event.get("session_id") or ""
-        values = {**event, "user_id": user.id if user is not None else None, "type": str(event_type), "description": str(description)}
-        rows.append(await _api_create(session, "analytics_events", values, user))
-    await session.commit()
-    return {"data": rows if isinstance(body, list) else (rows[0] if rows else None)}
 
 
 @router.get("/api/engagement/products/{product_id}/likes")
@@ -7761,6 +9956,15 @@ def _normalize_admin_body(
     for_create: bool = False,
 ) -> dict[str, Any]:
     values = dict(body)
+    if table == "international_orders" and for_create:
+        # International requests use the same customer-facing order-number
+        # contract as checkout orders. Generate it on the server so every
+        # request is searchable and traceable from its first insert.
+        values["order_number"] = _international_order_number_value(
+            uuid.uuid4(),
+            datetime.now(timezone.utc),
+        )
+        values.pop("orderNumber", None)
     if table in {"suppliers", "local_merchants"}:
         # Supplier/merchant forms are shared by the web dashboard and the
         # Flutter dashboard. Keep both naming conventions in one backend
@@ -7834,6 +10038,14 @@ def _normalize_admin_body(
             values["name"] = values["form_key"]
         if "form_name" in values and "type" not in values:
             values["type"] = values["form_name"]
+        settings = values.get("settings")
+        if isinstance(settings, dict):
+            values["settings"] = {
+                **settings,
+                "displayLocation": settings.get("displayLocation") or "contact",
+            }
+        elif for_create:
+            values["settings"] = {"displayLocation": "contact"}
         values.setdefault("status", "active")
     if table == "banners":
         if "link_url" in values and "url" not in values:
@@ -7923,7 +10135,15 @@ async def _api_create(session: AsyncSession, table: str, body: dict[str, Any], a
     return await _create_resource_row(session, table, _normalize_admin_body(table, body, actor, for_create=True))
 
 
-async def _api_update(session: AsyncSession, table: str, record_id: uuid.UUID, body: dict[str, Any], actor: User | None = None) -> dict[str, Any]:
+async def _api_update(
+    session: AsyncSession,
+    table: str,
+    record_id: uuid.UUID,
+    body: dict[str, Any],
+    actor: User | None = None,
+    *,
+    notify_customer: bool = True,
+) -> dict[str, Any]:
     if table == "categories":
         return await update_category_record(session, record_id, _normalize_admin_body(table, body, actor))
     model = MODEL_BY_TABLE[table]
@@ -7934,6 +10154,7 @@ async def _api_update(session: AsyncSession, table: str, record_id: uuid.UUID, b
     previous = {
         "status": getattr(row, "status", None),
         "approval_status": getattr(row, "approval_status", None),
+        "classification": getattr(row, "classification", None),
         "amount": getattr(row, "amount", None),
         "extra_data": dict(getattr(row, "extra_data", None) or {}),
     }
@@ -7945,7 +10166,7 @@ async def _api_update(session: AsyncSession, table: str, record_id: uuid.UUID, b
             extra[key] = _jsonable(value)
     if "extra_data" in model.__table__.c:
         row.extra_data = extra
-    if table == "international_orders":
+    if notify_customer:
         await _notify_customer_resource_update(
             session,
             table,
@@ -7963,6 +10184,15 @@ async def _api_delete(session: AsyncSession, table: str, record_id: uuid.UUID) -
         await soft_delete_category_record(session, record_id)
         return
     model = MODEL_BY_TABLE[table]
+    if table == "loyalty_tiers":
+        row = await session.get(model, record_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="record_not_found")
+        row.is_active = False
+        row.status = "deleted"
+        row.deleted_at = datetime.now(timezone.utc)
+        await session.flush()
+        return
     await session.execute(delete(model).where(model.id == record_id))
 
 
@@ -8120,6 +10350,78 @@ async def api_create_admin_courier(request: Request, staff: User = Depends(requi
     return await _create_update_delete_resource("couriers", request, session, staff)
 
 
+@router.get("/api/admin/courier-users/options")
+async def api_courier_user_options(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    courier_user_ids = select(UserRole.user_id).where(UserRole.role.in_(("courier", "delivery")))
+    rows = (
+        await session.execute(
+            select(User, Profile)
+            .outerjoin(Profile, Profile.user_id == User.id)
+            .where(
+                User.deleted_at.is_(None),
+                User.is_active.is_(True),
+                User.id.in_(courier_user_ids),
+            )
+            .order_by(Profile.full_name.asc().nullslast(), User.email.asc())
+        )
+    ).all()
+    return {"data": [
+        {
+            "id": str(user.id),
+            "user_id": str(user.id),
+            "email": user.email,
+            "full_name": profile.full_name if profile else user.email,
+        }
+        for user, profile in rows
+    ]}
+
+
+@router.patch("/api/admin/couriers/{record_id}/account")
+async def api_link_admin_courier_account(
+    record_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    if not isinstance(body, dict) or ("user_id" not in body and "userId" not in body):
+        raise HTTPException(status_code=422, detail="courier_account_required")
+    raw_user_id = body.get("user_id") if "user_id" in body else body.get("userId")
+    user_id = None if raw_user_id in (None, "", "null", "unassigned") else _uuid(raw_user_id, "user_id")
+    courier_model = MODEL_BY_TABLE["couriers"]
+    courier = await session.get(courier_model, record_id, with_for_update=True)
+    if courier is None or courier.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="courier_not_found")
+    if user_id is not None:
+        user = await session.get(User, user_id)
+        if user is None or user.deleted_at is not None or user.is_active is False:
+            raise HTTPException(status_code=404, detail="courier_account_not_found")
+        role_exists = (
+            await session.execute(
+                select(UserRole.user_id).where(
+                    UserRole.user_id == user_id,
+                    UserRole.role.in_(("courier", "delivery")),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if role_exists is None:
+            raise HTTPException(status_code=409, detail="courier_account_role_required")
+        already_linked = (
+            await session.execute(
+                select(courier_model.id).where(
+                    courier_model.user_id == user_id,
+                    courier_model.id != record_id,
+                    courier_model.deleted_at.is_(None),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if already_linked is not None:
+            raise HTTPException(status_code=409, detail="courier_account_already_linked")
+    courier.user_id = user_id
+    await session.commit()
+    return {"data": serialize_record(courier), "account_linked": user_id is not None}
+
+
 @router.patch("/api/admin/couriers/{record_id}")
 async def api_update_admin_courier(record_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return await _create_update_delete_resource("couriers", request, session, staff, record_id, "update")
@@ -8168,12 +10470,41 @@ async def api_content_admin_settings(staff: User = Depends(require_staff), sessi
 @router.patch("/api/content/settings/{setting_key}")
 async def api_content_update_setting(setting_key: str, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="setting_payload_required")
     model = MODEL_BY_TABLE["site_settings"]
-    rows = await _rows(session, "site_settings", clauses=(model.name == setting_key,), limit=1)
-    row = rows[0] if rows else model(name=setting_key, status="active", is_active=True)
+    columns = model.__table__.c
+    clauses = []
+    if "name" in columns:
+        clauses.append(columns.name == setting_key)
+    if "setting_key" in columns:
+        clauses.append(columns.setting_key == setting_key)
+    if "extra_data" in columns:
+        clauses.append(columns.extra_data["setting_key"].astext == setting_key)
+    order_by = []
+    if "name" in columns:
+        order_by.append((columns.name == setting_key).desc())
+    if "updated_at" in columns:
+        order_by.append(columns.updated_at.desc())
+    rows = await _rows(
+        session,
+        "site_settings",
+        clauses=(or_(*clauses),) if clauses else (),
+        limit=50,
+        order_by=tuple(order_by),
+    )
+    row = next((item for item in rows if getattr(item, "name", None) == setting_key), rows[0] if rows else None)
+    row = row or model(name=setting_key, status="active", is_active=True)
     if not rows:
         session.add(row)
-    row.extra_data = body.get("value") if isinstance(body.get("value"), dict) else body
+    if "name" in columns:
+        row.name = setting_key
+    if "status" in columns:
+        row.status = "active"
+    if "is_active" in columns:
+        row.is_active = True
+    if "extra_data" in columns:
+        row.extra_data = body.get("value") if isinstance(body.get("value"), dict) else body
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -8371,6 +10702,85 @@ async def api_content_theme_templates(
     return {"data": templates}
 
 
+@router.post("/api/content/theme/templates", status_code=201)
+async def api_content_create_theme_template(
+    request: Request,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    """Persist a named snapshot of the current design settings."""
+    ThemeAdminService.require_access(roles)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="template_payload_required")
+
+    name = str(body.get("name") or "").strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=422, detail="template_name_required")
+    settings = body.get("settings")
+    if not isinstance(settings, dict) or not settings:
+        raise HTTPException(status_code=422, detail="template_settings_required")
+    if not _theme_payload_safe(body):
+        raise HTTPException(status_code=422, detail="invalid_theme_payload")
+
+    model = MODEL_BY_TABLE["theme_settings"]
+    existing = await _rows(
+        session,
+        "theme_settings",
+        clauses=(model.status == "template",),
+        limit=100,
+    )
+    normalized_name = name.casefold()
+    if any(
+        str((row.extra_data or {}).get("name") or "").strip().casefold() == normalized_name
+        for row in existing
+    ):
+        raise HTTPException(status_code=409, detail="template_name_exists")
+
+    next_order = max(
+        [int((row.extra_data or {}).get("sort_order") or 0) for row in existing] or [0]
+    ) + 1
+    row = model(
+        name=f"template:{uuid.uuid4()}",
+        status="template",
+        is_active=True,
+        extra_data={
+            "name": name,
+            "name_en": str(body.get("name_en") or "").strip() or None,
+            "description": str(body.get("description") or "").strip() or None,
+            "preview_image": body.get("preview_image") or body.get("previewImage"),
+            "settings": _jsonable(settings),
+            "is_default": False,
+            "sort_order": next_order,
+            "created_by": str(staff.id),
+        },
+    )
+    session.add(row)
+    session.add(
+        MODEL_BY_TABLE["audit_logs"](
+            user_id=staff.id,
+            type="theme.template.create",
+            description=f"Created theme template {name}",
+        )
+    )
+    await session.commit()
+    return {
+        "data": {
+            "id": str(row.id),
+            "name": name,
+            "name_en": row.extra_data.get("name_en"),
+            "description": row.extra_data.get("description"),
+            "preview_image": row.extra_data.get("preview_image"),
+            "settings": _jsonable(settings),
+            "is_active": True,
+            "is_default": False,
+            "sort_order": next_order,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+    }
+
+
 @router.post("/api/content/theme/templates/{template_id}/apply")
 async def api_content_apply_theme_template(template_id: uuid.UUID, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     ThemeAdminService.require_access(roles)
@@ -8518,6 +10928,10 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
     table = CONTENT_TABLES.get(section_key)
     if table is None:
         raise HTTPException(status_code=404, detail="content_section_not_found")
+    staff_reader = False
+    if section_key == "custom-elements" and user is not None:
+        role_rows = await session.execute(select(UserRole.role).where(UserRole.user_id == user.id))
+        staff_reader = bool(set(role_rows.scalars()).intersection({"admin", "manager", "staff", "employee"}))
     if admin:
         if user is None:
             raise HTTPException(status_code=401, detail="authentication_required")
@@ -8527,6 +10941,53 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
         if section_key == "sections" and (page or "home") == "home":
             await _ensure_home_page_sections(session)
     rows = await _resource_data(session, table)
+    if section_key == "theme" and admin:
+        # The design editor reads this collection as the current theme. Audit
+        # history, preview tokens, and saved templates are separate resources;
+        # returning them here lets an older client treat their metadata as a
+        # live setting and overwrite the value it just saved.
+        rows = [
+            row
+            for row in rows
+            if str(row.get("status") or "").strip().lower() in {"active", "draft"}
+            and str(row.get("name") or "") != "active_template"
+            and not str(row.get("name") or "").startswith(("history:", "preview:", "template:"))
+        ]
+        # Older content edits stored the hero image in site_content under
+        # hero_banner. Hydrate the canonical theme hero from that value when
+        # the theme row is missing, so the design editor does not show a blank
+        # uploader for an already-published image.
+        legacy_hero = next(
+            (
+                payload
+                for payload in (_site_content_payload(row) for row in await _public_rows(session, "site_content", limit=100))
+                if str(payload.get("key") or payload.get("name") or "") == "hero_banner"
+            ),
+            None,
+        )
+        if legacy_hero:
+            theme_hero = next(
+                (row for row in rows if str(row.get("key") or row.get("name") or "") == "hero"),
+                None,
+            )
+            legacy_value = {
+                "title": legacy_hero.get("title") or "",
+                "subtitle": legacy_hero.get("content") or "",
+                "imageUrl": legacy_hero.get("image_url") or legacy_hero.get("imageUrl") or "",
+                **(legacy_hero.get("metadata") if isinstance(legacy_hero.get("metadata"), dict) else {}),
+            }
+            if theme_hero is None:
+                rows.append({
+                    "key": "hero",
+                    "name": "hero",
+                    "status": "active",
+                    "is_active": True,
+                    "value": legacy_value,
+                })
+            else:
+                current_value = theme_hero.get("value") if isinstance(theme_hero.get("value"), dict) else {}
+                if not current_value.get("imageUrl") and not current_value.get("image_url"):
+                    theme_hero["value"] = {**legacy_value, **current_value}
     if section_key == "blog":
         rows = [_blog_article_payload(row) for row in await _blog_source_rows(session)]
         if not admin:
@@ -8534,7 +10995,7 @@ async def api_content_section(section_key: str, page: str | None = None, key: st
         if category and category != "all":
             rows = [row for row in rows if row.get("category") == category]
         return {"data": rows}
-    if not admin:
+    if not admin and not staff_reader:
         rows = _public_content_rows(rows)
         if section_key == "theme":
             rows = [
@@ -8931,6 +11392,155 @@ async def api_assign_order(order_id: uuid.UUID, request: Request, staff: User = 
     return {"data": serialize_record(row)}
 
 
+def _assignment_is_current(row: Any) -> bool:
+    extra_data = getattr(row, "extra_data", None)
+    return not isinstance(extra_data, dict) or extra_data.get("is_current") is not False
+
+
+async def _admin_order_courier_assignment(
+    session: AsyncSession,
+    order_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+) -> tuple[Any | None, Any | None]:
+    assignment_model = MODEL_BY_TABLE["courier_assignments"]
+    statement = select(assignment_model).where(
+        assignment_model.order_id == order_id,
+        assignment_model.deleted_at.is_(None),
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    rows = list((await session.execute(statement)).scalars())
+    candidates = [
+        row
+        for row in rows
+        if _assignment_is_current(row)
+        and str(getattr(row, "status", "") or "").strip().lower()
+        not in {"cancelled", "failed"}
+    ]
+    assignment = max(
+        candidates,
+        key=lambda row: str(getattr(row, "created_at", "") or ""),
+        default=None,
+    )
+    if assignment is None:
+        return None, None
+    courier_model = MODEL_BY_TABLE["couriers"]
+    courier = (
+        await session.execute(
+            select(courier_model).where(
+                or_(
+                    courier_model.id == assignment.courier_id,
+                    courier_model.user_id == assignment.courier_id,
+                    courier_model.id == assignment.user_id,
+                    courier_model.user_id == assignment.user_id,
+                ),
+                courier_model.deleted_at.is_(None),
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    return assignment, courier
+
+
+@router.get("/api/admin/orders/{order_id}/courier-assignment")
+async def api_get_order_courier_assignment(
+    order_id: uuid.UUID,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    order = await session.get(Order, order_id)
+    if order is None or order.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    assignment, courier = await _admin_order_courier_assignment(session, order_id)
+    courier_map = {}
+    if courier is not None:
+        courier_map = {str(courier.id): courier}
+        if getattr(courier, "user_id", None):
+            courier_map[str(courier.user_id)] = courier
+    data = _courier_assignment_payload(assignment, courier_map) if assignment is not None else None
+    return {"data": data, "courier_linked": bool(data and data.get("courier_linked"))}
+
+
+@router.patch("/api/admin/orders/{order_id}/courier-assignment")
+async def api_set_order_courier_assignment(
+    order_id: uuid.UUID,
+    request: Request,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    order = await session.get(Order, order_id, with_for_update=True)
+    if order is None or order.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="courier_assignment_payload_required")
+    raw_courier_id = body.get("courier_id") or body.get("courierId")
+    requested_id = None if raw_courier_id in (None, "", "unassigned", "null") else _uuid(raw_courier_id, "courier_id")
+    assignment_model = MODEL_BY_TABLE["courier_assignments"]
+    current_rows = list(
+        (
+            await session.execute(
+                select(assignment_model)
+                .where(
+                    assignment_model.order_id == order_id,
+                    assignment_model.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    courier = None
+    if requested_id is not None:
+        courier_model = MODEL_BY_TABLE["couriers"]
+        courier = (
+            await session.execute(
+                select(courier_model).where(
+                    or_(courier_model.id == requested_id, courier_model.user_id == requested_id),
+                    courier_model.deleted_at.is_(None),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if courier is None:
+            raise HTTPException(status_code=404, detail="courier_not_found")
+        courier_status = str(getattr(courier, "status", "active") or "active").strip().lower()
+        if courier_status in {"inactive", "disabled", "deleted"} or getattr(courier, "is_active", True) is False:
+            raise HTTPException(status_code=409, detail="courier_inactive")
+        if not getattr(courier, "user_id", None):
+            raise HTTPException(status_code=409, detail="courier_account_not_linked")
+
+    for old_assignment in current_rows:
+        if not _assignment_is_current(old_assignment):
+            continue
+        old_extra = dict(getattr(old_assignment, "extra_data", None) or {})
+        old_extra.update({"is_current": False, "unassigned_by": str(staff.id)})
+        old_assignment.extra_data = old_extra
+        old_status = str(getattr(old_assignment, "status", "") or "").strip().lower()
+        if old_status in set(COURIER_ACTIVE_STATUSES):
+            old_assignment.status = "cancelled"
+
+    assignment = None
+    if courier is not None:
+        assignment = assignment_model(
+            courier_id=courier.id,
+            user_id=courier.user_id,
+            order_id=order_id,
+            status="assigned",
+            extra_data={
+                "is_current": True,
+                "assigned_by": str(staff.id),
+                "source": "admin_order_workflow",
+            },
+        )
+        session.add(assignment)
+        await session.flush()
+    await session.commit()
+    courier_map = {}
+    if courier is not None:
+        courier_map = {str(courier.id): courier, str(courier.user_id): courier}
+    data = _courier_assignment_payload(assignment, courier_map) if assignment is not None else None
+    return {"data": data, "courier_linked": bool(data and data.get("courier_linked"))}
+
+
 @router.post("/api/admin/orders/{order_id}/invoice-email", status_code=202)
 async def api_order_invoice_email(order_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     row = await session.get(Order, order_id)
@@ -9140,11 +11750,21 @@ def _validated_public_contact_message(body: Any) -> dict[str, Any]:
 
 
 @router.post("/api/communication/contact", status_code=201)
-async def api_create_contact_message(request: Request, session: AsyncSession = Depends(get_session)):
+async def api_create_contact_message(
+    request: Request,
+    user: User | None = Depends(optional_user),
+    session: AsyncSession = Depends(get_session),
+):
+    # Contact remains available to guests, but a signed-in customer must be
+    # attached server-side so an admin reply can always create the customer's
+    # in-app/mobile notification without relying on a manually typed email.
+    payload = _validated_public_contact_message(await request.json())
+    if user is not None:
+        payload["user_id"] = user.id
     row = await _api_create(
         session,
         "contact_messages",
-        _validated_public_contact_message(await request.json()),
+        payload,
     )
     await session.commit()
     return {"data": row}
@@ -10961,8 +13581,10 @@ async def theme_settings(session: AsyncSession = Depends(get_session)):
             model.deleted_at.is_(None),
             model.status == "active",
             model.is_active.is_(True),
+            model.name != "active_template",
             ~model.name.like("history:%"),
             ~model.name.like("preview:%"),
+            ~model.name.like("template:%"),
         ),
         order_by=(model.updated_at.desc(), model.created_at.desc()),
         limit=1,

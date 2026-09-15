@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 from sqlalchemy import func, literal_column, or_, select, text
@@ -39,6 +40,39 @@ def money_or_zero(value: Any) -> Decimal:
 
 LOCAL_PAYMENT_SUCCESS_STATUSES = ("confirmed", "approved", "paid", "completed")
 LOYALTY_EARNING_ORDER_STATUSES = frozenset({"delivered", "completed"})
+
+
+def _safe_local_product_url(value: Any) -> str | None:
+    """Return only absolute HTTPS links without embedded credentials."""
+
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    return candidate
+
+
+def _local_request_image_url(request_id: str, value: Any) -> str | None:
+    """Turn a private file reference into the authenticated attachment route."""
+
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    if candidate.lower().startswith("file:"):
+        asset_id = candidate.split(":", 1)[1].strip()
+        try:
+            uuid.UUID(asset_id)
+        except (TypeError, ValueError):
+            return None
+        return f"/api/shopping/local/requests/{request_id}/attachments/{asset_id}"
+    if candidate.startswith(("/uploads/", "/api/uploads/", "https://")):
+        return candidate
+    return None
 
 
 @dataclass(frozen=True)
@@ -202,8 +236,16 @@ async def loyalty_program_settings(session: AsyncSession) -> LoyaltyProgramSetti
 
     data = dict(getattr(row, "extra_data", {}) or {})
     status = str(getattr(row, "status", "active") or "active").strip().lower()
+    stored_active = data.get(
+        "is_active",
+        data.get("loyalty_active", getattr(row, "is_active", True)),
+    )
+    if isinstance(stored_active, str):
+        active = stored_active.strip().lower() not in {"false", "0", "off", "inactive"}
+    else:
+        active = bool(stored_active)
     return LoyaltyProgramSettings(
-        is_active=bool(getattr(row, "is_active", True)) and status in {"active", "enabled", "published"},
+        is_active=active and status in {"active", "enabled", "published"},
         points_per_currency=_positive_whole_number(
             data.get("points_per_currency", data.get("pointsPerCurrency")),
             1000,
@@ -355,11 +397,64 @@ async def serialize_local_shopping_requests(
     session: AsyncSession,
     requests: list[Any],
 ) -> list[dict[str, Any]]:
-    """Serialize local requests with payment totals derived from confirmed ledger rows."""
+    """Serialize local requests with one stable customer-facing data contract."""
 
     payloads = [serialize_record(request) for request in requests]
     if not requests:
         return payloads
+
+    for request, payload in zip(requests, payloads):
+        request_id = str(request.id)
+        raw_images = payload.get("image_urls")
+        image_values = raw_images if isinstance(raw_images, list) else []
+        normalized_images = [
+            normalized
+            for normalized in (_local_request_image_url(request_id, value) for value in image_values)
+            if normalized
+        ]
+        payload["image_urls"] = normalized_images
+        payload.setdefault("order_number", f"LS-{request_id[:8].upper()}")
+
+        raw_items = payload.get("items")
+        items = raw_items if isinstance(raw_items, list) else []
+        if not items:
+            items = [{}]
+        request_description = payload.get("product_description") or payload.get("description") or "منتج التسوق المحلي"
+        payload.setdefault("product_description", request_description)
+        request_url = payload.get("product_url") or payload.get("url")
+        normalized_items: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(items):
+            item = dict(raw_item) if isinstance(raw_item, dict) else {}
+            item_images = item.get("image_urls") if isinstance(item.get("image_urls"), list) else []
+            item_image = item.get("product_image_url") or item.get("image_url") or (item_images[0] if item_images else None)
+            item["product_name"] = (
+                item.get("product_name")
+                or item.get("product_description")
+                or item.get("description")
+                or request_description
+            )
+            item["product_image_url"] = _local_request_image_url(request_id, item_image) or (normalized_images[0] if normalized_images else None)
+            raw_product_url = item.get("product_url") or item.get("url") or request_url
+            safe_product_url = _safe_local_product_url(raw_product_url)
+            if safe_product_url:
+                item["product_url"] = safe_product_url
+                item["product_url_is_safe"] = True
+            else:
+                item.pop("product_url", None)
+                item["product_url_is_safe"] = False
+                if raw_product_url:
+                    item["unsafe_product_url"] = True
+            item.setdefault("id", f"{request_id}-{index + 1}")
+            item.setdefault("quantity", payload.get("quantity") or 1)
+            normalized_items.append(item)
+        payload["items"] = normalized_items
+        request_raw_url = _safe_local_product_url(request_url)
+        if request_raw_url:
+            payload["product_url"] = request_raw_url
+            payload["product_url_is_safe"] = True
+        elif request_url:
+            payload.pop("product_url", None)
+            payload["product_url_is_safe"] = False
 
     request_ids = [str(request.id) for request in requests]
     payment_model = MODEL_BY_TABLE["order_payments"]
@@ -685,7 +780,11 @@ async def calculate_checkout_financials(
     loyalty_discount, loyalty_meta = await _loyalty_discount(
         session,
         user_id=user_id,
-        requested_points=body.get("loyaltyPointsToRedeem") or body.get("loyaltyPoints"),
+        requested_points=(
+            body.get("loyaltyPointsToRedeem")
+            or body.get("loyaltyPointsRedeemed")
+            or body.get("loyaltyPoints")
+        ),
         eligible_amount=after_coupon,
     )
     shipping_total, shipping_source, shipping_meta = await _shipping_total(session, body)

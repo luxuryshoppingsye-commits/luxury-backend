@@ -31,6 +31,8 @@ services:
         generateValue: true
       - key: JWT_REFRESH_TOKEN_DAYS
         value: "365"
+      - key: AUTH_SESSION_MAX_HOURS
+        value: "5"
       - key: RENDER_PUBLIC_URL
         # Render exposes the real public service URL automatically. Map it to
         # the setting name used by the FastAPI application instead of keeping

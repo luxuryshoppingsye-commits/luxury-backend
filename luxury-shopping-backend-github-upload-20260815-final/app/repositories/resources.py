@@ -182,7 +182,11 @@ async def _notify_customer_resource_update(
     """Create customer/partner notifications for generic staff resource edits."""
     if not actor_id:
         return
-    from ..services.notification_service import NotificationPayload, NotificationService
+    from ..services.notification_service import (
+        NotificationPayload,
+        NotificationService,
+        create_payment_status_notification,
+    )
 
     target_id = None
     notification_type = None
@@ -253,6 +257,163 @@ async def _notify_customer_resource_update(
             "deep_link": f"/international-orders/{entity_id}",
         }
         action_url = payload["deep_link"]
+    elif table == "local_shopping_requests":
+        target_id = getattr(record, "user_id", None)
+        old_status = _resource_status(previous.get("status"))
+        new_status = _resource_status(getattr(record, "status", None))
+        old_extra = previous.get("extra_data") if isinstance(previous.get("extra_data"), dict) else {}
+        new_extra = getattr(record, "extra_data", None) if isinstance(getattr(record, "extra_data", None), dict) else {}
+        pricing_keys = {
+            "amount",
+            "estimated_amount",
+            "estimatedAmount",
+            "estimated_price",
+            "estimatedPrice",
+            "quoted_amount",
+            "quotedAmount",
+            "final_price",
+            "finalPrice",
+            "final_cost",
+            "finalCost",
+        }
+        pricing_changed = (
+            "amount" in changed_data
+            and not _resource_values_equal(previous.get("amount"), getattr(record, "amount", None))
+        ) or any(
+            key in changed_data
+            and not _resource_values_equal(old_extra.get(key), new_extra.get(key))
+            for key in pricing_keys
+        ) or (
+            "extra_data" in changed_data
+            and any(
+                not _resource_values_equal(old_extra.get(key), new_extra.get(key))
+                for key in pricing_keys
+            )
+        )
+        status_changed = "status" in changed_data and old_status != new_status
+        old_payment_status = _resource_status(old_extra.get("payment_status"))
+        new_payment_status = _resource_status(new_extra.get("payment_status"))
+        payment_status_changed = (
+            any(key in changed_data for key in ("payment_status", "paymentStatus"))
+            and old_payment_status != new_payment_status
+        )
+        if not target_id:
+            return
+        if payment_status_changed:
+            await create_payment_status_notification(
+                session,
+                user_id=target_id,
+                status=new_payment_status,
+                international=False,
+                entity_type="local_shopping_requests",
+                entity_id=entity_id,
+                action_url="/local-shopping",
+                created_by=actor_id,
+                source="local_shopping_payment",
+                deduplication_key=f"local-payment-status:{entity_id}:{old_payment_status}:{new_payment_status}",
+            )
+        if not (status_changed or pricing_changed):
+            return
+        if status_changed:
+            status_labels_ar = {
+                "pending": "قيد الانتظار",
+                "reviewing": "قيد المراجعة",
+                "approved": "تمت الموافقة",
+                "confirmed": "تم تأكيد الطلب المحلي",
+                "purchasing": "جاري شراء الطلب المحلي",
+                "purchased": "تم شراء الطلب المحلي",
+                "processing": "قيد التجهيز",
+                "shipping": "جاري شحن الطلب المحلي",
+                "shipped": "تم الشحن",
+                "ready": "الطلب المحلي جاهز للتسليم",
+                "delivered": "تم التسليم",
+                "rejected": "مرفوض",
+                "cancelled": "ملغى",
+            }
+            status_labels_en = {
+                "pending": "pending",
+                "reviewing": "under review",
+                "approved": "approved",
+                "confirmed": "local request confirmed",
+                "purchasing": "being purchased",
+                "purchased": "purchased",
+                "processing": "being prepared",
+                "shipping": "being shipped",
+                "shipped": "shipped",
+                "ready": "ready for delivery",
+                "delivered": "delivered",
+                "rejected": "rejected",
+                "cancelled": "cancelled",
+            }
+            status_ar = status_labels_ar.get(new_status, new_status.replace("_", " "))
+            status_en = status_labels_en.get(new_status, new_status.replace("_", " ").title())
+            title = "تم تحديث حالة طلب التسوق المحلي"
+            body = f"حالة طلب التسوق المحلي الآن: {status_ar}."
+            title_en = "Local shopping request status updated"
+            body_en = f"Your local shopping request status is now {status_en}."
+            notification_type = "order_status"
+        else:
+            amount = (
+                getattr(record, "amount", None)
+                or new_extra.get("final_price")
+                or new_extra.get("finalPrice")
+                or new_extra.get("final_cost")
+                or new_extra.get("finalCost")
+                or new_extra.get("estimated_price")
+                or new_extra.get("estimatedPrice")
+            )
+            currency = new_extra.get("currency_code") or new_extra.get("currencyCode") or "YER"
+            title = "تم تحديث تسعير طلبك المحلي"
+            body = f"تم تحديث تسعير طلب التسوق المحلي إلى {amount} {currency}. يرجى مراجعة الطلب."
+            title_en = "Your local shopping request pricing was updated"
+            body_en = f"Your local shopping request pricing was updated. New total: {amount} {currency}. Please review the request."
+            notification_type = "order_update"
+        payload = {
+            "localRequestId": entity_id,
+            "local_request_id": entity_id,
+            "status": new_status,
+            "order_status": new_status,
+            "title_en": title_en,
+            "body_en": body_en,
+            "deep_link": "/local-shopping",
+        }
+        action_url = "/local-shopping"
+    elif table in {"order_payments", "international_order_payments"}:
+        old_status = _resource_status(previous.get("status"))
+        new_status = _resource_status(getattr(record, "status", None))
+        if old_status == new_status:
+            return
+        international = table == "international_order_payments"
+        parent = None
+        local_request = False
+        if international:
+            parent_model = MODEL_BY_TABLE["international_orders"]
+            parent = await session.get(parent_model, getattr(record, "order_id", None))
+        elif getattr(record, "order_id", None):
+            parent = await session.get(MODEL_BY_TABLE["orders"], record.order_id)
+        else:
+            local_request_id = _resource_extra_value(record, "local_request_id")
+            if local_request_id:
+                parent = await session.get(MODEL_BY_TABLE["local_shopping_requests"], local_request_id)
+                local_request = True
+        target_id = getattr(parent, "user_id", None) if parent is not None else None
+        if not target_id or parent is None:
+            return
+        parent_id = str(getattr(parent, "id", ""))
+        await create_payment_status_notification(
+            session,
+            user_id=target_id,
+            status=new_status,
+            international=international,
+            entity_type="international_orders" if international else "local_shopping_requests" if local_request else "orders",
+            entity_id=parent_id,
+            action_url=f"/international-orders/{parent_id}" if international else "/local-shopping" if local_request else f"/orders/{parent_id}",
+            order_id=None if international or local_request else getattr(parent, "id", None),
+            created_by=actor_id,
+            source="finance",
+            deduplication_key=f"payment-status:{table}:{record.id}:{new_status}:{datetime.now().astimezone().isoformat()}",
+        )
+        return
     elif table == "products":
         old_status = _resource_status(previous.get("approval_status"))
         new_status = _resource_status(getattr(record, "approval_status", None))
@@ -330,6 +491,47 @@ async def _notify_customer_resource_update(
             "deep_link": "/partner/products" if storefront else "/partner/applications",
         }
         action_url = payload["deep_link"]
+    elif table == "profiles":
+        target_id = getattr(record, "user_id", None)
+        old_classification = str(previous.get("classification") or "").strip()
+        new_classification = str(getattr(record, "classification", None) or "").strip()
+        classification_changed = (
+            any(key in changed_data for key in ("classification", "customer_classification", "customerClassification"))
+            and old_classification != new_classification
+        )
+        if not target_id or not classification_changed:
+            return
+        normalized_classification = new_classification.lower().replace("_", " ")
+        is_special_customer = normalized_classification in {
+            "premium",
+            "vip",
+            "featured",
+            "special",
+            "مميز",
+            "مميزة",
+            "عميل مميز",
+            "عميلة مميزة",
+        } or ("مميز" in normalized_classification and "غير" not in normalized_classification)
+        if is_special_customer:
+            title = "تهانينا! أصبحت عميلاً مميزاً"
+            body = "تم تفعيل تصنيفك كعميل مميز. يمكنك الآن الاستفادة من المزايا المتاحة لك عبر برنامج الولاء."
+            title_en = "Congratulations! You are now a premium customer"
+            body_en = "Your premium customer status is now active. Open the loyalty program to view your available benefits."
+        else:
+            title = "تم تحديث تصنيف حسابك"
+            body = f"تم تحديث تصنيف حسابك إلى: {new_classification or 'عميل عادي'}. افتح برنامج الولاء لمعرفة المزايا المتاحة لك."
+            title_en = "Your customer classification was updated"
+            body_en = f"Your customer classification is now: {new_classification or 'Regular customer'}. Open the loyalty program to view your available benefits."
+        notification_type = "customer_classification_changed"
+        payload = {
+            "classification": new_classification,
+            "previous_classification": old_classification,
+            "is_special_customer": is_special_customer,
+            "title_en": title_en,
+            "body_en": body_en,
+            "deep_link": "/loyalty",
+        }
+        action_url = "/loyalty"
     else:
         return
 
@@ -339,7 +541,7 @@ async def _notify_customer_resource_update(
             title=title,
             body=body,
             notification_type=notification_type or "message",
-            category="order" if table == "international_orders" else "partner" if table in {"partner_storefronts", "partner_applications"} else "system",
+            category="order" if table in {"international_orders", "local_shopping_requests"} else "partner" if table in {"partner_storefronts", "partner_applications"} else "system",
             priority="high",
             action_type="open_resource",
             action_url=action_url,
@@ -351,6 +553,10 @@ async def _notify_customer_resource_update(
             deduplication_key=(
                 f"partner-application-review:{entity_id}:{_resource_status(getattr(record, 'status', None))}"
                 if table == "partner_applications"
+                else f"local-request-status:{entity_id}:{_resource_status(getattr(record, 'status', None))}"
+                if table == "local_shopping_requests" and notification_type == "order_status"
+                else f"customer-classification:{target_id}:{_resource_status(previous.get('classification'))}:{_resource_status(getattr(record, 'classification', None))}"
+                if table == "profiles" and notification_type == "customer_classification_changed"
                 else f"resource-update:{table}:{entity_id}:{notification_type}:{datetime.now().astimezone().isoformat()}"
             ),
         )
@@ -500,6 +706,12 @@ def _normalize_resource_payload(
 ) -> dict[str, Any]:
     """Normalize dashboard aliases before the generic resource writer persists them."""
     values = dict(raw)
+    if table == "international_orders" and operation in {"insert", "upsert"}:
+        if not str(values.get("order_number") or "").strip():
+            values["order_number"] = (
+                f"INTL-{datetime.now():%Y%m%d}-{uuid.uuid4().hex.upper()}"
+            )
+        values.pop("orderNumber", None)
     if table == "site_settings":
         # Keep both the REST content API and the resource API on the same
         # storage contract. Older clients send setting_key/setting_value,

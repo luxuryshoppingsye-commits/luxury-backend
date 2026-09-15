@@ -16,6 +16,7 @@ def _configure_test_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JWT_SECRET", "unit-test-secret-value-with-32-characters-minimum")
     monkeypatch.setenv("JWT_ACCESS_TOKEN_MINUTES", "15")
     monkeypatch.setenv("JWT_REFRESH_TOKEN_DAYS", "7")
+    monkeypatch.setenv("AUTH_SESSION_MAX_HOURS", "5")
     get_settings.cache_clear()
 
 
@@ -64,5 +65,6 @@ def test_refresh_token_returns_raw_digest_and_expiry(monkeypatch: pytest.MonkeyP
     assert len(raw) > 40
     assert digest == tokens.token_hash(raw)
     assert raw != digest
-    assert expires_at > datetime.now(timezone.utc)
+    lifetime_seconds = (expires_at - datetime.now(timezone.utc)).total_seconds()
+    assert 0 < lifetime_seconds <= 5 * 60 * 60
     assert tokens.token_hash(raw) == tokens.token_hash(raw)

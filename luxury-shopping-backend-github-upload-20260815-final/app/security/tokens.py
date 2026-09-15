@@ -12,6 +12,19 @@ from ..config import get_settings
 
 
 ALGORITHM = "HS256"
+DEFAULT_AUTH_SESSION_MAX_HOURS = 5
+
+
+def session_max_age_seconds(settings: Any | None = None) -> int:
+    """Return the absolute maximum lifetime for one authenticated session."""
+    settings = settings or get_settings()
+    configured_hours = int(
+        getattr(settings, "auth_session_max_hours", DEFAULT_AUTH_SESSION_MAX_HOURS)
+    )
+    return max(
+        60 * 60,
+        min(DEFAULT_AUTH_SESSION_MAX_HOURS * 60 * 60, configured_hours * 60 * 60),
+    )
 
 
 def create_access_token(user_id: str, roles: list[str], security_version: int = 0) -> str:
@@ -45,7 +58,9 @@ def create_refresh_token() -> tuple[str, str, datetime]:
     settings = get_settings()
     raw = secrets.token_urlsafe(64)
     digest = token_hash(raw)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.jwt_refresh_token_days)
+    configured_lifetime = timedelta(days=settings.jwt_refresh_token_days)
+    maximum_lifetime = timedelta(seconds=session_max_age_seconds(settings))
+    expires_at = datetime.now(timezone.utc) + min(configured_lifetime, maximum_lifetime)
     return raw, digest, expires_at
 
 

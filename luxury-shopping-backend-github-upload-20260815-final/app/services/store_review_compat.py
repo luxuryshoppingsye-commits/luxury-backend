@@ -34,6 +34,17 @@ ORDER BY sr.created_at DESC
 LIMIT 1
 """
 
+_HANDOVER_ADMIN_SQL = """
+SELECT sr.id, sr.user_id, sr.rating, sr.comment, sr.customer_name,
+       sr.is_approved, sr.is_rejected, sr.admin_notes, sr.status,
+       sr.created_at, sr.updated_at,
+       p.full_name AS profile_full_name
+FROM public.store_reviews sr
+LEFT JOIN public.profiles p ON p.user_id = sr.user_id
+ORDER BY sr.created_at DESC
+LIMIT :limit
+"""
+
 _HANDOVER_CREATE_SQL = """
 INSERT INTO public.store_reviews (
     user_id, rating, comment, customer_name, status, is_approved, is_rejected
@@ -122,6 +133,29 @@ LEFT JOIN public.profiles p ON p.user_id = sr.user_id
 WHERE sr.user_id = :user_id
 ORDER BY sr.created_at DESC
 LIMIT 1
+"""
+
+_GENERIC_ADMIN_SQL = """
+SELECT sr.id, sr.user_id,
+       COALESCE(NULLIF(sr.extra_data ->> 'rating', ''), '0') AS rating,
+       COALESCE(NULLIF(sr.extra_data ->> 'comment', ''), NULLIF(sr.extra_data ->> 'body', ''), NULLIF(sr.body, ''), NULLIF(sr.title, '')) AS comment,
+       COALESCE(NULLIF(TRIM(sr.extra_data ->> 'customer_name'), ''), NULLIF(TRIM(sr.extra_data ->> 'customerName'), ''), NULLIF(TRIM(sr.title), '')) AS customer_name,
+       (
+           LOWER(COALESCE(sr.status, '')) IN ('approved', 'active', 'published', 'visible', 'live', 'accepted', 'approve', 'accept')
+           OR LOWER(COALESCE(sr.extra_data ->> 'is_approved', '')) IN ('true', '1', 'yes')
+       ) AS is_approved,
+       (
+           LOWER(COALESCE(sr.status, '')) IN ('rejected', 'declined', 'denied', 'hidden', 'blocked', 'inactive', 'disabled')
+           OR LOWER(COALESCE(sr.extra_data ->> 'is_rejected', '')) IN ('true', '1', 'yes')
+       ) AS is_rejected,
+       COALESCE(NULLIF(sr.extra_data ->> 'show_name', ''), 'true') AS show_name,
+       sr.extra_data ->> 'admin_notes' AS admin_notes, sr.created_at, sr.updated_at, sr.status,
+       p.full_name AS profile_full_name
+FROM public.store_reviews sr
+LEFT JOIN public.profiles p ON p.user_id = sr.user_id
+WHERE sr.deleted_at IS NULL
+ORDER BY sr.created_at DESC
+LIMIT :limit
 """
 
 
@@ -227,6 +261,17 @@ async def fetch_user_store_review(session: AsyncSession, user_id: uuid.UUID) -> 
     if not rows:
         return None
     return normalize_store_review_row(rows[0])
+
+
+async def fetch_admin_store_reviews(session: AsyncSession, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Read all store reviews across the legacy and resource-table schemas."""
+    params = {"limit": limit}
+    rows = await _fetch_rows(session, _HANDOVER_ADMIN_SQL, params)
+    if rows is None:
+        rows = await _fetch_rows(session, _GENERIC_ADMIN_SQL, params)
+    if rows is None:
+        return []
+    return [normalize_store_review_row(row) for row in rows]
 
 
 async def create_handover_store_review(

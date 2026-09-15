@@ -109,3 +109,47 @@ async def test_order_summary_serializer_includes_order_items_for_admin_matching(
         "product_name": "منتج محفوظ",
         "quantity": 2,
     }]
+
+
+@pytest.mark.asyncio
+async def test_order_summary_serializer_prefers_current_profile_name_over_shipping_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    order = SimpleNamespace(
+        id=order_id,
+        user_id=user_id,
+        total=Decimal("1000.00"),
+        extra_data={},
+    )
+    monkeypatch.setattr(commerce, "_serialize_order", lambda _: {
+        "id": str(order_id),
+        "total": "1000.00",
+        "shipping_total": "0.00",
+        "shipping_address": {"full_name": "الاسم القديم", "city": "صنعاء"},
+    })
+
+    class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return []
+
+        def all(self):
+            return self._rows
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[
+        Result([(user_id, "الاسم الجديد")]),
+        Result([]),
+        Result([]),
+        Result([]),
+        Result([]),
+    ]))
+
+    rows = await commerce._serialize_orders_with_financials(session, [order])
+
+    assert rows[0]["customer_name"] == "الاسم الجديد"
+    assert rows[0]["shipping_address"]["full_name"] == "الاسم الجديد"
+    assert rows[0]["shipping_address"]["city"] == "صنعاء"

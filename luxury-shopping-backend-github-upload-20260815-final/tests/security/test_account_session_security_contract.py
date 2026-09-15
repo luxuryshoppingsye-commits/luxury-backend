@@ -100,8 +100,8 @@ async def test_web_refresh_keeps_a_remembered_session_persistent(monkeypatch: py
     await auth_routes.web_refresh(request, response, Session())
 
     cookies = response.headers.getlist("set-cookie")
-    assert any("rt=new-refresh-token" in header and "Max-Age=2592000" in header for header in cookies)
-    assert any("luxury_remember_me=1" in header and "Max-Age=2592000" in header for header in cookies)
+    assert any("rt=new-refresh-token" in header and "Max-Age=18000" in header for header in cookies)
+    assert any("luxury_remember_me=1" in header and "Max-Age=18000" in header for header in cookies)
 
 
 async def _latest_email_token(user_id: uuid.UUID, purpose_key: str) -> str:

@@ -104,11 +104,12 @@ def _is_chat_product_request(message: str) -> bool:
     return _has_any_chat_term(
         message,
         [
-            "ملابس", "لبس", "طفل", "اطفال", "أطفال", "طفلي", "طفلتي",
+            "ملابس", "لبس", "شال", "شالات", "وشاح", "أوشحة", "كشميري", "كشمير",
+            "طفل", "اطفال", "أطفال", "طفلي", "طفلتي",
             "ولدي", "ابني", "بنتي", "بنت", "بنات", "ولاد", "رجالي", "نسائي",
             "عطر", "عطور", "حذاء", "احذية", "أحذية", "شنطة", "حقيبة", "اكسسوار",
             "إكسسوار", "ساعة", "ساعات", "جوال", "الكترونيات", "إلكترونيات",
-            "clothes", "clothing", "kids", "child", "children", "boys", "girls",
+            "clothes", "clothing", "shawl", "shawls", "scarf", "scarves", "kids", "child", "children", "boys", "girls",
             "men", "women", "perfume", "shoes", "bag", "watch", "electronics",
         ],
     )
@@ -155,6 +156,38 @@ _CHAT_CATALOG_AUDIENCE_TERMS: dict[str, tuple[str, ...]] = {
         "girls",
     ),
 }
+
+_CHAT_SUPPORT_TERMS = [
+    "الدعم الفني",
+    "الدعم",
+    "فريق الدعم",
+    "خدمة العملاء",
+    "تواصل معنا",
+    "تواصل مع موظف",
+    "موظف",
+    "support",
+    "contact us",
+    "customer service",
+    "agent",
+    "human",
+]
+
+_CHAT_DELAYED_ORDER_TERMS = [
+    "متأخر",
+    "متاخر",
+    "تأخر",
+    "تاخر",
+    "تأخير",
+    "تاخير",
+    "ما وصل",
+    "لم يصل",
+    "ما وصلني",
+    "مو واصل",
+    "delayed",
+    "late",
+    "not arrived",
+    "overdue",
+]
 
 
 def _chat_requested_catalog_audiences(message: str) -> tuple[str, ...]:
@@ -419,6 +452,18 @@ def _chat_direct_guidance(message: str, language: str) -> str | None:
             "Sign in, open My Orders, choose the order, and check its status and tracking updates."
             if english
             else "سجّل دخولك، افتح طلباتي، اختر الطلب، ثم راجع حالته وتحديثات التتبع."
+        )
+    if _has_any_chat_term(message, _CHAT_DELAYED_ORDER_TERMS):
+        return (
+            "Open My Orders, choose the delayed order, and check its status and tracking updates. If it is past the shown delivery time, open Support and send the order number."
+            if english
+            else "إذا كان طلبك متأخرًا، افتح طلباتي واختر الطلب لمراجعة حالته وتحديثات التتبع. إذا تجاوز الموعد الظاهر، افتح مركز الدعم وأرسل رقم الطلب."
+        )
+    if _has_any_chat_term(message, _CHAT_SUPPORT_TERMS):
+        return (
+            "Open Support and choose Contact an employee, or open Contact us to send the team your message. Include the order number when your question is about an order."
+            if english
+            else "للتواصل مع الدعم الفني، افتح مركز الدعم واضغط «تواصل مع موظف»، أو افتح «تواصل معنا» لإرسال رسالتك. أرفق رقم الطلب إذا كان استفسارك عن طلب."
         )
     if (
         _has_any_chat_term(message, ["شراء", "اشتري", "أشتري", "اكمل الطلب", "إتمام الطلب", "checkout", "buy now"])
@@ -1074,16 +1119,24 @@ Output contract:
 
 def _extract_chat_search_terms(message: str) -> list[str]:
     stopwords = {
-        "ابحث", "بحث", "ابي", "أبي", "اريد", "أريد", "اشتي", "بغيت", "منتج", "منتجات",
+        "ابحث", "بحث", "ابي", "أبي", "اريد", "أريد", "اشتي", "بغيت", "ابغى", "أبغى",
+        "منتج", "منتجات", "المنتج", "المنتجات", "ملابس", "الملابس", "لبس", "اللبس",
         "عن", "في", "من", "على", "وش", "ايش", "إيش", "ارني", "اعرض", "عروض", "عرض",
         "هل", "كيف", "ممكن", "لو", "لو سمحت", "عندي", "فيه", "في", "هذا", "هذه", "ذلك",
         "هدية", "هديه", "افضل", "أفضل", "ميزانية", "حدود", "بحدود", "سعر", "اقل", "أقل", "تحت",
         "show", "find", "search", "product", "products", "for", "me", "please", "want",
         "gift", "present", "budget", "price", "recommend", "best", "under", "below",
     }
+    audience_terms = {
+        _normalize_chat_text(term)
+        for terms in _CHAT_CATALOG_AUDIENCE_TERMS.values()
+        for term in terms
+    }
     cleaned = re.sub(r"[^\w\u0600-\u06FF\s-]", " ", message.lower())
     terms: list[str] = []
     for word in cleaned.split():
+        if _normalize_chat_text(word) in audience_terms:
+            continue
         if _normalize_chat_digits(word).isdigit():
             continue
         if len(word) < 3 or word in stopwords:
@@ -1344,6 +1397,38 @@ def _answer_matches_chat_intent(message: str, answer: str) -> bool:
             )
         if _has_any_chat_term(message, ["تتبع", "طلباتي", "رقم الطلب", "tracking", "my orders"]):
             return _has_any_chat_term(answer, ["تتبع", "طلباتي", "حالة", "tracking", "my orders", "order"])
+        if _has_any_chat_term(message, _CHAT_DELAYED_ORDER_TERMS):
+            return _has_any_chat_term(
+                answer,
+                [
+                    "طلباتي",
+                    "حالة",
+                    "تتبع",
+                    "الدعم",
+                    "مركز الدعم",
+                    "رقم الطلب",
+                    "my orders",
+                    "status",
+                    "tracking",
+                    "support",
+                    "order number",
+                ],
+            )
+        if _has_any_chat_term(message, _CHAT_SUPPORT_TERMS):
+            return _has_any_chat_term(
+                answer,
+                [
+                    "الدعم",
+                    "مركز الدعم",
+                    "تواصل",
+                    "موظف",
+                    "خدمة العملاء",
+                    "support",
+                    "contact",
+                    "agent",
+                    "customer service",
+                ],
+            )
         if _has_any_chat_term(message, ["شراء", "اشتري", "أشتري", "اكمل الطلب", "إتمام الطلب", "checkout", "buy"]):
             return _has_any_chat_term(answer, ["شراء", "السلة", "الطلب", "تسجيل دخول", "checkout", "cart", "sign in"])
         if _has_any_chat_term(message, ["مقارنة", "قارن", "مقارنه", "compare"]):
@@ -1813,9 +1898,9 @@ async def _chat_site_context(
             _has_any_chat_term(
                 message,
                 [
-                    "منتج", "منتجات", "ابحث", "سعر", "فستان", "حقيبة", "حقيبه",
+                    "منتج", "منتجات", "ابحث", "سعر", "فستان", "شال", "شالات", "وشاح", "كشميري", "كشمير", "حقيبة", "حقيبه",
                     "حذاء", "عطر", "مقاس", "ماركة", "السلة", "إرجاع", "استبدال",
-                    "product", "search", "price", "dress", "bag", "shoe", "perfume",
+                    "product", "search", "price", "dress", "shawl", "scarf", "bag", "shoe", "perfume",
                     "size", "brand", "cart", "return", "refund",
                 ],
             ),
@@ -2006,6 +2091,16 @@ async def execute_public_ai_chat(
     if not message:
         raise HTTPException(status_code=400, detail="message_required")
     language = "en" if body.get("language") == "en" else "ar"
+    direct_guidance = _chat_direct_guidance(message, language)
+    if direct_guidance:
+        return {
+            "response": direct_guidance,
+            "transferToAgent": _has_any_chat_term(message, _CHAT_SUPPORT_TERMS),
+            "hasProducts": False,
+            "configured": True,
+            "providerStatus": "rule_based",
+            "request_id": current_request_id(),
+        }
     site_context, has_products = await _chat_site_context(
         session,
         message,
@@ -2028,6 +2123,43 @@ async def execute_public_ai_chat(
         )
         if part
     )
+    # Keep explicit catalog answers grounded in the live public results. This
+    # prevents the provider from inventing product names or mixing departments
+    # when the customer asks for a product, offer, gift, or budget.
+    catalog_grounded_request = _is_chat_product_request(message) or _has_any_chat_term(
+        message,
+        [
+            "عرض",
+            "عروض",
+            "خصم",
+            "كوبون",
+            "هدية",
+            "هديه",
+            "اقتراح",
+            "افضل",
+            "أفضل",
+            "ميزانية",
+            "سعر",
+            "offer",
+            "discount",
+            "coupon",
+            "gift",
+            "present",
+            "recommend",
+            "best",
+            "budget",
+            "price",
+        ],
+    )
+    if catalog_grounded_request:
+        return {
+            "response": _fallback_chat_answer(message, language, site_context),
+            "transferToAgent": False,
+            "hasProducts": has_products,
+            "configured": True,
+            "providerStatus": "catalog_grounded",
+            "request_id": current_request_id(),
+        }
     try:
         raw_response = await _ai_answer(
             message,

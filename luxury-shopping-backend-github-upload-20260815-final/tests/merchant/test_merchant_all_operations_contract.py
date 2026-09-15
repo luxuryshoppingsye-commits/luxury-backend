@@ -12,7 +12,14 @@ from backend.app.config import get_settings
 from backend.app.database import SessionFactory
 from backend.app.main import app
 from backend.app.models import MODEL_BY_TABLE
-from backend.app.models.domain import AccountSecurity, FileAsset, Profile, User, UserRole
+from backend.app.models.domain import (
+    AccountSecurity,
+    FileAsset,
+    Profile,
+    StaffPermissionSet,
+    User,
+    UserRole,
+)
 from backend.app.security.passwords import hash_password
 
 
@@ -61,13 +68,39 @@ async def _activate_user(user_id: uuid.UUID) -> None:
         await session.commit()
 
 
+async def _grant_merchant_option_permissions(user_id: uuid.UUID) -> None:
+    async with SessionFactory() as session:
+        session.add(
+            StaffPermissionSet(
+                user_id=user_id,
+                permissions=[
+                    "brands.create",
+                    "brands.update",
+                    "brands.delete",
+                    "product_options.create",
+                    "product_options.update",
+                    "product_options.delete",
+                    "coupons.delete",
+                ],
+            )
+        )
+        await session.commit()
+
+
 async def test_merchant_full_operations_are_executable_in_isolated_postgres() -> None:
     suffix = uuid.uuid4().hex[:10]
     admin_email = f"merchant-e2e-admin-{suffix}@example.com"
     customer_email = f"merchant-e2e-customer-{suffix}@example.com"
+    audience_customer_email = f"merchant-e2e-audience-{suffix}@example.com"
     admin_id, admin_password = await _seed_user(admin_email, "admin", "Merchant E2E Admin")
     customer_id, customer_password = await _seed_user(customer_email, "customer", "Merchant E2E Customer")
+    audience_customer_id, audience_customer_password = await _seed_user(
+        audience_customer_email,
+        "customer",
+        "Merchant E2E Audience Customer",
+    )
     await _activate_user(customer_id)
+    await _activate_user(audience_customer_id)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -113,6 +146,7 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
         assert approval.status_code == 200, approval.text
         merchant_user_id = customer_id
         await _activate_user(merchant_user_id)
+        await _grant_merchant_option_permissions(merchant_user_id)
 
         merchant_auth = await _login(client, customer_email, customer_password)
         assert "partner" in merchant_auth["roles"]
@@ -246,9 +280,15 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
         coupon = await client.post(
             "/partner/coupons",
             headers=merchant_headers,
-            json={"code": f"MERCHANT{suffix.upper()}", "amount": 100},
+            json={
+                "code": f"MERCHANT{suffix.upper()}",
+                "amount": 100,
+                "notify_customers": True,
+                "audience": "all",
+            },
         )
         assert coupon.status_code == 201, coupon.text
+        assert coupon.json()["data"]["notified_customers"] == 1
         coupon_id = coupon.json()["data"]["id"]
         coupon_update = await client.patch(
             f"/partner/coupons/{coupon_id}",
@@ -256,6 +296,23 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
             json={"amount": 150},
         )
         assert coupon_update.status_code == 200, coupon_update.text
+        assert coupon_update.json()["data"]["notified_customers"] == 1
+
+        audience_auth = await _login(
+            client,
+            audience_customer_email,
+            audience_customer_password,
+        )
+        audience_notifications = await client.get(
+            "/notifications",
+            headers=_headers(audience_auth["access_token"]),
+        )
+        assert audience_notifications.status_code == 200, audience_notifications.text
+        assert any(
+            row.get("title") == "كوبون خصم"
+            and f"MERCHANT{suffix.upper()}" in row.get("body", "")
+            for row in audience_notifications.json()
+        )
 
         image = await client.post(
             "/manage/product-image",
@@ -330,6 +387,18 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
         request_list = await client.get("/api/partner/requests", headers=merchant_headers)
         assert request_list.status_code == 200 and request_list.json()["data"]
         assert any(row["id"] == request_id for row in request_list.json()["data"])
+
+        legacy_restock_request = await client.post(
+            "/api/partner/requests",
+            headers=merchant_headers,
+            json={
+                "request_type": "طلب تزويد بضاعة",
+                "title": f"Restock Request {suffix}",
+                "description": "Legacy Arabic request type contract test",
+            },
+        )
+        assert legacy_restock_request.status_code == 200, legacy_restock_request.text
+        assert legacy_restock_request.json()["data"]["request_type"] == "restock"
 
         admin_requests = await client.get(
             "/api/admin/partner-requests",

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import date
+import io
 import uuid
 from decimal import Decimal
 from urllib.parse import urlsplit
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pypdf import PdfReader
 from sqlalchemy import func, select
 
 from backend.app.config import get_settings
@@ -15,9 +17,34 @@ from backend.app.main import app
 from backend.app.models import MODEL_BY_TABLE
 from backend.app.models.domain import AccountSecurity, Order, OrderItem, Product, Profile, User, UserRole
 from backend.app.security.passwords import hash_password
+from backend.app.services.report_admin_services import ReportGenerationService
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_financial_report_pdf_is_localized_instead_of_a_technical_dump() -> None:
+    metadata = {
+        "date_basis": "orders.created_at plus successful payment/refund status",
+        "order_count": "5",
+        "eligible_order_count": "5",
+        "gross_revenue": "61000.00",
+        "paid_amount": "63500.00",
+        "refund_amount": "0.00",
+        "net_revenue": "61000.00",
+        "currency_code": "YER",
+        "partner_scope": None,
+    }
+
+    for report_type, columns, rows in (
+        ("summary", ("metric", "value"), []),
+        ("revenue", ("metric", "value"), [{"metric": "gross_revenue", "value": "61000.00"}]),
+    ):
+        pdf = ReportGenerationService._render_pdf(report_type, rows, columns, metadata)
+        extracted = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf)).pages)
+
+        assert pdf.startswith(b"%PDF")
+        assert "Luxury Report" not in extracted
 
 
 def _assert_safe_database() -> None:

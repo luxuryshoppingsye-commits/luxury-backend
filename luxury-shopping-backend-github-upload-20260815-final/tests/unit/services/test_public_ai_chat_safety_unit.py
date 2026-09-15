@@ -12,8 +12,10 @@ from backend.app.services.function_service import (
     _chat_site_context,
     _answer_matches_chat_intent,
     _chat_requested_catalog_audiences,
+    _is_chat_product_request,
     _customer_safe_site_context_v2,
     _extract_chat_budget,
+    _extract_chat_search_terms,
     _fallback_chat_answer,
     _gemini_auth_header_options,
     _looks_like_unusable_ai_answer,
@@ -100,6 +102,15 @@ def test_public_ai_chat_requires_answer_to_match_customer_intent():
 )
 def test_public_ai_catalog_audience_uses_only_the_explicit_requested_department(message, expected):
     assert _chat_requested_catalog_audiences(message) == expected
+
+
+def test_public_ai_chat_recognizes_shawl_search_as_a_catalog_request():
+    assert _is_chat_product_request("شال كشميري")
+
+
+def test_public_ai_catalog_search_terms_do_not_turn_department_into_product_name():
+    assert _extract_chat_search_terms("أبغى ملابس رجالي") == []
+    assert _extract_chat_search_terms("شال كشميري") == ["شال", "كشميري"]
 
 
 def test_public_ai_chat_rejects_products_from_another_explicit_department():
@@ -200,6 +211,42 @@ def test_public_ai_direct_guidance_answers_the_requested_app_action(message, exp
     assert answer is not None
     assert expected in answer
     assert "خيارات مناسبة" not in answer
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("كيف اتواصل مع الدعم الفني؟", "تواصل مع موظف"),
+        ("مشكلتي ان طلبي متأخر", "طلباتي"),
+    ],
+)
+def test_public_ai_direct_guidance_handles_support_and_delayed_orders(message, expected):
+    answer = _chat_direct_guidance(message, "ar")
+
+    assert answer is not None
+    assert expected in answer
+
+
+def test_public_ai_chat_rejects_generic_answer_for_support_question():
+    assert not _answer_matches_chat_intent(
+        "كيف اتواصل مع الدعم الفني؟",
+        "أنا معك. اسألني بطريقتك وسأساعدك.",
+    )
+    assert _answer_matches_chat_intent(
+        "كيف اتواصل مع الدعم الفني؟",
+        "افتح مركز الدعم واضغط تواصل مع موظف.",
+    )
+
+
+def test_public_ai_chat_rejects_generic_answer_for_delayed_order():
+    assert not _answer_matches_chat_intent(
+        "مشكلتي ان طلبي متأخر",
+        "هذه بعض المنتجات المناسبة لك.",
+    )
+    assert _answer_matches_chat_intent(
+        "مشكلتي ان طلبي متأخر",
+        "افتح طلباتي لمراجعة الحالة، وإذا تجاوز الموعد أرسل رقم الطلب للدعم.",
+    )
 
 
 def test_public_ai_natural_product_request_does_not_become_order_tracking_or_checkout():

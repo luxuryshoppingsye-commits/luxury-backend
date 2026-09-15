@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..models import MODEL_BY_TABLE
 from ..models.domain import Brand, Category, Product, ProductVariant
+from .partner_subscription import active_partner_ids, public_partner_product_clause
 
 
 PUBLIC_APPROVAL_STATUSES = ("approved", "accepted", "active", "published", "visible", "live")
@@ -102,8 +103,17 @@ _INTERNAL_VISIBLE_TEXT_PATTERNS = (
     re.compile(r"\bTEST\b|TEST_", re.IGNORECASE),
     re.compile(r"\bCART_ORDER_REMEDIATION\b", re.IGNORECASE),
     re.compile(r"\bMOCK\b|\bDUMMY\b|\bSAMPLE\b|\bFIXTURE\b|RUN_ID", re.IGNORECASE),
+    re.compile(r"اختبار|تجريبي", re.IGNORECASE),
     re.compile(r"^Imported product\b", re.IGNORECASE),
     re.compile(r"^Unknown product\b|^Unknown item\b", re.IGNORECASE),
+    re.compile(
+        r"^(?:ال)?منتج\s+غير\s+مت(?:وفر|اح)(?:\s+حال(?:ياً|يًا|يا))?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:(?:currently\s+)?unavailable|unavailable\s+product|product\s+(?:unavailable|not\s+available))$",
+        re.IGNORECASE,
+    ),
     re.compile(r"^Product\s+[0-9a-f_-]{5,}$", re.IGNORECASE),
     re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE),
 )
@@ -138,7 +148,12 @@ def first_safe_display_text(*values: Any) -> str | None:
 
 
 def product_has_safe_public_text(product: Product) -> bool:
-    return safe_public_display_text(product.name) or safe_public_display_text(product.name_en)
+    values = [
+        value
+        for value in (product.name, product.name_en)
+        if isinstance(value, str) and value.strip()
+    ]
+    return bool(values) and all(safe_public_display_text(value) for value in values)
 
 
 def public_approval_clause(model: type[Product] = Product) -> Any:
@@ -164,6 +179,7 @@ def public_product_base_clauses(model: type[Product] = Product) -> list[Any]:
         public_approval_clause(model),
         public_product_safe_text_clause(model),
         public_product_image_clause(model),
+        public_partner_product_clause(model),
     ]
 
 
@@ -192,7 +208,15 @@ def public_product_safe_text_clause(model: type[Product] = Product) -> Any:
         "Imported product%",
         "%QA%",
         "%اختبار%",
+        "%تجريبي%",
         "%تحقق%",
+        "%منتج غير متوفر%",
+        "%المنتج غير متوفر%",
+        "%منتج غير متاح%",
+        "%المنتج غير متاح%",
+        "%product unavailable%",
+        "%unavailable product%",
+        "%product not available%",
         "منتج قديم مؤرشف%",
         "Unknown product%",
         "Unknown item%",
@@ -314,7 +338,12 @@ def public_storefront_response(
     public_id: Any | None = None,
     store_type: str | None = None,
 ) -> dict[str, Any]:
-    name = _storefront_value(row, "name") or _storefront_value(row, "business_name") or "Merchant store"
+    name = (
+        _storefront_value(row, "name")
+        or _storefront_value(row, "store_name")
+        or _storefront_value(row, "business_name")
+        or "Merchant store"
+    )
     resolved_id = public_id or _storefront_value(row, "partner_id") or _storefront_value(row, "user_id") or _storefront_value(row, "id") or ""
     resolved_store_type = store_type or "partner"
     resolved_partner_id = _storefront_value(row, "partner_id") or _storefront_value(row, "user_id")
@@ -337,8 +366,13 @@ def public_storefront_response(
     logo_value = (
         _storefront_value(row, "logo_url")
         or _storefront_value(row, "store_logo_url")
+        or _storefront_value(row, "store_image_url")
+        or _storefront_value(row, "storeImageUrl")
         or _storefront_value(row, "image_url")
+        or _storefront_value(row, "imageUrl")
+        or _storefront_value(row, "store_banner_url")
         or _storefront_value(row, "avatar_url")
+        or _storefront_value(row, "avatarUrl")
     )
     # Store images may be saved as a relative upload path or as the public CDN
     # URL returned by the upload endpoint. Normalize upload paths for clients,
@@ -354,11 +388,16 @@ def public_storefront_response(
         "partner_id": str(resolved_partner_id) if resolved_store_type == "partner" and resolved_partner_id else None,
         "supplier_id": str(resolved_id) if resolved_store_type == "local" and resolved_id else None,
         "display_name": name,
+        "displayName": name,
         "name": name,
+        "store_name": name,
+        "storeName": name,
         "name_en": _storefront_value(row, "name_en"),
         "slug": _storefront_value(row, "slug"),
         "logo_url": logo_url,
+        "logoUrl": logo_url,
         "store_logo_url": logo_url,
+        "storeLogoUrl": logo_url,
         "cover_url": _storefront_value(row, "cover_url"),
         "public_description": _storefront_value(row, "description"),
         "description": _storefront_value(row, "description"),
@@ -613,6 +652,12 @@ async def build_public_product_rows(
             for key in (getattr(storefront, "partner_id", None), getattr(storefront, "user_id", None)):
                 if key:
                     storefronts[key] = storefront
+        active_ids = await active_partner_ids(session, partner_ids)
+        storefronts = {
+            key: storefront
+            for key, storefront in storefronts.items()
+            if key in active_ids
+        }
     if supplier_ids and "local_merchants" in MODEL_BY_TABLE:
         local_model = MODEL_BY_TABLE["local_merchants"]
         result = await session.execute(
@@ -647,6 +692,7 @@ async def build_public_product_rows(
         )
         for product in products
         if is_public_product(product)
+        and (not product.partner_id or product.partner_id in storefronts)
     ]
 
 

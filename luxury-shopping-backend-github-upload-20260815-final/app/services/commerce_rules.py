@@ -15,6 +15,7 @@ from ..models import MODEL_BY_TABLE
 from ..models.domain import Category, Product, ProductVariant
 from .catalog_policy import is_public_approval_status, is_public_product
 from .financial_calculator import money, unit_price
+from .partner_subscription import subscription_state
 
 
 _PHONE_RE = re.compile(r"^\+?[0-9\s\-]{7,20}$")
@@ -127,8 +128,26 @@ async def assert_partner_storefront_available(session: AsyncSession, product: Pr
         .limit(1)
     )
     storefront = result.scalar_one_or_none()
-    if storefront is not None and getattr(storefront, "is_active", True) is not True:
+    if storefront is None or getattr(storefront, "is_active", True) is not True:
         raise HTTPException(status_code=409, detail="merchant_not_active")
+    contract_model = MODEL_BY_TABLE.get("partner_contracts")
+    if contract_model is None:
+        raise HTTPException(status_code=409, detail="merchant_subscription_required")
+    contract = (
+        await session.execute(
+            select(contract_model)
+            .where(contract_model.partner_id == product.partner_id, contract_model.deleted_at.is_(None))
+            .order_by(contract_model.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    state = subscription_state(
+        getattr(contract, "extra_data", {}) if contract is not None else {},
+        contract_status=getattr(contract, "status", None),
+        contract_is_active=getattr(contract, "is_active", None),
+    )
+    if not state.is_active:
+        raise HTTPException(status_code=409, detail="merchant_subscription_inactive")
 
 
 async def assert_category_available(session: AsyncSession, product: Product) -> None:

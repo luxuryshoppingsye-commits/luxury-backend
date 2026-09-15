@@ -29,7 +29,13 @@ from ..models.domain import (
 )
 from ..repositories.resources import serialize_record
 from ..security.passwords import hash_password, validate_password, verify_password
-from ..security.tokens import create_access_token, create_refresh_token, create_session_token, token_hash
+from ..security.tokens import (
+    create_access_token,
+    create_refresh_token,
+    create_session_token,
+    session_max_age_seconds,
+    token_hash,
+)
 from .api_protection import trusted_client_ip
 
 ACTIVE_ACCOUNT_STATUS = "active"
@@ -386,7 +392,29 @@ async def auth_payload(
     profile_result = await session.execute(select(Profile).where(Profile.user_id == user.id))
     profile = profile_result.scalar_one_or_none()
     partner_agreement_accepted: bool | None = None
+    merchant_portal_enabled: bool | None = None
     if "partner" in roles:
+        storefront_model = MODEL_BY_TABLE.get("partner_storefronts")
+        if storefront_model is not None:
+            try:
+                storefront_result = await session.execute(
+                    select(storefront_model.id)
+                    .where(
+                        or_(
+                            storefront_model.user_id == user.id,
+                            storefront_model.partner_id == user.id,
+                        ),
+                        storefront_model.deleted_at.is_(None),
+                    )
+                    .limit(1)
+                )
+                merchant_portal_enabled = (
+                    storefront_result.scalar_one_or_none() is not None
+                )
+            except SQLAlchemyError:
+                # Do not lock an existing partner out during a temporary
+                # storefront-table/database failure.
+                merchant_portal_enabled = None
         try:
             contract_model = MODEL_BY_TABLE["partner_contracts"]
             contract = (
@@ -435,6 +463,8 @@ async def auth_payload(
     }
     if partner_agreement_accepted is not None:
         payload["partner_agreement_accepted"] = partner_agreement_accepted
+    if merchant_portal_enabled is not None:
+        payload["merchant_portal_enabled"] = merchant_portal_enabled
     if issue_tokens:
         if await _optional_table_ready(session, AuthSession.__tablename__):
             now = datetime.now(timezone.utc)
@@ -443,9 +473,9 @@ async def auth_payload(
                 auth_session = AuthSession(
                     user_id=user.id,
                     session_token_hash=session_hash,
-                    # A remembered session is renewable and ends through an
-                    # explicit logout/revocation or account security action.
-                    expires_at=None,
+                    # A remembered session can renew short-lived access tokens,
+                    # but the authentication session itself ends after five hours.
+                    expires_at=now + timedelta(seconds=session_max_age_seconds(get_settings())),
                     last_seen_at=now,
                     remembered=True,
                     user_agent=request.headers.get("user-agent") if request else None,
@@ -498,6 +528,38 @@ async def auth_payload(
 
 def _iso_or_none(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _effective_auth_session_expiry(auth_session: AuthSession) -> datetime | None:
+    """Apply the five-hour cap, including to legacy sessions with no expiry."""
+    created_at = _as_utc(getattr(auth_session, "created_at", None))
+    current_expiry = _as_utc(getattr(auth_session, "expires_at", None))
+    if created_at is None:
+        return current_expiry
+    hard_expiry = created_at + timedelta(seconds=session_max_age_seconds(get_settings()))
+    if current_expiry is None or current_expiry > hard_expiry:
+        auth_session.expires_at = hard_expiry
+        return hard_expiry
+    return current_expiry
+
+
+def _effective_refresh_token_expiry(refresh_token: RefreshToken) -> datetime | None:
+    """Cap legacy refresh tokens that predate the absolute session limit."""
+    created_at = _as_utc(getattr(refresh_token, "created_at", None))
+    current_expiry = _as_utc(getattr(refresh_token, "expires_at", None))
+    if created_at is None:
+        return current_expiry
+    hard_expiry = created_at + timedelta(seconds=session_max_age_seconds(get_settings()))
+    if current_expiry is None or current_expiry > hard_expiry:
+        refresh_token.expires_at = hard_expiry
+        return hard_expiry
+    return current_expiry
 
 
 async def check_login_rate_limit(session: AsyncSession, email: str, ip: str) -> None:
@@ -851,7 +913,8 @@ async def rotate_refresh_token(
             request=request,
         )
         raise HTTPException(status_code=401, detail="refresh_token_reuse_detected")
-    if stored.expires_at <= now:
+    refresh_expires_at = _effective_refresh_token_expiry(stored)
+    if refresh_expires_at is None or refresh_expires_at <= now:
         stored.revoked_at = now
         raise HTTPException(status_code=401, detail="invalid_refresh_token")
     user = await session.get(User, stored.user_id)
@@ -861,11 +924,14 @@ async def rotate_refresh_token(
         raise HTTPException(status_code=401, detail="inactive_user")
     if stored.session_id is not None and await _optional_table_ready(session, AuthSession.__tablename__):
         auth_session = await session.get(AuthSession, stored.session_id, with_for_update=True)
+        session_expires_at = (
+            _effective_auth_session_expiry(auth_session) if auth_session is not None else None
+        )
         if (
             auth_session is None
             or auth_session.user_id != user.id
             or auth_session.revoked_at is not None
-            or (auth_session.expires_at is not None and auth_session.expires_at <= now)
+            or (session_expires_at is not None and session_expires_at <= now)
         ):
             stored.revoked_at = now
             raise HTTPException(status_code=401, detail="invalid_refresh_token")
@@ -919,10 +985,13 @@ async def rotate_auth_session(
     )
     auth_session = result.scalar_one_or_none()
     now = datetime.now(timezone.utc)
+    session_expires_at = (
+        _effective_auth_session_expiry(auth_session) if auth_session is not None else None
+    )
     if (
         auth_session is None
         or auth_session.revoked_at is not None
-        or (auth_session.expires_at is not None and auth_session.expires_at <= now)
+        or (session_expires_at is not None and session_expires_at <= now)
     ):
         raise HTTPException(status_code=401, detail="invalid_session")
     user = await session.get(User, auth_session.user_id)

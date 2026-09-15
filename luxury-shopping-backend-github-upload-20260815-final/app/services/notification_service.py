@@ -58,6 +58,7 @@ CUSTOMER_NOTIFICATION_TYPES = frozenset([
     'payment_due',
     'payment_pending',
     'payment_due_reminder',
+    'payment_status_changed',
     'cart_discount',
     'cart_coupon',
     'cart_offer',
@@ -77,6 +78,9 @@ CUSTOMER_NOTIFICATION_TYPES = frozenset([
     'welcome_message',
     'customer_welcome',
     'welcome_popup',
+    'customer_classification_changed',
+    'account_deletion_approved',
+    'account_deletion_rejected',
     'customer_message_staff',
     'admin_direct_message',
     'admin_broadcast_message',
@@ -252,6 +256,20 @@ def _english_notification_content(row: Any, notification: dict[str, Any]) -> tup
     elif notification_type in {"partner_application_rejected", "partner_rejected"}:
         title = title or "Your merchant application was rejected"
         body = body or "Please review your application and contact support if needed."
+    elif notification_type == "account_deletion_approved":
+        title = title or "Your account deletion request was approved"
+        body = body or "Your account and store were disabled. Order and invoice records were retained as required."
+    elif notification_type == "account_deletion_rejected":
+        title = title or "Your account deletion request was rejected"
+        body = body or "Your account remains active and you can sign in normally."
+    elif notification_type == "payment_status_changed":
+        title = title or "Payment status updated"
+        payment_status = data.get("payment_status") or data.get("status") or "pending"
+        status_label = _PAYMENT_STATUS_LABELS_EN.get(
+            str(payment_status).strip().lower(),
+            str(payment_status).replace("_", " ").title(),
+        )
+        body = body or f"Your payment status is now {status_label}."
     elif notification_type == "order_created":
         title = title or "Order received"
         body = body or "Your order was received successfully and will be processed soon."
@@ -311,6 +329,75 @@ class NotificationPayload:
     # Direct email workflows can enqueue their matching in-app/mobile event
     # without creating a second email message.
     delivery_channels: tuple[str, ...] | None = None
+
+
+_PAYMENT_STATUS_LABELS_AR = {
+    "pending": "قيد الانتظار",
+    "confirmed": "تم التأكيد",
+    "approved": "تمت الموافقة",
+    "paid": "مدفوع",
+    "partial": "مدفوع جزئياً",
+    "partially_refunded": "تم رد جزء من المبلغ",
+    "refunded": "تم رد المبلغ",
+    "rejected": "مرفوض",
+}
+_PAYMENT_STATUS_LABELS_EN = {
+    "pending": "pending",
+    "confirmed": "confirmed",
+    "approved": "approved",
+    "paid": "paid",
+    "partial": "partially paid",
+    "partially_refunded": "partially refunded",
+    "refunded": "refunded",
+    "rejected": "rejected",
+}
+
+
+async def create_payment_status_notification(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    status: Any,
+    international: bool,
+    entity_type: str,
+    entity_id: str,
+    action_url: str,
+    order_id: uuid.UUID | None = None,
+    created_by: uuid.UUID | None = None,
+    source: str = "finance",
+    deduplication_key: str | None = None,
+) -> Any:
+    """Persist one customer-visible payment-status event for every order type."""
+    status_key = str(status or "pending").strip().lower().replace(" ", "_") or "pending"
+    status_ar = _PAYMENT_STATUS_LABELS_AR.get(status_key, status_key.replace("_", " "))
+    status_en = _PAYMENT_STATUS_LABELS_EN.get(status_key, status_key.replace("_", " ").title())
+    scope_ar = "طلبك الدولي" if international else "طلبك"
+    scope_en = "international order" if international else "order"
+    return await NotificationService(session).create_notification(
+        NotificationPayload(
+            user_id=user_id,
+            title=f"تم تحديث حالة الدفع لـ{scope_ar}",
+            body=f"حالة الدفع لـ{scope_ar} الآن: {status_ar}.",
+            notification_type="payment_status_changed",
+            category="payment",
+            priority="high",
+            action_type="open_order",
+            action_url=action_url,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            order_id=order_id,
+            payload={
+                "payment_status": status_key,
+                "status": status_key,
+                "deep_link": action_url,
+                "title_en": f"Payment status updated for your {scope_en}",
+                "body_en": f"Payment status for your {scope_en} is now {status_en}.",
+            },
+            created_by=created_by,
+            source=source,
+            deduplication_key=deduplication_key,
+        )
+    )
 
 
 class NotificationService:
@@ -1192,6 +1279,8 @@ def _category_from_type(notification_type: str) -> str:
         return "promotional"
     if "support" in lowered or "ticket" in lowered:
         return "support"
+    if "account" in lowered and "deletion" in lowered:
+        return "account_security"
     if "security" in lowered or "password" in lowered or "login" in lowered:
         return "security"
     return "system"

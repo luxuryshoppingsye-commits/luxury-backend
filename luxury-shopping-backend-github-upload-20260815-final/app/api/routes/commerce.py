@@ -70,6 +70,7 @@ from ...services.commerce_rules import (
     validate_customer_checkout_address,
     validate_shipping_address,
 )
+from ...services.partner_subscription import public_partner_storefront_clause
 from ...services.payment_methods import validate_payment_method_for_checkout
 from ...services.staff_permissions import require_staff_permission
 from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof, normalize_status
@@ -275,6 +276,80 @@ def _serialize_manage_product(product: Product) -> dict[str, Any]:
     return row
 
 
+async def _commerce_rows(
+    session: AsyncSession, table: str, *, limit: int
+) -> list[Any]:
+    model = MODEL_BY_TABLE[table]
+    statement = select(model)
+    if "deleted_at" in model.__table__.c:
+        statement = statement.where(model.__table__.c.deleted_at.is_(None))
+    if "created_at" in model.__table__.c:
+        statement = statement.order_by(model.__table__.c.created_at.desc())
+    result = await session.execute(statement.limit(limit))
+    return list(result.scalars())
+
+
+def _inventory_payload_value(payload: dict[str, Any], *keys: str) -> str | None:
+    """Read inventory references from both columns and legacy extra_data."""
+    extra = payload.get("extra_data")
+    extra = extra if isinstance(extra, dict) else {}
+    for key in keys:
+        value = payload.get(key)
+        if value is None or not str(value).strip():
+            value = extra.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
+def _inventory_payload_quantity(payload: dict[str, Any]) -> int:
+    try:
+        return int(float(payload.get("quantity") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _manage_product_inventory_summary(
+    session: AsyncSession, product_ids: set[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Expose warehouse assignments to the admin and merchant product views."""
+    if not product_ids:
+        return {}
+    location_payloads = [
+        serialize_record(row)
+        for row in await _commerce_rows(session, "inventory_locations", limit=5000)
+    ]
+    if not location_payloads:
+        location_payloads = [
+            serialize_record(row)
+            for row in await _commerce_rows(session, "inventory", limit=5000)
+        ]
+    warehouse_payloads = [
+        serialize_record(row)
+        for row in await _commerce_rows(session, "warehouses", limit=500)
+    ]
+    warehouses = {
+        str(payload.get("id")): payload
+        for payload in warehouse_payloads
+        if payload.get("id")
+    }
+    summary: dict[str, list[dict[str, Any]]] = {}
+    for payload in location_payloads:
+        product_id = _inventory_payload_value(payload, "product_id", "productId")
+        warehouse_id = _inventory_payload_value(payload, "warehouse_id", "warehouseId")
+        if not product_id or product_id not in product_ids or not warehouse_id:
+            continue
+        warehouse = warehouses.get(warehouse_id)
+        entry = {
+            "id": payload.get("id"),
+            "warehouse_id": warehouse_id,
+            "warehouse_name": (warehouse or {}).get("name") or "مستودع غير معروف",
+            "quantity": _inventory_payload_quantity(payload),
+        }
+        summary.setdefault(product_id, []).append(entry)
+    return summary
+
+
 async def _serialize_manage_products(
     session: AsyncSession, products: list[Product]
 ) -> list[dict[str, Any]]:
@@ -293,10 +368,38 @@ async def _serialize_manage_products(
             select(supplier_model).where(supplier_model.id.in_(supplier_ids))
         )
         suppliers_by_id = {row.id: row for row in result.scalars()}
+    inventory_by_product = await _manage_product_inventory_summary(
+        session, {str(product.id) for product in products}
+    )
 
     rows: list[dict[str, Any]] = []
     for product in products:
         row = _serialize_manage_product(product)
+        assignments = inventory_by_product.get(str(product.id), [])
+        assigned_quantity = sum(
+            int(entry.get("quantity") or 0) for entry in assignments
+        )
+        row["inventory_locations"] = assignments
+        row["warehouse_count"] = len(assignments)
+        row["warehouse_id"] = (
+            assignments[0]["warehouse_id"] if len(assignments) == 1 else None
+        )
+        row["warehouse_name"] = (
+            "، ".join(
+                dict.fromkeys(
+                    str(entry.get("warehouse_name") or "مستودع غير معروف")
+                    for entry in assignments
+                )
+            )
+            if assignments
+            else "غير موزع"
+        )
+        row["warehouse_quantity"] = (
+            assigned_quantity
+            if assignments
+            else int(getattr(product, "stock_quantity", 0) or 0)
+        )
+        row["inventory_assignment_status"] = "assigned" if assignments else "unassigned"
         brand = brands_by_id.get(product.brand_id) if product.brand_id else None
         if brand is not None:
             row["brand_name"] = brand.name
@@ -402,9 +505,18 @@ _INTERNAL_VISIBLE_TEXT_PATTERNS = (
     re.compile(r"\bE2E\b|E2E_", re.IGNORECASE),
     re.compile(r"\bTEST\b|TEST_", re.IGNORECASE),
     re.compile(r"\bMOCK\b|\bDUMMY\b|\bSAMPLE\b|\bFIXTURE\b|RUN_ID", re.IGNORECASE),
+    re.compile(r"اختبار|تجريبي", re.IGNORECASE),
     re.compile(r"^(Category|Store)\s+[0-9a-f_-]{5,}$", re.IGNORECASE),
     re.compile(r"^Imported product\b", re.IGNORECASE),
     re.compile(r"^Unknown product\b|^Unknown item\b", re.IGNORECASE),
+    re.compile(
+        r"^(?:ال)?منتج\s+غير\s+مت(?:وفر|اح)(?:\s+حال(?:ياً|يًا|يا))?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:(?:currently\s+)?unavailable|unavailable\s+product|product\s+(?:unavailable|not\s+available))$",
+        re.IGNORECASE,
+    ),
     re.compile(r"^Product\s+[0-9a-f_-]{5,}$", re.IGNORECASE),
     re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE),
 )
@@ -420,11 +532,21 @@ def _safe_public_display_text(value: Any) -> bool:
 
 
 def _row_has_safe_public_product_text(row: dict[str, Any]) -> bool:
-    return _safe_public_display_text(row.get("name")) or _safe_public_display_text(row.get("name_en"))
+    values = [
+        value
+        for value in (row.get("name"), row.get("name_en"))
+        if isinstance(value, str) and value.strip()
+    ]
+    return bool(values) and all(_safe_public_display_text(value) for value in values)
 
 
 def _product_has_safe_public_text(product: Product) -> bool:
-    return _safe_public_display_text(product.name) or _safe_public_display_text(product.name_en)
+    values = [
+        value
+        for value in (product.name, product.name_en)
+        if isinstance(value, str) and value.strip()
+    ]
+    return bool(values) and all(_safe_public_display_text(value) for value in values)
 
 
 def _product_image_upload_path(value: Any, upload_dir: Path | None = None) -> Path | None:
@@ -781,6 +903,129 @@ async def _product_payload(session: AsyncSession, product: Product) -> dict[str,
     if brand:
         row["brand_name"] = brand.name
     return row
+
+
+COURIER_ASSIGNMENT_TERMINAL_STATUSES = frozenset({"cancelled", "failed"})
+
+
+def _courier_assignment_is_current(assignment: Any) -> bool:
+    extra_data = getattr(assignment, "extra_data", None)
+    return not isinstance(extra_data, dict) or extra_data.get("is_current") is not False
+
+
+def _courier_assignment_payload(
+    assignment: Any,
+    couriers_by_key: dict[str, Any],
+) -> dict[str, Any]:
+    payload = serialize_record(assignment)
+    courier_id = getattr(assignment, "courier_id", None)
+    user_id = getattr(assignment, "user_id", None)
+    courier = couriers_by_key.get(str(courier_id)) or couriers_by_key.get(str(user_id))
+    courier_payload = serialize_record(courier) if courier is not None else None
+    resolved_courier_id = getattr(courier, "id", None) if courier is not None else courier_id
+    courier_name = (
+        (courier_payload or {}).get("full_name")
+        or (courier_payload or {}).get("name")
+        or ""
+    )
+    payload.update(
+        {
+            "assignment_id": str(getattr(assignment, "id", "")),
+            "courier_id": str(resolved_courier_id) if resolved_courier_id else None,
+            "courier_name": courier_name or None,
+            "courier_phone": (courier_payload or {}).get("phone"),
+            "courier": courier_payload,
+            "courier_assignment_status": getattr(assignment, "status", None),
+            "courier_linked": courier is not None,
+        }
+    )
+    return payload
+
+
+async def _attach_courier_assignments(
+    session: AsyncSession,
+    orders: list[Order],
+    payloads: list[dict[str, Any]],
+) -> None:
+    """Attach the same courier-link contract to admin/app order responses."""
+    if not orders:
+        return
+    assignment_model = MODEL_BY_TABLE["courier_assignments"]
+    assignment_rows = list(
+        (
+            await session.execute(
+                select(assignment_model).where(
+                    assignment_model.order_id.in_([order.id for order in orders]),
+                    assignment_model.deleted_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+    courier_model = MODEL_BY_TABLE["couriers"]
+    courier_keys: set[uuid.UUID] = set()
+    for assignment in assignment_rows:
+        for value in (
+            getattr(assignment, "courier_id", None),
+            getattr(assignment, "user_id", None),
+        ):
+            if not value:
+                continue
+            try:
+                courier_keys.add(value if isinstance(value, uuid.UUID) else uuid.UUID(str(value)))
+            except (TypeError, ValueError, AttributeError):
+                continue
+    couriers_by_key: dict[str, Any] = {}
+    if courier_keys:
+        courier_rows = list(
+            (
+                await session.execute(
+                    select(courier_model).where(
+                        or_(
+                            courier_model.id.in_(list(courier_keys)),
+                            courier_model.user_id.in_(list(courier_keys)),
+                        ),
+                        courier_model.deleted_at.is_(None),
+                    )
+                )
+            ).scalars()
+        )
+        for courier in courier_rows:
+            couriers_by_key[str(courier.id)] = courier
+            if getattr(courier, "user_id", None):
+                couriers_by_key[str(courier.user_id)] = courier
+
+    assignments_by_order: dict[uuid.UUID, list[Any]] = {}
+    for assignment in assignment_rows:
+        assignments_by_order.setdefault(assignment.order_id, []).append(assignment)
+    payload_by_id = {order.id: payload for order, payload in zip(orders, payloads)}
+    for order_id, payload in payload_by_id.items():
+        candidates = [
+            assignment
+            for assignment in assignments_by_order.get(order_id, [])
+            if _courier_assignment_is_current(assignment)
+            and str(getattr(assignment, "status", "") or "").lower()
+            not in COURIER_ASSIGNMENT_TERMINAL_STATUSES
+        ]
+        selected = max(
+            candidates,
+            key=lambda assignment: str(getattr(assignment, "created_at", "") or ""),
+            default=None,
+        )
+        courier_assignment = (
+            _courier_assignment_payload(selected, couriers_by_key)
+            if selected is not None
+            else None
+        )
+        payload["courier_assignment"] = courier_assignment
+        payload["courier"] = (courier_assignment or {}).get("courier")
+        payload["courier_id"] = (courier_assignment or {}).get("courier_id")
+        payload["courier_name"] = (courier_assignment or {}).get("courier_name")
+        payload["courier_phone"] = (courier_assignment or {}).get("courier_phone")
+        payload["courier_assignment_id"] = (courier_assignment or {}).get("assignment_id")
+        payload["courier_assignment_status"] = (courier_assignment or {}).get("courier_assignment_status")
+        payload["courier_linked"] = bool(
+            courier_assignment and courier_assignment.get("courier_linked")
+        )
 
 
 def _return_status_label(status: Any) -> str:
@@ -1232,7 +1477,26 @@ async def catalog_categories(limit: int = Query(500, ge=1, le=5000), session: As
 @router.get("/api/catalog/admin/categories")
 async def catalog_admin_categories(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(Category).where(Category.deleted_at.is_(None)).order_by(Category.sort_order, Category.name))
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    categories = list(result.scalars())
+    if not categories:
+        return {"data": []}
+
+    product_count_result = await session.execute(
+        select(Product.category_id, func.count(Product.id))
+        .where(Product.category_id.in_([category.id for category in categories]), *public_product_clauses(Product))
+        .group_by(Product.category_id)
+    )
+    direct_counts = {
+        category_id: int(count or 0)
+        for category_id, count in product_count_result.all()
+    }
+    data = []
+    for category in categories:
+        row = serialize_record(category)
+        row["direct_product_count"] = direct_counts.get(category.id, 0)
+        row["product_count"] = row["direct_product_count"]
+        data.append(row)
+    return {"data": data}
 
 
 @router.get("/brands")
@@ -1541,7 +1805,7 @@ async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
     local_model = MODEL_BY_TABLE["local_merchants"]
     result = await session.execute(
         select(model)
-        .where(model.deleted_at.is_(None), model.is_active.is_(True))
+        .where(public_partner_storefront_clause(model))
         .order_by(model.name)
         .limit(limit)
     )
@@ -1989,6 +2253,69 @@ async def _visible_orders(
     return list(result.scalars())
 
 
+async def _attach_current_customer_name(
+    session: AsyncSession,
+    order: Order,
+    payload: dict[str, Any],
+) -> None:
+    user_id = getattr(order, "user_id", None)
+    if user_id is None:
+        return
+    profile_result = await session.execute(
+        select(Profile.full_name).where(
+            Profile.user_id == user_id,
+            Profile.deleted_at.is_(None),
+        )
+    )
+    full_name = profile_result.scalar_one_or_none()
+    current_name = str(full_name).strip() if full_name is not None else ""
+    if not current_name:
+        return
+    payload["customer_name"] = current_name
+    address = payload.get("shipping_address")
+    if isinstance(address, dict):
+        payload["shipping_address"] = {
+            **address,
+            "full_name": current_name,
+        }
+
+
+async def _attach_current_customer_names(
+    session: AsyncSession,
+    orders: list[Order],
+    payloads: list[dict[str, Any]],
+) -> None:
+    user_ids = {
+        order.user_id
+        for order in orders
+        if getattr(order, "user_id", None) is not None
+    }
+    if not user_ids:
+        return
+    profile_result = await session.execute(
+        select(Profile.user_id, Profile.full_name).where(
+            Profile.user_id.in_(user_ids),
+            Profile.deleted_at.is_(None),
+        )
+    )
+    current_names = {
+        str(user_id): str(full_name).strip()
+        for user_id, full_name in profile_result.all()
+        if full_name is not None and str(full_name).strip()
+    }
+    for order, payload in zip(orders, payloads):
+        current_name = current_names.get(str(getattr(order, "user_id", "")))
+        if not current_name:
+            continue
+        payload["customer_name"] = current_name
+        address = payload.get("shipping_address")
+        if isinstance(address, dict):
+            payload["shipping_address"] = {
+                **address,
+                "full_name": current_name,
+            }
+
+
 async def _serialize_orders_with_financials(session: AsyncSession, orders: list[Order]) -> list[dict[str, Any]]:
     """Return order rows with one consistent paid/remaining summary.
 
@@ -2000,6 +2327,11 @@ async def _serialize_orders_with_financials(session: AsyncSession, orders: list[
     payloads = [_serialize_order(order) for order in orders]
     if not orders:
         return payloads
+
+    # ``shipping_address.full_name`` is an order-time snapshot.  The admin
+    # list must use the current profile name so it cannot disagree with the
+    # order details view after a customer edits their profile.
+    await _attach_current_customer_names(session, orders, payloads)
 
     order_ids = [order.id for order in orders]
     # The admin order-linking screen uses this endpoint to compare a local
@@ -2044,6 +2376,7 @@ async def _serialize_orders_with_financials(session: AsyncSession, orders: list[
         if paid > 0 and str(payload.get("payment_status") or "").lower() not in {"refunded", "partial_refund", "partially_refunded"}:
             payload["payment_status"] = "paid" if total > 0 and paid >= total else "partial"
         payload.setdefault("shipping_cost", payload.get("shipping_total", "0"))
+    await _attach_courier_assignments(session, orders, payloads)
     return payloads
 
 
@@ -2092,9 +2425,11 @@ def _partner_request_payload(row: Any) -> dict[str, Any]:
                 payload.setdefault("description", notes)
         except json.JSONDecodeError:
             payload.setdefault("description", notes)
+    raw_request_type = str(payload.get("request_type") or "custom").strip().lower()
+    request_type = _PARTNER_REQUEST_TYPE_ALIASES.get(raw_request_type, raw_request_type)
     return {
         **serialize_record(row),
-        "request_type": payload.get("request_type") or "custom",
+        "request_type": request_type,
         "title": payload.get("title") or "طلب تاجر",
         "product_name": payload.get("product_name") or "",
         "description": payload.get("description") or "",
@@ -2212,7 +2547,21 @@ async def api_create_partner_request(
     return {"data": _partner_request_payload(row)}
 
 
-_PARTNER_REQUEST_TYPES = {"custom", "sourcing", "customization", "supply", "service", "other"}
+_PARTNER_REQUEST_TYPES = {"custom", "restock", "return", "sourcing", "customization", "supply", "service", "other"}
+_PARTNER_REQUEST_TYPE_ALIASES = {
+    "طلب تزويد بضاعة": "restock",
+    "طلب تزويد البضاعة": "restock",
+    "تزويد بضاعة": "restock",
+    "restock_request": "restock",
+    "procurement": "restock",
+    "stock_replenishment": "restock",
+    "طلب مخصص": "custom",
+    "توفير منتج": "sourcing",
+    "تخصيص منتج": "customization",
+    "توريد": "supply",
+    "خدمة": "service",
+    "أخرى": "other",
+}
 _PARTNER_REQUEST_PRIORITIES = {"low", "normal", "high", "urgent"}
 _PARTNER_REQUEST_EDITABLE_STATUSES = {"pending", "draft", "rejected"}
 
@@ -2220,6 +2569,7 @@ _PARTNER_REQUEST_EDITABLE_STATUSES = {"pending", "draft", "rejected"}
 def _partner_request_values(body: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
     current = dict(existing or {})
     request_type = str(body.get("request_type") if body.get("request_type") is not None else current.get("request_type") or "custom").strip().lower()
+    request_type = _PARTNER_REQUEST_TYPE_ALIASES.get(request_type, request_type)
     if request_type not in _PARTNER_REQUEST_TYPES:
         raise HTTPException(status_code=422, detail="invalid_request_type")
     title = str(body.get("title") if body.get("title") is not None else current.get("title") or "").strip()
@@ -2931,6 +3281,26 @@ async def api_user_international_shopping_order_detail(
     return {"data": serialize_record(row)}
 
 
+@router.get("/orders/{order_id}/courier-assignment")
+@router.get("/api/orders/{order_id}/courier-assignment")
+async def order_courier_assignment(
+    order_id: uuid.UUID,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    order = await session.get(Order, order_id)
+    is_staff = bool(roles.intersection({"admin", "manager", "finance", "logistics", "staff"}))
+    if order is None or order.deleted_at is not None or (order.user_id != user.id and not is_staff):
+        raise HTTPException(status_code=404, detail="order_not_found")
+    payload: dict[str, Any] = {}
+    await _attach_courier_assignments(session, [order], [payload])
+    return {
+        "data": payload.get("courier_assignment"),
+        "courier_linked": payload.get("courier_linked", False),
+    }
+
+
 @router.get("/orders/{order_id}")
 @router.get("/api/orders/{order_id}")
 async def order_detail(
@@ -3018,6 +3388,8 @@ async def order_detail(
         "customerReceived": bool((order.extra_data or {}).get("customer_received_at")),
         "returns": [_serialize_return(row, items_by_return.get(str(row.id), [])) for row in return_rows],
     }
+    await _attach_current_customer_name(session, order, payload["order"])
+    await _attach_courier_assignments(session, [order], [payload["order"]])
     return {"data": payload} if False else payload
 
 
@@ -3436,22 +3808,46 @@ async def change_order_status(
     courier_actor = bool(roles.intersection({"courier", "delivery"}) and not roles.intersection({"admin", "manager", "logistics", "staff", "employee"}))
     if courier_actor:
         assignment_model = MODEL_BY_TABLE["courier_assignments"]
-        assignment = (
+        courier_assignments = list(
             await session.execute(
                 select(assignment_model).where(
                     assignment_model.order_id == order.id,
                     or_(assignment_model.user_id == user.id, assignment_model.courier_id == user.id),
                     assignment_model.deleted_at.is_(None),
                     assignment_model.status.in_(["active", "assigned", "accepted", "picked_up", "out_for_delivery"]),
-                ).with_for_update().limit(1)
+                ).with_for_update()
             )
-        ).scalar_one_or_none()
+        ).scalars()
+        assignment = next((row for row in courier_assignments if _courier_assignment_is_current(row)), None)
         if assignment is None:
             raise HTTPException(status_code=403, detail="courier_not_assigned")
     previous, next_status = assert_allowed_transition(order.status, next_status, courier=courier_actor)
-    # Couriers must provide delivery proof. Staff and administrators are
-    # allowed to record a verified/manual delivery from the operations panel,
-    # where the authenticated staff action is already audited below.
+    if next_status in {"delivered", "completed"}:
+        assignment_model = MODEL_BY_TABLE["courier_assignments"]
+        order_assignments = list(
+            (
+                await session.execute(
+                    select(assignment_model).where(
+                        assignment_model.order_id == order.id,
+                        assignment_model.deleted_at.is_(None),
+                    ).with_for_update()
+                )
+            ).scalars()
+        )
+        current_assignment = next(
+            (
+                row for row in order_assignments
+                if _courier_assignment_is_current(row)
+                and str(getattr(row, "status", "") or "").strip().lower()
+                not in COURIER_ASSIGNMENT_TERMINAL_STATUSES
+            ),
+            None,
+        )
+        if current_assignment is None:
+            raise HTTPException(status_code=409, detail="courier_assignment_required_for_delivery")
+    # Couriers must provide delivery proof. Staff and administrators can
+    # record a delivery from the operations panel only after a courier is
+    # explicitly linked, so the final order state remains traceable.
     if courier_actor:
         assert_delivery_proof(next_status, body)
     order.status = next_status
@@ -3766,7 +4162,37 @@ async def catalog_admin_products(
     result = await session.execute(
         select(Product).where(Product.deleted_at.is_(None)).order_by(Product.updated_at.desc()).limit(limit)
     )
-    rows = await _product_payloads(session, list(result.scalars()), public=False)
+    products = list(result.scalars())
+    rows = await _product_payloads(session, products, public=False)
+    assignments_by_product = await _manage_product_inventory_summary(
+        session, {str(product.id) for product in products}
+    )
+    for row in rows:
+        product_id = str(row.get("id") or "")
+        assignments = assignments_by_product.get(product_id, [])
+        row["inventory_locations"] = assignments
+        row["warehouse_count"] = len(assignments)
+        row["warehouse_id"] = (
+            assignments[0]["warehouse_id"] if len(assignments) == 1 else None
+        )
+        row["warehouse_name"] = (
+            "، ".join(
+                dict.fromkeys(
+                    str(entry.get("warehouse_name") or "مستودع غير معروف")
+                    for entry in assignments
+                )
+            )
+            if assignments
+            else "غير موزع"
+        )
+        row["warehouse_quantity"] = (
+            sum(int(entry.get("quantity") or 0) for entry in assignments)
+            if assignments
+            else int(row.get("stock_quantity") or 0)
+        )
+        row["inventory_assignment_status"] = (
+            "assigned" if assignments else "unassigned"
+        )
     return {"data": rows}
 
 

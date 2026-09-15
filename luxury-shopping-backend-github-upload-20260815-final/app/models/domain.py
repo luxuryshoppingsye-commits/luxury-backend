@@ -91,9 +91,10 @@ class StaffPermissionSet(Base, TimestampMixin):
 class AuthSession(Base, UuidPrimaryKeyMixin, TimestampMixin):
     """Durable server-side login session owned by one user.
 
-    The raw session token is never stored.  A remembered mobile session has
-    no fixed expiry and is ended by logout, account security changes, or an
-    administrator revoking the session.
+    The raw session token is never stored. A remembered mobile session can
+    renew short-lived access tokens, but expires after five hours and can
+    also be ended by logout, account security changes, or administrator
+    revocation.
     """
 
     __tablename__ = "auth_sessions"
@@ -479,6 +480,7 @@ COMMON_FIELD_SPECS: dict[str, Any] = {
     "reviewed_by": lambda: _col(UUID(as_uuid=True), index=True),
     "requested_by": lambda: _col(UUID(as_uuid=True), index=True),
     "name": lambda: _col(String(500), index=True),
+    "order_number": lambda: _col(String(80), index=True),
     "name_en": lambda: _col(String(500)),
     "title": lambda: _col(String(500), index=True),
     "label": lambda: _col(String(240), index=True),
@@ -628,7 +630,7 @@ RESOURCE_SPECS: dict[str, tuple[str, ...]] = {
     "partner_order_requests": ("partner_id", "order_id", "status", "notes"),
     "partner_payments": ("partner_id", "order_id", "status", "amount"),
     "local_shopping_requests": ("user_id", "status", "description", "amount"),
-    "international_orders": ("user_id", "status", "description", "amount"),
+    "international_orders": ("order_number", "user_id", "status", "description", "amount"),
     "global_sites": ("name", "name_en", "url", "logo_url", "status", "is_active", "sort_order"),
     "currencies": ("name", "name_en", "code", "status", "is_active"),
     "suppliers": ("name", "name_en", "email", "phone", "status", "description", "is_active"),

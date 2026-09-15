@@ -300,7 +300,11 @@ def _send_resend_email_sync(
 async def _allowed_by_preferences(session: AsyncSession, row: Any, channel: str) -> tuple[bool, str | None]:
     user_id = getattr(row, "user_id", None)
     extra = _extra(row)
-    if channel == "email" and user_id is None and extra.get("contact_message_id"):
+    # A reply to a contact message is a direct response to an action initiated
+    # by the customer. It must not disappear because the customer disabled
+    # optional support-update emails; the contact-reply route has already
+    # authorized and identified this transactional message.
+    if channel == "email" and extra.get("contact_message_id"):
         return True, None
     if user_id is None:
         return False, "recipient_user_required"
