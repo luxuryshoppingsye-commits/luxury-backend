@@ -283,12 +283,14 @@ def public_category_summary(category: Category | None) -> dict[str, Any] | None:
 def public_brand_summary(brand: Brand | None) -> dict[str, Any] | None:
     if brand is None:
         return None
+    logo_url = public_brand_logo_url(brand.logo_url)
     return {
         "id": str(brand.id),
         "name": brand.name,
         "name_en": brand.name_en,
         "slug": brand.slug,
-        "logo_url": brand.logo_url,
+        "logo_url": logo_url,
+        "logoUrl": logo_url,
     }
 
 
@@ -610,6 +612,41 @@ def _public_upload_url(value: Any) -> str | None:
     if lowered.startswith(("data:", "javascript:")):
         return None
     return f"/uploads/{raw.lstrip('/')}"
+
+
+def public_brand_logo_url(value: Any) -> str | None:
+    """Return a browser-safe public URL for a brand logo reference.
+
+    Brand records created through the secure upload flow may retain the
+    ``file:<uuid>`` reference instead of the response URL.  Keep that
+    reference resolvable through the public, policy-checked brand-logo route;
+    legacy paths and configured CDN URLs continue through the normal upload
+    URL normalizer.
+    """
+    if isinstance(value, dict):
+        for key in ("url", "logo_url", "logoUrl", "path", "src"):
+            normalized = public_brand_logo_url(value.get(key))
+            if normalized:
+                return normalized
+        return None
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("file:"):
+        asset_id = raw.split(":", 1)[1].strip()
+        try:
+            asset_uuid = uuid.UUID(asset_id)
+        except (ValueError, AttributeError):
+            return None
+        return f"/api/catalog/brand-logo/{asset_uuid}"
+    normalized = _public_upload_url(raw)
+    if normalized:
+        return normalized
+    if raw.lower().startswith(("data:", "javascript:")):
+        return None
+    return raw
 
 
 async def build_public_product_rows(

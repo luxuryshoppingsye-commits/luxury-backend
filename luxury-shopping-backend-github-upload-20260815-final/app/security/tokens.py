@@ -12,7 +12,11 @@ from ..config import get_settings
 
 
 ALGORITHM = "HS256"
-DEFAULT_AUTH_SESSION_MAX_HOURS = 5
+# Keep the authenticated session alive for one year unless it is explicitly
+# configured shorter. The short-lived access token is still renewed through
+# the server-side session record.
+DEFAULT_AUTH_SESSION_MAX_HOURS = 24 * 365
+MAX_AUTH_SESSION_MAX_HOURS = 24 * 365
 
 
 def session_max_age_seconds(settings: Any | None = None) -> int:
@@ -23,7 +27,7 @@ def session_max_age_seconds(settings: Any | None = None) -> int:
     )
     return max(
         60 * 60,
-        min(DEFAULT_AUTH_SESSION_MAX_HOURS * 60 * 60, configured_hours * 60 * 60),
+        min(MAX_AUTH_SESSION_MAX_HOURS * 60 * 60, configured_hours * 60 * 60),
     )
 
 

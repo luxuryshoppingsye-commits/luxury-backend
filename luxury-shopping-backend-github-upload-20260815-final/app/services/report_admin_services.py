@@ -471,6 +471,47 @@ class RevenueRecognitionService:
         return regular_rows + supplemental_rows
 
     @classmethod
+    async def order_activity_summary(
+        cls,
+        session: AsyncSession,
+        *,
+        start: Any = None,
+        end: Any = None,
+    ) -> dict[str, Any]:
+        """Return the value and count of every eligible order, paid or not.
+
+        Revenue recognition intentionally counts only successful payments. The
+        accounting dashboard also needs the order activity itself so pending
+        cash-on-delivery and local/international requests are visible instead
+        of making a busy period look empty.
+        """
+
+        orders = await cls.eligible_orders(session, start=start, end=end)
+        supplemental = await cls._supplemental_orders(session, start=start, end=end)
+        order_value = money(sum((money(order.total or 0) for order in orders), Decimal("0.00")))
+        currency_code = next(
+            (
+                str(getattr(order, "currency_code", "") or "").strip() or "YER"
+                for order in orders
+            ),
+            "YER",
+        )
+        for _, record in supplemental:
+            payload = serialize_record(record)
+            order_value += cls._supplemental_payload_total(payload)
+            if currency_code == "YER":
+                currency_code = str(
+                    payload.get("currency_code")
+                    or payload.get("currencyCode")
+                    or "YER"
+                ).strip() or "YER"
+        return {
+            "order_count": len(orders) + len(supplemental),
+            "order_value": money(order_value),
+            "currency_code": currency_code,
+        }
+
+    @classmethod
     async def pending_payment_amount(
         cls,
         session: AsyncSession,
@@ -517,6 +558,7 @@ class RevenueRecognitionService:
     @classmethod
     async def summary(cls, session: AsyncSession, *, start: Any = None, end: Any = None, partner_id: uuid.UUID | None = None) -> dict[str, Any]:
         rows = await cls.order_rows(session, start=start, end=end, partner_id=partner_id)
+        activity = await cls.order_activity_summary(session, start=start, end=end)
         gross = money(sum((row.partner_share_gross for row in rows), Decimal("0.00")))
         refunds = money(sum((row.refund_total for row in rows), Decimal("0.00")))
         net = money(sum((row.net_revenue for row in rows), Decimal("0.00")))
@@ -531,6 +573,9 @@ class RevenueRecognitionService:
             "net_revenue": format(net, "f"),
             "currency_code": rows[0].currency_code if rows else "YER",
             "partner_scope": str(partner_id) if partner_id else None,
+            "order_activity_count": activity["order_count"],
+            "order_activity_value": format(activity["order_value"], "f"),
+            "order_activity_currency_code": activity["currency_code"],
         }
 
     @classmethod

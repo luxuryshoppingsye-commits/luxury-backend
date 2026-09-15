@@ -91,8 +91,8 @@ class StaffPermissionSet(Base, TimestampMixin):
 class AuthSession(Base, UuidPrimaryKeyMixin, TimestampMixin):
     """Durable server-side login session owned by one user.
 
-    The raw session token is never stored. A remembered mobile session can
-    renew short-lived access tokens, but expires after five hours and can
+    The raw session token is never stored. A remembered web or mobile session can
+    renew short-lived access tokens, but expires after one year and can
     also be ended by logout, account security changes, or administrator
     revocation.
     """

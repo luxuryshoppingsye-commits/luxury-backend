@@ -440,6 +440,17 @@ async def test_order_state_machine_courier_assignment_and_delivery_proof() -> No
         )
         assert delivered.status_code == 200 and delivered.json()["status"] == "delivered"
 
+        cannot_unassign_delivered = await client.patch(
+            f"/api/admin/orders/{order_id}/courier-assignment",
+            headers=admin_headers,
+            json={"courier_id": None},
+        )
+        assert (
+            cannot_unassign_delivered.status_code == 409
+            and cannot_unassign_delivered.json()["detail"]
+            == "courier_assignment_required_for_delivered_order"
+        )
+
         async with SessionFactory() as session:
             stored = await session.get(Order, order_id)
             assert stored is not None and stored.status == "delivered"

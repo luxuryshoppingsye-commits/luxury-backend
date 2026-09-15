@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 
 import pytest
@@ -95,6 +96,20 @@ def test_catalog_proxy_path_uses_absolute_api_url_in_production(monkeypatch) -> 
     assert catalog_policy._public_upload_url(
         "/api/catalog/image-proxy/products/item-1.webp"
     ) == "https://api.luxuryshoppings.com/api/catalog/image-proxy/products/item-1.webp"
+
+
+def test_brand_file_reference_uses_public_checked_logo_route() -> None:
+    asset_id = uuid.uuid4()
+
+    assert catalog_policy.public_brand_logo_url(f"file:{asset_id}") == (
+        f"/api/catalog/brand-logo/{asset_id}"
+    )
+
+
+def test_brand_legacy_site_asset_path_is_normalized() -> None:
+    assert catalog_policy.public_brand_logo_url("site-assets/brands/chanel.webp") == (
+        "/uploads/site-assets/brands/chanel.webp"
+    )
 
 
 def test_share_image_reader_allows_configured_api_and_r2_hosts(monkeypatch) -> None:

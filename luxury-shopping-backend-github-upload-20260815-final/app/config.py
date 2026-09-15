@@ -48,7 +48,12 @@ class Settings(BaseSettings):
     jwt_secret: str = Field(alias="JWT_SECRET", min_length=32)
     jwt_access_token_minutes: int = Field(30, alias="JWT_ACCESS_TOKEN_MINUTES", ge=5, le=1440)
     jwt_refresh_token_days: int = Field(365, alias="JWT_REFRESH_TOKEN_DAYS", ge=1, le=365)
-    auth_session_max_hours: int = Field(5, alias="AUTH_SESSION_MAX_HOURS", ge=1, le=5)
+    auth_session_max_hours: int = Field(
+        24 * 365,
+        alias="AUTH_SESSION_MAX_HOURS",
+        ge=1,
+        le=24 * 365,
+    )
     upload_dir: Path = Field(Path("backend/data/uploads"), alias="UPLOAD_DIR")
     upload_fallback_dir: Path | None = Field(None, alias="UPLOAD_FALLBACK_DIR")
     storage_provider: str = Field("local", alias="STORAGE_PROVIDER")

@@ -113,6 +113,7 @@ async def test_report_exports_create_real_files_and_recognize_revenue() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         headers = await _login(client, admin, admin_password)
         source = await client.get("/api/finance/reports", headers=headers)
+        summary = await client.get("/api/finance/summary", headers=headers)
         csv_export = await client.post("/reports/export", headers={**headers, "Idempotency-Key": run_id}, json={"type": "orders", "format": "csv"})
         pdf_export = await client.post("/reports/export", headers=headers, json={"type": "summary", "format": "pdf"})
         csv_download = await client.get(csv_export.json()["download_url"].replace("http://testserver", ""), headers=headers)
@@ -121,6 +122,11 @@ async def test_report_exports_create_real_files_and_recognize_revenue() -> None:
     assert source.status_code == 200, source.text
     revenue = source.json()["data"]["revenue"]
     assert Decimal(revenue["net_revenue"]) >= Decimal("70.00")
+    assert summary.status_code == 200, summary.text
+    accounting = summary.json()["data"]
+    assert Decimal(str(accounting["orderActivityValue"])) >= Decimal("200.00")
+    assert accounting["orderActivityCount"] >= 2
+    assert Decimal(str(accounting["pendingPayments"])) >= Decimal("100.00")
     assert csv_export.status_code == 200, csv_export.text
     assert csv_export.json()["status"] == "ready"
     assert csv_export.json()["ready_has_valid_file"] is True

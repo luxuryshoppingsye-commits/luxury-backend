@@ -15,8 +15,8 @@ def _configure_test_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ALLOW_TEST_FIXTURES", "true")
     monkeypatch.setenv("JWT_SECRET", "unit-test-secret-value-with-32-characters-minimum")
     monkeypatch.setenv("JWT_ACCESS_TOKEN_MINUTES", "15")
-    monkeypatch.setenv("JWT_REFRESH_TOKEN_DAYS", "7")
-    monkeypatch.setenv("AUTH_SESSION_MAX_HOURS", "5")
+    monkeypatch.setenv("JWT_REFRESH_TOKEN_DAYS", "365")
+    monkeypatch.setenv("AUTH_SESSION_MAX_HOURS", "8760")
     get_settings.cache_clear()
 
 
@@ -66,5 +66,12 @@ def test_refresh_token_returns_raw_digest_and_expiry(monkeypatch: pytest.MonkeyP
     assert digest == tokens.token_hash(raw)
     assert raw != digest
     lifetime_seconds = (expires_at - datetime.now(timezone.utc)).total_seconds()
-    assert 0 < lifetime_seconds <= 5 * 60 * 60
+    assert 0 < lifetime_seconds <= 365 * 24 * 60 * 60
     assert tokens.token_hash(raw) == tokens.token_hash(raw)
+
+
+def test_session_max_age_is_one_year_and_cannot_exceed_the_safety_cap() -> None:
+    one_year = 365 * 24 * 60 * 60
+
+    assert tokens.session_max_age_seconds(type("Settings", (), {"auth_session_max_hours": 8760})()) == one_year
+    assert tokens.session_max_age_seconds(type("Settings", (), {"auth_session_max_hours": 99999})()) == one_year

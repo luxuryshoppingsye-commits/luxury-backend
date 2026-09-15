@@ -474,6 +474,7 @@ def _web_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 REMEMBER_ME_COOKIE = "luxury_remember_me"
+SESSION_COOKIE = "luxury_session"
 
 
 def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent: bool = True) -> None:
@@ -483,6 +484,7 @@ def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent:
         settings.jwt_refresh_token_days * 24 * 60 * 60,
         session_max_age_seconds(settings),
     )
+    session_cookie_max_age = session_max_age_seconds(settings)
     cookie_options: dict[str, Any] = {
         "httponly": True,
         "samesite": "lax",
@@ -501,6 +503,12 @@ def _set_refresh_cookie(response: Response, payload: dict[str, Any], persistent:
         if persistent:
             refresh_cookie_options["max_age"] = refresh_cookie_max_age
         response.set_cookie("rt", str(token), **refresh_cookie_options)
+    session_token = payload.get("session_token")
+    if session_token:
+        session_cookie_options = dict(cookie_options)
+        if persistent:
+            session_cookie_options["max_age"] = session_cookie_max_age
+        response.set_cookie(SESSION_COOKIE, str(session_token), **session_cookie_options)
     if persistent:
         remember_cookie_options = dict(cookie_options)
         remember_cookie_options["max_age"] = refresh_cookie_max_age
@@ -631,7 +639,11 @@ async def web_firebase_auth(
 @router.post("/api/auth/login")
 async def web_login(body: LoginRequest, request: Request, response: Response, session: AsyncSession = Depends(get_session)):
     payload = await login(body, request, session)
-    _set_refresh_cookie(response, payload, persistent=body.remember_me)
+    # Web authentication is a durable session by contract. Keep the legacy
+    # remember_me field accepted for older clients, but do not let an
+    # unchecked client flag turn a successful login into a logout on the next
+    # browser restart.
+    _set_refresh_cookie(response, payload, persistent=True)
     return _web_auth_payload(payload)
 
 
@@ -893,17 +905,26 @@ async def web_refresh(
     session: AsyncSession = Depends(get_session),
 ):
     token = request.cookies.get("rt")
+    session_token = request.cookies.get(SESSION_COOKIE)
     persistent = request.cookies.get(REMEMBER_ME_COOKIE) == "1"
     try:
         body = await request.json()
         if isinstance(body, dict):
             token = body.get("refresh_token") or body.get("refreshToken") or token
+            session_token = body.get("session_token") or body.get("sessionToken") or session_token
     except Exception:
         pass
-    if not token:
+    if not token and not session_token:
         raise HTTPException(status_code=401, detail="refresh_token_required")
     try:
-        payload = await rotate_refresh_token(session, str(token), request)
+        if session_token:
+            # A durable session is the source of truth for the web login. Do
+            # not fall back to a refresh token after it has been revoked.
+            payload = await rotate_auth_session(session, str(session_token), request)
+        else:
+            # Keep compatibility with cookies issued before the durable
+            # session cookie was introduced.
+            payload = await rotate_refresh_token(session, str(token), request)
     except HTTPException:
         await session.commit()
         raise
@@ -925,18 +946,24 @@ async def logout(body: RefreshRequest, session: AsyncSession = Depends(get_sessi
 @router.post("/api/auth/logout")
 async def web_logout(request: Request, response: Response, session: AsyncSession = Depends(get_session)):
     token = request.cookies.get("rt")
+    session_token = request.cookies.get(SESSION_COOKIE)
     try:
         body = await request.json()
         if isinstance(body, dict):
             token = body.get("refresh_token") or body.get("refreshToken") or token
+            session_token = body.get("session_token") or body.get("sessionToken") or session_token
     except Exception:
         pass
     if token:
         await revoke_refresh_token(session, str(token))
+    if session_token:
+        await revoke_auth_session(session, str(session_token))
+    if token or session_token:
         await session.commit()
     result = {"ok": True}
     response.delete_cookie("at", path="/")
     response.delete_cookie("rt", path="/")
+    response.delete_cookie(SESSION_COOKIE, path="/")
     response.delete_cookie(REMEMBER_ME_COOKIE, path="/")
     return result
 
@@ -1018,6 +1045,7 @@ async def logout_all_sessions(
     await session.commit()
     response.delete_cookie("at", path="/")
     response.delete_cookie("rt", path="/")
+    response.delete_cookie(SESSION_COOKIE, path="/")
     return {"ok": True, "revoked": revoked}
 
 

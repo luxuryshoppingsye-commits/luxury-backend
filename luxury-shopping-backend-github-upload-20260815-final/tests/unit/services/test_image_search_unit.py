@@ -313,3 +313,67 @@ async def test_product_description_rejects_non_https_image_urls():
     with pytest.raises(HTTPException) as exc:
         await service._assert_public_https_url("http://example.test/product.jpg")
     assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_deep_product_analysis_returns_structured_gemini_fields(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(
+        gemini_api_key="test-key", google_api_key="", ai_api_key="",
+        ai_default_model="gemini-2.5-flash", ai_request_timeout_seconds=10))
+    encoded = service._image_data(image_body())
+    monkeypatch.setattr(service, "_image_data_from_public_url", AsyncMock(return_value=encoded))
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, headers, json):
+            prompt = json["contents"][0]["parts"][0]["text"]
+            assert "exactly these keys" in prompt
+            inline = json["contents"][0]["parts"][1]["inlineData"]
+            assert inline["mimeType"] == "image/jpeg"
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+                "candidates": [{"content": {"parts": [{"text": (
+                    '{"productName":"حقيبة جلدية", "productNameEn":"Leather bag", '
+                    '"category":"حقائب", "subcategory":"حقائب يد", '
+                    '"description":"حقيبة عملية بتصميم واضح وألوان هادئة للاستخدام اليومي.", '
+                    '"keywords":["حقيبة","حقيبة"], "attributes":["مقبض علوي"], '
+                    '"colors":["بني"], "features":["تصميم عملي"], "brand":"", '
+                    '"material":"جلد", "condition":"جديدة", "targetAudience":"نساء", '
+                    '"estimatedPriceRange":""}'
+                )}]}}]})
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", Client)
+    result = await service.deep_analyze_product_image("https://images.example.test/product.jpg")
+
+    assert result["productName"] == "حقيبة جلدية"
+    assert result["productNameEn"] == "Leather bag"
+    assert result["keywords"] == ["حقيبة"]
+    assert result["estimatedPriceRange"] == ""
+
+
+@pytest.mark.asyncio
+async def test_product_assistant_deep_analyze_dispatches_to_image_service(monkeypatch):
+    from backend.app.services import function_service
+
+    analyzer = AsyncMock(return_value={"productName": "حقيبة", "description": "وصف"})
+    monkeypatch.setattr(service, "deep_analyze_product_image", analyzer)
+    monkeypatch.setattr(function_service, "roles_for", AsyncMock(return_value=["admin"]))
+    monkeypatch.setattr(function_service, "_reserve_ai_usage", AsyncMock(return_value="ledger"))
+
+    class Quota:
+        def __init__(self, session): pass
+        async def complete(self, ledger_id, *, actual_tokens): pass
+        async def fail(self, ledger_id, *, error_code_safe): raise AssertionError(error_code_safe)
+
+    monkeypatch.setattr(function_service, "AIQuotaService", Quota)
+    result = await function_service.execute_function(
+        "ai-product-assistant",
+        {"action": "deep_analyze", "imageUrl": "https://images.example.test/product.jpg"},
+        SimpleNamespace(id="user-id"),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    assert result["productName"] == "حقيبة"
+    analyzer.assert_awaited_once_with("https://images.example.test/product.jpg")

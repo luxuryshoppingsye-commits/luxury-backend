@@ -47,6 +47,7 @@ from ...services.catalog_policy import (
     public_main_storefront_response,
     public_product_response,
     public_storefront_response,
+    public_brand_logo_url,
     validate_public_product_or_404,
     _public_upload_url,
 )
@@ -1505,6 +1506,14 @@ async def brands(limit: int = Query(100, ge=1, le=5000), session: AsyncSession =
     return await public_read_cache.get_or_set(key, lambda: _brands_uncached(limit=limit, session=session))
 
 
+def _brand_payload(brand: Brand) -> dict[str, Any]:
+    payload = serialize_record(brand)
+    logo_url = public_brand_logo_url(payload.get("logo_url") or payload.get("logoUrl"))
+    payload["logo_url"] = logo_url
+    payload["logoUrl"] = logo_url
+    return payload
+
+
 async def _brands_uncached(limit: int, session: AsyncSession) -> list[dict[str, Any]]:
     result = await session.execute(
         select(Brand)
@@ -1514,7 +1523,7 @@ async def _brands_uncached(limit: int, session: AsyncSession) -> list[dict[str, 
     )
     return [
         row
-        for row in (serialize_record(item) for item in result.scalars())
+        for row in (_brand_payload(item) for item in result.scalars())
         if _safe_public_display_text(row.get("name")) or _safe_public_display_text(row.get("name_en"))
     ]
 
@@ -1591,7 +1600,7 @@ async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dic
 @router.get("/api/catalog/admin/brands")
 async def catalog_admin_brands(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(Brand).where(Brand.deleted_at.is_(None)).order_by(Brand.name))
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    return {"data": [_brand_payload(row) for row in result.scalars()]}
 
 
 @router.get("/products")
@@ -1917,6 +1926,50 @@ def _canonicalize_catalog_image(data: bytes) -> tuple[bytes, str] | None:
     except Exception:
         return None
     return data, media_type
+
+
+@router.get("/catalog/brand-logo/{file_id}")
+async def catalog_brand_logo(file_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+    """Serve a public brand logo saved by the secure file upload flow."""
+    asset = await session.get(FileAsset, file_id)
+    if (
+        asset is None
+        or asset.deleted_at is not None
+        or asset.policy_key != "site_asset"
+        or asset.visibility != "public"
+        or asset.status != "available"
+        or asset.scan_status not in {"clean", "not_required"}
+        or not str(asset.content_type or "").lower().startswith("image/")
+    ):
+        raise HTTPException(status_code=404, detail="brand_logo_not_found")
+
+    response_headers = {
+        "Cache-Control": "public, max-age=86400, s-maxage=604800, immutable",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if asset.storage_provider == "cloudflare_r2":
+        try:
+            r2_response = storage._r2_client().get_object(
+                Bucket=str(storage.settings.r2_bucket),
+                Key=str(asset.storage_key),
+            )
+            body = r2_response.get("Body")
+            if body is None:
+                raise HTTPException(status_code=404, detail="brand_logo_not_found")
+            data = body.read()
+            body.close()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="brand_logo_not_found") from exc
+        return Response(data, media_type=asset.content_type, headers=response_headers)
+
+    if asset.storage_provider != "local_uploads":
+        raise HTTPException(status_code=404, detail="brand_logo_not_found")
+    target = storage._safe_join(asset.storage_key)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="brand_logo_not_found")
+    return Response(target.read_bytes(), media_type=asset.content_type, headers=response_headers)
 
 
 @router.get("/catalog/image-proxy/{image_path:path}")
@@ -4078,7 +4131,7 @@ async def manage_brands(
         .order_by(Brand.name)
         .limit(limit)
     )
-    return [serialize_record(row) for row in result.scalars()]
+    return [_brand_payload(row) for row in result.scalars()]
 
 
 @router.get("/manage/suppliers")
@@ -4121,7 +4174,7 @@ async def manage_create_brand(
     session.add(brand)
     await session.commit()
     await session.refresh(brand)
-    return serialize_record(brand)
+    return _brand_payload(brand)
 
 
 @router.post("/manage/suppliers", status_code=201)
@@ -4468,6 +4521,20 @@ async def delete_product(product_id: uuid.UUID, user: User = Depends(current_use
         variants=variants,
         actor=user,
     )
+    session.add(
+        MODEL_BY_TABLE["audit_logs"](
+            user_id=user.id,
+            type="products.delete",
+            description=f"Deleted products record {product_id}",
+            extra_data={
+                "action": "delete",
+                "table_name": "products",
+                "record_id": str(product_id),
+                "source": "manage_products_api",
+                "deleted_variant_count": len(variants),
+            },
+        )
+    )
     await session.commit()
     return {"ok": True, "removed_assets": removed_assets, "data": serialize_record(product)}
 
@@ -4535,5 +4602,18 @@ async def delete_variant(variant_id: uuid.UUID, user: User = Depends(current_use
     _require_product_owner(product, user, roles)
     variant.deleted_at = datetime.now(timezone.utc)
     variant.is_active = False
+    session.add(
+        MODEL_BY_TABLE["audit_logs"](
+            user_id=user.id,
+            type="product_variants.delete",
+            description=f"Deleted product_variants record {variant_id}",
+            extra_data={
+                "action": "delete",
+                "table_name": "product_variants",
+                "record_id": str(variant_id),
+                "source": "manage_product_variants_api",
+            },
+        )
+    )
     await session.commit()
     return {"ok": True}

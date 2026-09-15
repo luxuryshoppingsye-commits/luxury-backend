@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -1292,13 +1292,34 @@ class ResourceRepository:
             record = await self._record_from_row(row)
             if record is None:
                 continue
+            record_id = str(getattr(record, "id", ""))
             deleted_rows.append(self._serialize_response(record))
             if self.table == "categories":
                 await self._delete_category_resource_record(record.id)
             elif hasattr(record, "deleted_at"):
-                record.deleted_at = datetime.now().astimezone()
+                record.deleted_at = datetime.now(timezone.utc)
             else:
                 await self.session.delete(record)
+            # Deletions must remain auditable even when the deleted resource is
+            # soft-deleted and disappears from normal resource queries.  The
+            # compatibility clients send the event fields in ``extra_data``;
+            # the report endpoint understands this shape as well as the
+            # canonical ``type``/``description`` shape.
+            if self.user_id is not None:
+                audit_model = MODEL_BY_TABLE["audit_logs"]
+                self.session.add(
+                    audit_model(
+                        user_id=self.user_id,
+                        type=f"{self.table}.deleted",
+                        description=f"Deleted {self.table} record {record_id}",
+                        extra_data={
+                            "action": "delete",
+                            "table_name": self.table,
+                            "record_id": record_id,
+                            "source": "resource_api",
+                        },
+                    )
+                )
         await self.session.flush()
         return deleted_rows
 

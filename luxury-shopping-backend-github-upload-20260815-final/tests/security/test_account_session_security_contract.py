@@ -83,6 +83,11 @@ async def test_web_refresh_keeps_a_remembered_session_persistent(monkeypatch: py
         return {"type": "http.request", "body": b"", "more_body": False}
 
     monkeypatch.setattr(auth_routes, "rotate_refresh_token", rotate)
+    monkeypatch.setattr(
+        auth_routes,
+        "get_settings",
+        lambda: SimpleNamespace(app_env="test", jwt_refresh_token_days=365, auth_session_max_hours=8760),
+    )
     request = Request(
         {
             "type": "http",
@@ -100,8 +105,159 @@ async def test_web_refresh_keeps_a_remembered_session_persistent(monkeypatch: py
     await auth_routes.web_refresh(request, response, Session())
 
     cookies = response.headers.getlist("set-cookie")
-    assert any("rt=new-refresh-token" in header and "Max-Age=18000" in header for header in cookies)
-    assert any("luxury_remember_me=1" in header and "Max-Age=18000" in header for header in cookies)
+    assert any("rt=new-refresh-token" in header and "Max-Age=31536000" in header for header in cookies)
+    assert any("luxury_remember_me=1" in header and "Max-Age=31536000" in header for header in cookies)
+
+
+async def test_web_refresh_prefers_the_durable_session_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def rotate_session(_session: object, token: str, _request: Request) -> dict[str, object]:
+        calls.append(f"session:{token}")
+        return {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+            "roles": [],
+        }
+
+    async def unexpected_refresh(*_args: object, **_kwargs: object) -> dict[str, object]:
+        pytest.fail("the web refresh must use the durable session cookie when it is present")
+
+    class Session:
+        async def commit(self) -> None:
+            return None
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    monkeypatch.setattr(auth_routes, "rotate_auth_session", rotate_session)
+    monkeypatch.setattr(auth_routes, "rotate_refresh_token", unexpected_refresh)
+    monkeypatch.setattr(
+        auth_routes,
+        "get_settings",
+        lambda: SimpleNamespace(app_env="test", jwt_refresh_token_days=365, auth_session_max_hours=8760),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/auth/refresh",
+            "headers": [
+                (b"cookie", b"luxury_session=durable-session-token"),
+                (b"content-type", b"application/json"),
+            ],
+        },
+        receive,
+    )
+    response = Response()
+
+    await auth_routes.web_refresh(request, response, Session())
+
+    assert calls == ["session:durable-session-token"]
+    assert any("rt=new-refresh-token" in header for header in response.headers.getlist("set-cookie"))
+
+
+async def test_web_login_cookie_persists_the_durable_session_for_one_year(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_routes,
+        "get_settings",
+        lambda: SimpleNamespace(app_env="test", jwt_refresh_token_days=365, auth_session_max_hours=8760),
+    )
+    response = Response()
+
+    auth_routes._set_refresh_cookie(
+        response,
+        {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "session_token": "durable-session-token",
+            "expires_in": 1800,
+        },
+        persistent=True,
+    )
+
+    cookies = response.headers.getlist("set-cookie")
+    assert any(
+        "luxury_session=durable-session-token" in header
+        and "Max-Age=31536000" in header
+        and "HttpOnly" in header
+        for header in cookies
+    )
+
+
+async def test_web_login_uses_durable_cookie_even_when_legacy_flag_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[bool] = []
+
+    async def fake_login(_body: object, _request: object, _session: object) -> dict[str, object]:
+        return {"user": {}, "roles": []}
+
+    def capture_cookie(_response: Response, _payload: dict[str, object], *, persistent: bool = True) -> None:
+        captured.append(persistent)
+
+    class Session:
+        pass
+
+    monkeypatch.setattr(auth_routes, "login", fake_login)
+    monkeypatch.setattr(auth_routes, "_set_refresh_cookie", capture_cookie)
+
+    await auth_routes.web_login(
+        SimpleNamespace(remember_me=False),
+        SimpleNamespace(),
+        Response(),
+        Session(),
+    )
+
+    assert captured == [True]
+
+
+async def test_web_logout_revokes_refresh_and_durable_session_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revoked: list[tuple[str, str]] = []
+
+    async def revoke_refresh(_session: object, token: str) -> None:
+        revoked.append(("refresh", token))
+
+    async def revoke_session(_session: object, token: str) -> None:
+        revoked.append(("session", token))
+
+    class Session:
+        commits = 0
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    monkeypatch.setattr(auth_routes, "revoke_refresh_token", revoke_refresh)
+    monkeypatch.setattr(auth_routes, "revoke_auth_session", revoke_session)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/auth/logout",
+            "headers": [(b"cookie", b"rt=refresh-token; luxury_session=session-token")],
+        },
+        receive,
+    )
+    response = Response()
+    session = Session()
+
+    await auth_routes.web_logout(request, response, session)
+
+    assert revoked == [
+        ("refresh", "refresh-token"),
+        ("session", "session-token"),
+    ]
+    assert session.commits == 1
+    deleted = response.headers.getlist("set-cookie")
+    assert any('luxury_session="";' in header and "Max-Age=0" in header for header in deleted)
 
 
 async def _latest_email_token(user_id: uuid.UUID, purpose_key: str) -> str:

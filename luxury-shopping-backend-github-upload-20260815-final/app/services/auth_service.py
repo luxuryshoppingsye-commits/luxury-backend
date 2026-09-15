@@ -474,7 +474,7 @@ async def auth_payload(
                     user_id=user.id,
                     session_token_hash=session_hash,
                     # A remembered session can renew short-lived access tokens,
-                    # but the authentication session itself ends after five hours.
+                    # but the authentication session itself ends after one year.
                     expires_at=now + timedelta(seconds=session_max_age_seconds(get_settings())),
                     last_seen_at=now,
                     remembered=True,
@@ -537,7 +537,7 @@ def _as_utc(value: datetime | None) -> datetime | None:
 
 
 def _effective_auth_session_expiry(auth_session: AuthSession) -> datetime | None:
-    """Apply the five-hour cap, including to legacy sessions with no expiry."""
+    """Apply the one-year cap, including to legacy sessions with no expiry."""
     created_at = _as_utc(getattr(auth_session, "created_at", None))
     current_expiry = _as_utc(getattr(auth_session, "expires_at", None))
     if created_at is None:

@@ -192,6 +192,31 @@ async def test_receipt_upload_review_signed_url_and_refund_security_contract() -
         assert direct_payment_receipt_url.status_code == 422
         assert direct_payment_receipt_url.json()["detail"] == "payment_receipts_must_use_order_endpoint"
 
+        missing_non_cash_receipt = await client.post(
+            f"/api/payments/orders/{order_id}",
+            headers=finance_headers,
+            json={"amount": "5.00", "status": "pending", "payment_method": "wallet_transfer"},
+        )
+        assert missing_non_cash_receipt.status_code == 422
+        assert missing_non_cash_receipt.json()["detail"] == "payment_receipt_required_for_non_cash"
+
+        generated_receipt_reference = await client.post(
+            f"/api/payments/orders/{order_id}",
+            headers=finance_headers,
+            json={
+                "amount": "5.00",
+                "status": "pending",
+                "payment_method": "wallet_transfer",
+                "receipt_url": f"receipt:{receipt_id}",
+            },
+        )
+        assert generated_receipt_reference.status_code == 201, generated_receipt_reference.text
+        assert generated_receipt_reference.json()["data"]["receipt_url"] == f"receipt:{receipt_id}"
+
+        listed_payments = await client.get(f"/api/payments/orders/{order_id}", headers=finance_headers)
+        assert listed_payments.status_code == 200, listed_payments.text
+        assert any(item.get("receipt_url") == f"receipt:{receipt_id}" for item in listed_payments.json()["data"])
+
         direct_payment_random_status = await client.post(
             f"/api/payments/orders/{order_id}",
             headers=finance_headers,

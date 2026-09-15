@@ -1055,9 +1055,33 @@ async def _public_rows(
     return list(result.scalars())
 
 
-def _add_audit_log(session: AsyncSession, user_id: uuid.UUID, action: str, description: str) -> None:
+def _add_audit_log(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    action: str,
+    description: str,
+    *,
+    table_name: str | None = None,
+    record_id: uuid.UUID | str | None = None,
+) -> None:
     model = MODEL_BY_TABLE["audit_logs"]
-    session.add(model(user_id=user_id, type=action, description=description))
+    extra_data = {
+        key: value
+        for key, value in {
+            "action": action,
+            "table_name": table_name,
+            "record_id": str(record_id) if record_id is not None else None,
+        }.items()
+        if value is not None
+    }
+    session.add(
+        model(
+            user_id=user_id,
+            type=action,
+            description=description,
+            extra_data=extra_data,
+        )
+    )
 
 
 def _storage_diagnostics() -> dict[str, Any]:
@@ -6292,6 +6316,11 @@ async def api_finance_summary(
     session: AsyncSession = Depends(get_session),
 ):
     revenue = await RevenueRecognitionService.summary(session, start=date_from, end=date_to)
+    activity = await RevenueRecognitionService.order_activity_summary(
+        session,
+        start=date_from,
+        end=date_to,
+    )
     expense_tables = ("general_expenses", "employee_payments", "partner_payments", "marketer_payments")
     expense_start, expense_end = _date_range(date_from, date_to)
 
@@ -6337,7 +6366,8 @@ async def api_finance_summary(
         end=date_to,
     )
     net_income = Decimal(revenue["net_revenue"])
-    gross_sales = Decimal(revenue["gross_revenue"])
+    recognized_gross_sales = Decimal(revenue["gross_revenue"])
+    order_activity_value = Decimal(activity["order_value"])
     collected_income = Decimal(revenue["paid_amount"])
     return {
         "data": {
@@ -6346,12 +6376,16 @@ async def api_finance_summary(
             "recognized_revenue": revenue,
             "payments": float(Decimal(revenue["paid_amount"])),
             "refunds": float(Decimal(revenue["refund_amount"])),
-            # Explicit names prevent the finance screen's gross sales figure
-            # from being confused with recognised/collected income.
-            "grossSales": float(gross_sales),
+            # Gross sales include eligible orders even while their payment is
+            # pending. Recognised/collected income remains separate below.
+            "grossSales": float(order_activity_value),
+            "recognizedGrossSales": float(recognized_gross_sales),
             "collectedIncome": float(collected_income),
             "recognizedIncome": float(net_income),
-            "remainingReceivable": float(max(gross_sales - collected_income, Decimal("0"))),
+            "remainingReceivable": float(max(order_activity_value - collected_income, Decimal("0"))),
+            "orderActivityValue": float(order_activity_value),
+            "orderActivityCount": int(activity["order_count"]),
+            "recognizedOrderCount": int(revenue["order_count"]),
             "currencyCode": revenue["currency_code"],
             "expenses": float(total_expenses),
             # These are the stable dashboard contract consumed by the web UI.
@@ -6369,6 +6403,7 @@ async def api_finance_summary(
 async def api_finance_today_stats(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     revenue = await RevenueRecognitionService.summary(session, start=today)
+    activity = await RevenueRecognitionService.order_activity_summary(session, start=today)
     order_model = MODEL_BY_TABLE["orders"]
     statement = (
         select(order_model)
@@ -6402,6 +6437,8 @@ async def api_finance_today_stats(staff: User = Depends(require_staff), session:
         "data": {
             "orders": orders,
             "collected": float(Decimal(revenue["paid_amount"])),
+            "salesValue": float(activity["order_value"]),
+            "orderActivityCount": int(activity["order_count"]),
             "recognized_revenue": revenue,
         }
     }
@@ -6555,13 +6592,29 @@ async def api_dashboard_kpis(staff: User = Depends(require_staff), session: Asyn
 
 
 @router.get("/api/analytics/activity/access")
-async def api_activity_access(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+async def api_activity_access(
+    limit: int = Query(200, ge=1, le=500),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
     return {"data": []}
 
 
 @router.get("/api/analytics/activity/audit")
-async def api_activity_audit(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": []}
+async def api_activity_audit(
+    limit: int = Query(500, ge=1, le=2000),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return the audit trail in the shape used by the activity-log page.
+
+    Older Flutter clients sent ``action``, ``table_name`` and ``details``.
+    The compatibility resource API stores those fields in ``extra_data``;
+    newer backend code stores the canonical values in ``type`` and
+    ``description``.  Both formats must remain visible in one report.
+    """
+    audit_rows = await _rows(session, "audit_logs", limit=limit)
+    return {"data": [_activity_audit_payload(row) for row in audit_rows]}
 
 
 @router.get("/api/reviews/store/public")
@@ -6712,8 +6765,58 @@ def _security_audit_table_label(type_value: Any, description: Any) -> str:
     return "النظام"
 
 
-def _security_audit_action(type_value: Any, description: Any) -> str:
-    searchable = f"{type_value or ''} {description or ''}".strip().lower()
+def _audit_extra_data(row: Any) -> dict[str, Any]:
+    value = getattr(row, "extra_data", None)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _first_audit_value(values: list[Any]) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _audit_event_values(row: Any) -> tuple[Any, Any, str, Any, dict[str, Any]]:
+    extra_data = _audit_extra_data(row)
+    type_value = _first_audit_value([
+        getattr(row, "type", None),
+        extra_data.get("action"),
+        extra_data.get("action_type"),
+        extra_data.get("operation"),
+        extra_data.get("event_type"),
+    ])
+    table_value = _first_audit_value([
+        extra_data.get("table_name"),
+        extra_data.get("table"),
+        extra_data.get("resource"),
+        extra_data.get("entity_type"),
+    ])
+    description = str(
+        _first_audit_value([
+            getattr(row, "description", None),
+            extra_data.get("description"),
+        ])
+        or ""
+    ).strip()
+    record_id = _first_audit_value([
+        extra_data.get("record_id"),
+        extra_data.get("recordId"),
+        extra_data.get("entity_id"),
+    ])
+    return type_value, table_value, description, record_id, extra_data
+
+
+def _security_audit_action(
+    type_value: Any,
+    description: Any,
+    extra_data: dict[str, Any] | None = None,
+) -> str:
+    extra_data = extra_data or {}
+    searchable = f"{type_value or ''} {description or ''} {extra_data.get('action') or ''} {extra_data.get('operation') or ''}".strip().lower()
     if any(token in searchable for token in ("delete", "deleted", "remove", "removed", "حذف", "إزالة")):
         return "delete"
     if any(
@@ -6738,38 +6841,72 @@ def _security_audit_action(type_value: Any, description: Any) -> str:
 
 
 def _security_audit_changed_fields(row: Any) -> dict[str, bool]:
-    extra_data = getattr(row, "extra_data", None)
-    if not isinstance(extra_data, dict):
-        return {}
-    for key in ("changed_fields", "changedFields", "fields"):
-        value = extra_data.get(key)
-        if isinstance(value, dict):
-            return {str(field): True for field in value}
-        if isinstance(value, list):
-            return {str(field): True for field in value if str(field).strip()}
+    extra_data = _audit_extra_data(row)
+    candidates: list[Any] = [extra_data]
+    details = extra_data.get("details")
+    if isinstance(details, dict):
+        candidates.insert(0, details)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("changed_fields", "changedFields", "fields"):
+            value = candidate.get(key)
+            if isinstance(value, dict):
+                return {str(field): True for field in value}
+            if isinstance(value, list):
+                return {str(field): True for field in value if str(field).strip()}
     return {}
 
 
-def _security_audit_payload(row: Any, *, include_description: bool = True) -> dict[str, Any]:
-    type_value = getattr(row, "type", "")
-    description = str(getattr(row, "description", "") or "").strip()
+def _activity_audit_payload(row: Any) -> dict[str, Any]:
+    type_value, table_value, description, record_id, extra_data = _audit_event_values(row)
+    action = str(
+        _first_audit_value([
+            extra_data.get("action"),
+            extra_data.get("operation"),
+            type_value,
+        ])
+        or "activity"
+    )
+    details = extra_data.get("details")
+    if not isinstance(details, dict):
+        details = _security_audit_changed_fields(row)
     created_at = getattr(row, "created_at", None)
     return {
         "id": str(getattr(row, "id", "")),
         "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
-        "table_name": _security_audit_table_label(type_value, description),
-        "action": _security_audit_action(type_value, description),
+        "table_name": str(table_value or _security_audit_table_label(type_value, description)),
+        "action": action,
+        "details": details,
+        "description": description,
+        "record_id": str(record_id) if record_id is not None else None,
+    }
+
+
+def _security_audit_payload(row: Any, *, include_description: bool = True) -> dict[str, Any]:
+    type_value, table_value, description, record_id, extra_data = _audit_event_values(row)
+    created_at = getattr(row, "created_at", None)
+    return {
+        "id": str(getattr(row, "id", "")),
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        "table_name": _security_audit_table_label(table_value or type_value, description),
+        "action": _security_audit_action(type_value, description, extra_data),
         "changed_fields": _security_audit_changed_fields(row),
         "description": description if include_description else "",
+        "record_id": str(record_id) if record_id is not None else None,
     }
 
 
 @router.get("/api/dashboard/sensitive-data-changes")
-async def api_sensitive_data_changes(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+async def api_sensitive_data_changes(
+    limit: int = Query(500, ge=1, le=2000),
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
     # This page is an audit trail. The previous implementation returned raw
     # rate-limit events, which do not contain the fields expected by the UI
     # and produced hundreds of timestamp-only rows.
-    audit_rows = await _rows(session, "audit_logs", limit=50)
+    audit_rows = await _rows(session, "audit_logs", limit=limit)
     data = [_security_audit_payload(row) for row in audit_rows]
 
     # Keep blocked security events visible when there is no audit trail, while
@@ -6783,7 +6920,7 @@ async def api_sensitive_data_changes(staff: User = Depends(require_staff), sessi
                 str(getattr(row, "type", "") or "").strip().lower() == "api_rate_limit"
                 and str(getattr(row, "status", "") or "").strip().lower() in {"allowed", "ok", "success"}
             )
-        ][:50]
+        ][:limit]
     return {"data": data}
 
 
@@ -7188,7 +7325,7 @@ async def api_loyalty_admin_update_tier(tier_id: uuid.UUID, request: Request, st
 
 @router.delete("/api/loyalty/admin/tiers/{tier_id}")
 async def api_loyalty_admin_delete_tier(tier_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await _api_delete(session, "loyalty_tiers", tier_id)
+    await _api_delete(session, "loyalty_tiers", tier_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -9343,7 +9480,7 @@ async def api_delete_local_payment(
     session: AsyncSession = Depends(get_session),
 ):
     require_finance_actor(roles)
-    await _api_delete(session, "order_payments", payment_id)
+    await _api_delete(session, "order_payments", payment_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -9468,7 +9605,7 @@ async def api_update_international_payment(payment_id: uuid.UUID, request: Reque
 @router.delete("/api/finance/international-order-payments/{payment_id}")
 async def api_delete_international_payment(payment_id: uuid.UUID, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     require_finance_actor(roles)
-    await _api_delete(session, "international_order_payments", payment_id)
+    await _api_delete(session, "international_order_payments", payment_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -9661,6 +9798,14 @@ async def api_admin_update_category(category_id: uuid.UUID, request: Request, st
 @router.delete("/api/catalog/admin/categories/{category_id}")
 async def api_admin_delete_category(category_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     await soft_delete_category_record(session, category_id)
+    _add_audit_log(
+        session,
+        staff.id,
+        "categories.delete",
+        f"Deleted categories record {category_id}",
+        table_name="categories",
+        record_id=category_id,
+    )
     await session.commit()
     return {"ok": True}
 
@@ -9687,7 +9832,18 @@ async def api_admin_update_brand(brand_id: uuid.UUID, request: Request, staff: U
 
 @router.delete("/api/catalog/admin/brands/{brand_id}")
 async def api_admin_delete_brand(brand_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await session.execute(delete(MODEL_BY_TABLE["brands"]).where(MODEL_BY_TABLE["brands"].id == brand_id))
+    brand_model = MODEL_BY_TABLE["brands"]
+    brand = await session.get(brand_model, brand_id)
+    await session.execute(delete(brand_model).where(brand_model.id == brand_id))
+    if brand is not None:
+        _add_audit_log(
+            session,
+            staff.id,
+            "brands.delete",
+            f"Deleted brands record {brand_id}",
+            table_name="brands",
+            record_id=brand_id,
+        )
     await session.commit()
     return {"ok": True}
 
@@ -9944,6 +10100,14 @@ async def api_admin_delete_product(product_id: uuid.UUID, staff: User = Depends(
         variants=variants,
         actor=staff,
     )
+    _add_audit_log(
+        session,
+        staff.id,
+        "products.delete",
+        f"Deleted products record {product_id}",
+        table_name="products",
+        record_id=product_id,
+    )
     await session.commit()
     return {"ok": True, "removed_assets": removed_assets, "data": serialize_record(row)}
 
@@ -10179,9 +10343,23 @@ async def _api_update(
     return serialize_record(row)
 
 
-async def _api_delete(session: AsyncSession, table: str, record_id: uuid.UUID) -> None:
+async def _api_delete(
+    session: AsyncSession,
+    table: str,
+    record_id: uuid.UUID,
+    actor_id: uuid.UUID | None = None,
+) -> None:
     if table == "categories":
         await soft_delete_category_record(session, record_id)
+        if actor_id is not None:
+            _add_audit_log(
+                session,
+                actor_id,
+                f"admin.{table}.delete",
+                f"Deleted {table} record {record_id}",
+                table_name=table,
+                record_id=record_id,
+            )
         return
     model = MODEL_BY_TABLE[table]
     if table == "loyalty_tiers":
@@ -10192,14 +10370,35 @@ async def _api_delete(session: AsyncSession, table: str, record_id: uuid.UUID) -
         row.status = "deleted"
         row.deleted_at = datetime.now(timezone.utc)
         await session.flush()
+        if actor_id is not None:
+            _add_audit_log(
+                session,
+                actor_id,
+                f"admin.{table}.delete",
+                f"Deleted {table} record {record_id}",
+                table_name=table,
+                record_id=record_id,
+            )
+        return
+    row = await session.get(model, record_id)
+    if row is None:
         return
     await session.execute(delete(model).where(model.id == record_id))
+    if actor_id is not None:
+        _add_audit_log(
+            session,
+            actor_id,
+            f"admin.{table}.delete",
+            f"Deleted {table} record {record_id}",
+            table_name=table,
+            record_id=record_id,
+        )
 
 
 def _validate_payment_record_body(body: dict[str, Any], *, allow_status: bool = True) -> None:
     for field in DIRECT_RECEIPT_INPUT_FIELDS:
         value = body.get(field)
-        if field in {"receipt_url", "receiptUrl"} and value is not None and str(value).strip().startswith("file:"):
+        if field in {"receipt_url", "receiptUrl"} and value is not None and str(value).strip().startswith(("file:", "receipt:")):
             continue
         if value is not None and str(value).strip():
             raise HTTPException(status_code=422, detail="payment_receipts_must_use_order_endpoint")
@@ -10229,7 +10428,7 @@ async def api_admin_update_currency(record_id: uuid.UUID, request: Request, staf
 
 @router.delete("/api/catalog/admin/currencies/{record_id}")
 async def api_admin_delete_currency(record_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await _api_delete(session, "currencies", record_id)
+    await _api_delete(session, "currencies", record_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -10261,7 +10460,7 @@ async def api_admin_banner_history(record_id: uuid.UUID, staff: User = Depends(r
 
 @router.delete("/api/catalog/admin/banners/{record_id}")
 async def api_admin_delete_banner(record_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await _api_delete(session, "banners", record_id)
+    await _api_delete(session, "banners", record_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -10276,7 +10475,7 @@ async def _create_update_delete_resource(table: str, request: Request, session: 
         await session.commit()
         return {"data": row}
     if action == "delete" and record_id is not None:
-        await _api_delete(session, table, record_id)
+        await _api_delete(session, table, record_id, staff.id)
         await session.commit()
         return {"ok": True}
     raise HTTPException(status_code=400, detail="invalid_resource_action")
@@ -11244,7 +11443,7 @@ async def api_update_coupon(record_id: uuid.UUID, request: Request, staff: User 
 
 @router.delete("/api/marketing/coupons/{record_id}")
 async def api_delete_coupon(record_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await _api_delete(session, "coupons", record_id)
+    await _api_delete(session, "coupons", record_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -11301,7 +11500,7 @@ async def api_campaign_event(
 
 @router.delete("/api/marketing/campaigns/{record_id}")
 async def api_delete_campaign(record_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await _api_delete(session, "marketing_campaigns", record_id)
+    await _api_delete(session, "marketing_campaigns", record_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -11476,6 +11675,9 @@ async def api_set_order_courier_assignment(
         raise HTTPException(status_code=422, detail="courier_assignment_payload_required")
     raw_courier_id = body.get("courier_id") or body.get("courierId")
     requested_id = None if raw_courier_id in (None, "", "unassigned", "null") else _uuid(raw_courier_id, "courier_id")
+    order_status = str(getattr(order, "status", "") or "").strip().lower()
+    if requested_id is None and order_status in {"delivered", "completed"}:
+        raise HTTPException(status_code=409, detail="courier_assignment_required_for_delivered_order")
     assignment_model = MODEL_BY_TABLE["courier_assignments"]
     current_rows = list(
         (
@@ -11648,7 +11850,45 @@ async def api_list_order_payments(
         )
         payment_rows.extend(result.scalars().all())
     payment_rows.sort(key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    return {"data": [serialize_record(row) for row in payment_rows]}
+    payment_payloads = [serialize_record(row) for row in payment_rows]
+
+    # Customer-submitted receipts live in ``payment_receipts`` until finance
+    # reviews them. The admin payment panel reads ``order_payments`` though,
+    # so attach each unlinked receipt to the visible payment row. This keeps
+    # the receipt available for inspection without copying file bytes or
+    # exposing a public URL.
+    receipt_model = MODEL_BY_TABLE["payment_receipts"]
+    receipt_result = await session.execute(
+        select(receipt_model)
+        .where(receipt_model.order_id == order_id, receipt_model.deleted_at.is_(None))
+        .order_by(receipt_model.created_at.desc())
+    )
+    receipt_rows = list(receipt_result.scalars())
+    used_receipt_ids: set[str] = set()
+    for payment in payment_payloads:
+        receipt_ref = str(payment.get("receipt_url") or payment.get("receiptPath") or "").strip()
+        if receipt_ref.lower().startswith("receipt:"):
+            used_receipt_ids.add(receipt_ref.split(":", 1)[1])
+
+    for payment in payment_payloads:
+        if str(payment.get("receipt_url") or payment.get("receiptPath") or "").strip():
+            continue
+        receipt = next((item for item in receipt_rows if str(item.id) not in used_receipt_ids), None)
+        if receipt is None:
+            break
+        receipt_ref = f"receipt:{receipt.id}"
+        payment.update(
+            {
+                "receipt_url": receipt_ref,
+                "receiptPath": receipt_ref,
+                "payment_receipt_id": str(receipt.id),
+                "payment_receipt_status": str(receipt.status or "pending_review"),
+                "payment_receipt_created_at": receipt.created_at.isoformat() if receipt.created_at else None,
+            }
+        )
+        used_receipt_ids.add(str(receipt.id))
+
+    return {"data": payment_payloads}
 
 
 @router.post("/api/payments/orders/{order_id}", status_code=201)
@@ -11662,8 +11902,34 @@ async def api_create_order_payment(
     require_finance_actor(roles)
     body = await request.json()
     _validate_payment_record_body(body)
+    receipt_ref = str(body.get("receipt_url") or body.get("receiptUrl") or "").strip()
+    payment_type = str(body.get("payment_method") or body.get("type") or "cash").strip().lower()
+    if payment_type != "cash" and not receipt_ref:
+        raise HTTPException(status_code=422, detail="payment_receipt_required_for_non_cash")
+    if receipt_ref:
+        if not receipt_ref.lower().startswith("receipt:"):
+            raise HTTPException(status_code=422, detail="payment_receipt_reference_required")
+        try:
+            receipt_id = uuid.UUID(receipt_ref.split(":", 1)[1])
+        except (ValueError, IndexError) as exc:
+            raise HTTPException(status_code=422, detail="payment_receipt_reference_invalid") from exc
+        receipt_model = MODEL_BY_TABLE["payment_receipts"]
+        receipt = (
+            await session.execute(
+                select(receipt_model)
+                .where(
+                    receipt_model.id == receipt_id,
+                    receipt_model.order_id == order_id,
+                    receipt_model.deleted_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if receipt is None:
+            raise HTTPException(status_code=422, detail="payment_receipt_order_mismatch")
+        body["receipt_url"] = f"receipt:{receipt.id}"
     body["order_id"] = order_id
-    body["type"] = body.get("payment_method") or body.get("type") or "cash"
+    body["type"] = payment_type
     row = await _api_create(session, "order_payments", body, staff)
     await session.commit()
     return {"data": row}
@@ -11693,7 +11959,7 @@ async def api_delete_order_payment(
     session: AsyncSession = Depends(get_session),
 ):
     require_finance_actor(roles)
-    await _api_delete(session, "order_payments", payment_id)
+    await _api_delete(session, "order_payments", payment_id, staff.id)
     await session.commit()
     return {"ok": True}
 
@@ -11784,7 +12050,7 @@ async def api_read_contact_message(record_id: uuid.UUID, staff: User = Depends(r
 
 @router.delete("/api/admin/contact-messages/{record_id}")
 async def api_delete_contact_message(record_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    await _api_delete(session, "contact_messages", record_id)
+    await _api_delete(session, "contact_messages", record_id, staff.id)
     await session.commit()
     return {"ok": True}
 

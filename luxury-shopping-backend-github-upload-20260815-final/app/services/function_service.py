@@ -2833,6 +2833,35 @@ async def execute_function(
         if ai_ledger_id is not None:
             await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
         return {"matches": [serialize_record(item) for item in products], "configured": True, "request_id": current_request_id()}
+    if function_name == "ai-product-assistant" and _text(body, "action").lower() == "deep_analyze":
+        ai_ledger_id = await _reserve_ai_usage(
+            function_name=function_name,
+            body=body,
+            user=user,
+            roles=roles,
+            session=session,
+            request=request,
+        )
+        image_url = _text(body, "imageUrl", "image_url")
+        if not image_url:
+            await AIQuotaService(session).fail(ai_ledger_id, error_code_safe="product_image_url_required")
+            raise HTTPException(400, "product_image_url_required")
+
+        from .image_search import deep_analyze_product_image
+
+        try:
+            result = await deep_analyze_product_image(image_url)
+        except HTTPException as exc:
+            detail = exc.detail
+            error_code = detail.get("code") if isinstance(detail, dict) else str(detail)
+            await AIQuotaService(session).fail(ai_ledger_id, error_code_safe=error_code)
+            raise
+        actual_tokens = max(1, sum(
+            len(value) if isinstance(value, str) else sum(len(item) for item in value if isinstance(item, str))
+            for value in result.values()
+        ) // 4)
+        await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=actual_tokens)
+        return {**result, "configured": True, "request_id": current_request_id()}
     if function_name in {"ai-product-assistant", "ai-chat-support"}:
         ai_ledger_id = await _reserve_ai_usage(
             function_name=function_name,
