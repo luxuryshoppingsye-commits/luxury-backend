@@ -42,14 +42,14 @@ _METHOD_DEFINITIONS = (
     },
     {
         "provider_key": "JAIB",
-        "name_ar": "جيب",
+        "name_ar": "محفظة جيب",
         "name_en": "Jaib",
         "mode": "qr",
         "sort_order": 20,
         "requires_receipt": True,
         "requires_transaction_reference": True,
         "transfer_recipients": [
-            {"label": "رقم حساب جيب", "value": "549179"},
+            {"label": "محفظة جيب", "value": "549179"},
         ],
     },
     {
@@ -61,7 +61,7 @@ _METHOD_DEFINITIONS = (
         "requires_receipt": True,
         "requires_transaction_reference": True,
         "transfer_recipients": [
-            {"label": "رقم حساب جوالي", "value": "126638"},
+            {"label": "جوالي", "value": "126638"},
         ],
     },
     {
@@ -88,7 +88,7 @@ _METHOD_DEFINITIONS = (
         "requires_receipt": True,
         "requires_transaction_reference": True,
         "transfer_recipients": [
-            {"label": "رقم حساب ون كاش", "value": "177552"},
+            {"label": "ون كاش", "value": "177552"},
         ],
     },
     {
@@ -297,24 +297,47 @@ def payment_method_has_recipient(row: dict[str, Any]) -> bool:
 
 def payment_account_options(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     accounts: list[dict[str, Any]] = []
+    bank_method_keys = {"HASEB_KURAIMI", "YEMEN_WALLET", "BANK_TRANSFER"}
+    generic_transfer_keys = {"WALLET_TRANSFER", "BANK_TRANSFER"}
     for row in rows:
         if row.get("is_active") is not True or not payment_method_has_recipient(row):
             continue
         recipients = payment_method_recipients(row)
-        account_number = recipients[0]["value"]
-        accounts.append(
-            {
-                "id": str(row["provider_key"]).lower(),
-                "payment_method": row["provider_key"],
-                "display_name": row.get("name_ar") or row["provider_key"],
-                "account_name": row.get("name_ar") or row["provider_key"],
-                "account_number": account_number,
-                "merchant_number": _text(row.get("merchant_number")),
-                "phone_number": _text(row.get("phone_number")),
-                "type": "cash" if row["provider_key"] == COD_PAYMENT_METHOD else "wallet",
-                "is_active": True,
-            }
+        provider_key = str(row["provider_key"])
+        public_method_key = (
+            "bank_transfer" if provider_key in bank_method_keys else provider_key
         )
+        for recipient_index, recipient in enumerate(recipients):
+            account_id = provider_key.lower()
+            if recipient_index:
+                account_id = f"{account_id}__{recipient_index + 1}"
+            if (
+                len(recipients) == 1
+                and provider_key not in generic_transfer_keys
+                and provider_key not in bank_method_keys
+            ):
+                display_name = row.get("name_ar") or recipient["label"] or provider_key
+            else:
+                display_name = recipient["label"] or row.get("name_ar") or provider_key
+            accounts.append(
+                {
+                    "id": account_id,
+                    "payment_method": public_method_key,
+                    "display_name": display_name,
+                    "account_name": display_name,
+                    "account_number": recipient["value"],
+                    "merchant_number": _text(row.get("merchant_number")),
+                    "phone_number": _text(row.get("phone_number")),
+                    "type": (
+                        "cash"
+                        if provider_key == COD_PAYMENT_METHOD
+                        else "bank"
+                        if provider_key in bank_method_keys
+                        else "wallet"
+                    ),
+                    "is_active": True,
+                }
+            )
     return accounts
 
 

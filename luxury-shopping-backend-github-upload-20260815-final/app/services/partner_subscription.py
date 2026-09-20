@@ -82,9 +82,8 @@ def subscription_state(
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     baseline_active = _baseline_active(contract_status, contract_is_active)
     raw_status = _text(extra.get("subscription_status")).lower()
-    # A contract created before the subscription workflow has no payment
-    # evidence. Treat it as awaiting payment so legacy merchants cannot stay
-    # publicly visible without an approved subscription.
+    # Keep legacy contract status available for subscription administration and
+    # historical payment records. Public catalog access no longer depends on it.
     status = raw_status or "pending_payment"
     expires_at = _parse_datetime(extra.get("subscription_expires_at"))
     started_at = _parse_datetime(extra.get("subscription_started_at"))
@@ -191,26 +190,16 @@ def public_partner_product_clause(product_model: type[Any], *, now: datetime | N
             storefront_model.is_active.is_(True),
         )
     )
-    return or_(
-        product_model.partner_id.is_(None),
-        and_(storefront_exists, partner_subscription_exists_clause(product_model.partner_id, now=now)),
-    )
+    # Merchant visibility is controlled by the storefront's active state.
+    # The platform earns its share through order commissions, so a recurring
+    # merchant subscription must not gate the public catalog.
+    return or_(product_model.partner_id.is_(None), storefront_exists)
 
 
 def public_partner_storefront_clause(storefront_model: type[Any], *, now: datetime | None = None) -> Any:
-    partner_columns = []
-    if hasattr(storefront_model, "partner_id"):
-        partner_columns.append(storefront_model.partner_id)
-    if hasattr(storefront_model, "user_id"):
-        partner_columns.append(storefront_model.user_id)
-    partner_clause = or_(*[
-        partner_subscription_exists_clause(column, now=now)
-        for column in partner_columns
-    ]) if partner_columns else False
     return and_(
         storefront_model.deleted_at.is_(None),
         storefront_model.is_active.is_(True),
-        partner_clause,
     )
 
 

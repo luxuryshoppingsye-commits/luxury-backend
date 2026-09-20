@@ -22,6 +22,7 @@ from ..repositories.resources import serialize_record
 from ..storage import FileStorage
 from .financial_calculator import (
     approved_payment_total,
+    loyalty_points,
     money,
     refunded_total,
     sync_order_payment_status,
@@ -688,23 +689,36 @@ async def apply_refund_reversals_once(
                 )
             )
 
-    loyalty_discount = money((order.extra_data or {}).get("financial_breakdown", {}).get("loyalty_discount", "0"))
+    financial_breakdown = (order.extra_data or {}).get("financial_breakdown", {})
+    loyalty_discount = money(financial_breakdown.get("loyalty_discount", "0"))
+    loyalty_meta = financial_breakdown.get("loyalty")
+    try:
+        redeemed_points = loyalty_points(
+            loyalty_meta.get("points") if isinstance(loyalty_meta, dict) and "points" in loyalty_meta else loyalty_discount
+        )
+    except HTTPException:
+        redeemed_points = int(loyalty_discount)
     if loyalty_discount > 0:
         loyalty_model = MODEL_BY_TABLE["user_loyalty"]
         loyalty = (
             await session.execute(select(loyalty_model).where(loyalty_model.user_id == order.user_id).with_for_update().limit(1))
         ).scalar_one_or_none()
         if loyalty is not None:
-            loyalty.balance = money(loyalty.balance or 0) + loyalty_discount
+            loyalty.balance = money(loyalty.balance or 0) + redeemed_points
         tx_model = MODEL_BY_TABLE["points_transactions"]
         session.add(
             tx_model(
                 user_id=order.user_id,
                 order_id=order.id,
                 type="refund_reversal",
-                amount=loyalty_discount,
+                amount=redeemed_points,
                 description="Refund reversal of redeemed loyalty points",
-                extra_data={"refund_id": str(refund_row.id), "actor_id": str(actor_id)},
+                extra_data={
+                    "refund_id": str(refund_row.id),
+                    "actor_id": str(actor_id),
+                    "points": redeemed_points,
+                    "discount_yer": str(loyalty_discount),
+                },
             )
         )
 
@@ -982,6 +996,19 @@ async def issue_signed_receipt_url(
     }
 
 
+def _inline_receipt_file_response(target: Path, *, media_type: str) -> FileResponse:
+    """Return a receipt inline without relying on version-specific filename options."""
+    return FileResponse(
+        target,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 async def signed_receipt_file_response(
     session: AsyncSession,
     *,
@@ -1016,11 +1043,14 @@ async def signed_receipt_file_response(
         storage_hash = hashlib.sha256(str(target.relative_to(storage.root)).encode("utf-8")).hexdigest()
         if payload.get("storage_sha256") != storage_hash:
             raise HTTPException(status_code=403, detail="invalid_receipt_token")
-        return FileResponse(
+        return _inline_receipt_file_response(
             target,
             media_type=str(asset.content_type or "application/octet-stream"),
-            filename=str(asset.original_filename or target.name),
         )
+    try:
+        receipt_id = uuid.UUID(str(payload["receipt_id"]))
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=403, detail="invalid_receipt_token")
     model = MODEL_BY_TABLE["payment_receipts"]
     row = (
         await session.execute(select(model).where(model.id == receipt_id, model.deleted_at.is_(None)).limit(1))
@@ -1032,10 +1062,9 @@ async def signed_receipt_file_response(
     if payload.get("storage_sha256") != storage_hash:
         raise HTTPException(status_code=403, detail="invalid_receipt_token")
     extra = dict(getattr(row, "extra_data", {}) or {})
-    return FileResponse(
+    return _inline_receipt_file_response(
         target,
         media_type=str(extra.get("mime_type") or "application/octet-stream"),
-        filename=str(extra.get("original_filename") or target.name),
     )
 
 

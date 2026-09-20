@@ -123,10 +123,11 @@ async def test_checkout_payment_refund_financial_contract_uses_postgresql_values
 
     expected_subtotal = Decimal("2001.10")
     expected_coupon = Decimal("100.15")
-    expected_loyalty = Decimal("50.20")
-    expected_discount = Decimal("150.35")
+    expected_loyalty_points = Decimal("5")
+    expected_loyalty = Decimal("500.00")
+    expected_discount = Decimal("600.15")
     expected_shipping = Decimal("25.35")
-    expected_total = Decimal("1876.10")
+    expected_total = Decimal("1426.30")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -149,7 +150,7 @@ async def test_checkout_payment_refund_financial_contract_uses_postgresql_values
                 "shippingCost": "9999.99",
                 "couponCode": coupon_code,
                 "couponDiscount": "999.99",
-                "loyaltyPointsToRedeem": "50.20",
+                "loyaltyPointsToRedeem": "5",
                 "loyaltyDiscount": "888.88",
                 "subtotal": "1.00",
                 "total": "1.00",
@@ -181,7 +182,7 @@ async def test_checkout_payment_refund_financial_contract_uses_postgresql_values
                 "shippingCost": "9999.99",
                 "couponCode": coupon_code,
                 "couponDiscount": "999.99",
-                "loyaltyPointsToRedeem": "50.20",
+                "loyaltyPointsToRedeem": "5",
                 "loyaltyDiscount": "888.88",
                 "subtotal": "1.00",
                 "total": "1.00",
@@ -302,7 +303,7 @@ async def test_checkout_payment_refund_financial_contract_uses_postgresql_values
         loyalty = (
             await session.execute(select(loyalty_model).where(loyalty_model.user_id == customer_id))
         ).scalar_one()
-        assert loyalty.balance == Decimal("149.80")
+        assert loyalty.balance == Decimal("195.00")
 
         points_tx = MODEL_BY_TABLE["points_transactions"]
         points_total = (
@@ -310,7 +311,7 @@ async def test_checkout_payment_refund_financial_contract_uses_postgresql_values
                 select(func.coalesce(func.sum(points_tx.amount), 0)).where(points_tx.order_id == order_id)
             )
         ).scalar_one()
-        assert points_total == expected_loyalty
+        assert points_total == expected_loyalty_points
 
         payments_model = MODEL_BY_TABLE["payments"]
         paid_total = (

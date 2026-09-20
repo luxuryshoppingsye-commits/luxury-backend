@@ -454,3 +454,68 @@ async def test_order_state_machine_courier_assignment_and_delivery_proof() -> No
         async with SessionFactory() as session:
             stored = await session.get(Order, order_id)
             assert stored is not None and stored.status == "delivered"
+
+
+async def test_admin_can_assign_courier_record_before_linking_app_account() -> None:
+    suffix = uuid.uuid4().hex[:8]
+    customer_email, customer_password, _ = await _seed_user(f"direct_assignment_customer_{suffix}")
+    admin_email, admin_password, _ = await _seed_user(f"direct_assignment_admin_{suffix}", "admin")
+    _, _, courier_user_id = await _seed_user(f"direct_assignment_courier_{suffix}", "delivery")
+    shipping_zone_id = await _seed_shipping_zone(f"direct_assignment_{suffix}")
+    product_id = await _seed_product(f"direct_assignment_{suffix}", stock=5)
+
+    async with SessionFactory() as session:
+        courier_model = MODEL_BY_TABLE["couriers"]
+        courier = courier_model(
+            name=f"مندوب {suffix}",
+            phone="777888999",
+            status="active",
+        )
+        session.add(courier)
+        await session.commit()
+        courier_id = courier.id
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        customer_headers = await _login(client, customer_email, customer_password)
+        admin_headers = await _login(client, admin_email, admin_password)
+        order = await _create_checkout_order(client, customer_headers, product_id, shipping_zone_id)
+        order_id = uuid.UUID(order["id"])
+
+        assigned = await client.patch(
+            f"/api/admin/orders/{order_id}/courier-assignment",
+            headers=admin_headers,
+            json={"courier_id": str(courier_id)},
+        )
+        assert assigned.status_code == 200, assigned.text
+        assert assigned.json()["data"]["courier_id"] == str(courier_id)
+        assert assigned.json()["data"]["courier_linked"] is True
+
+        async with SessionFactory() as session:
+            assignment_model = MODEL_BY_TABLE["courier_assignments"]
+            assignment = (
+                await session.execute(
+                    select(assignment_model).where(assignment_model.order_id == order_id)
+                )
+            ).scalar_one()
+            assert assignment.courier_id == courier_id
+            assert assignment.user_id is None
+
+        linked = await client.patch(
+            f"/api/admin/couriers/{courier_id}/account",
+            headers=admin_headers,
+            json={"user_id": str(courier_user_id)},
+        )
+        assert linked.status_code == 200, linked.text
+        assert linked.json()["account_linked"] is True
+
+        async with SessionFactory() as session:
+            assignment_model = MODEL_BY_TABLE["courier_assignments"]
+            assignment = (
+                await session.execute(
+                    select(assignment_model).where(assignment_model.order_id == order_id)
+                )
+            ).scalar_one()
+            assert assignment.user_id == courier_user_id
+            courier = await session.get(MODEL_BY_TABLE["couriers"], courier_id)
+            assert courier is not None and courier.user_id == courier_user_id

@@ -43,6 +43,54 @@ def test_money_or_zero_safely_handles_invalid_values() -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 0), ("5", 5), (Decimal("12.00"), 12)],
+)
+def test_loyalty_points_are_whole_numbers(raw: object, expected: int) -> None:
+    assert fc.loyalty_points(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["5.5", "-1", "not-points"])
+def test_loyalty_points_reject_fractional_negative_or_invalid_values(raw: object) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        fc.loyalty_points(raw)
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_loyalty_discount_uses_configured_point_value_and_order_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Result:
+        def scalar_one_or_none(self) -> object:
+            return SimpleNamespace(balance=Decimal("20"))
+
+    monkeypatch.setattr(
+        fc,
+        "loyalty_program_settings",
+        AsyncMock(
+            return_value=fc.LoyaltyProgramSettings(
+                point_value_yer=100,
+                min_redeem_points=5,
+                max_redeem_percentage=50,
+            )
+        ),
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=Result()))
+
+    discount, meta = await fc._loyalty_discount(
+        session,
+        user_id=uuid.uuid4(),
+        requested_points=5,
+        eligible_amount=Decimal("2000.00"),
+    )
+
+    assert discount == Decimal("500.00")
+    assert meta["points"] == "5"
+    assert meta["point_value_yer"] == 100
+
+
+@pytest.mark.parametrize(
     ("total_points", "expected_tier", "expected_next"),
     [
         (0, "برونزي", 500),

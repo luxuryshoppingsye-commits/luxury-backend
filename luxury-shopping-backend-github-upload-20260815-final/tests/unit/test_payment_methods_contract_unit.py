@@ -44,7 +44,7 @@ def test_existing_configuration_without_recipients_inherits_luxury_accounts() ->
 
     jaib = next(row for row in rows if row["provider_key"] == "JAIB")
     assert payment_method_recipients(jaib) == [
-        {"label": "رقم حساب جيب", "value": "549179"},
+        {"label": "محفظة جيب", "value": "549179"},
     ]
 
 
@@ -110,3 +110,53 @@ def test_payment_account_options_excludes_unconfigured_transfer_methods() -> Non
             "is_active": True,
         }
     ]
+
+
+def test_payment_account_options_returns_every_recipient_with_bank_category() -> None:
+    rows = normalize_payment_method_rows(
+        [
+            {
+                "provider_key": "BANK_TRANSFER",
+                "name_ar": "تحويل بنكي",
+                "is_active": True,
+                "transfer_recipients": [
+                    {"label": "الحساب الرئيسي", "value": "SA001"},
+                    {"label": "الحساب الاحتياطي", "value": "SA002"},
+                ],
+            }
+        ],
+        base_rows=_default_method_rows(),
+    )
+
+    bank_accounts = [
+        account
+        for account in payment_account_options(rows)
+        if account["id"].startswith("bank_transfer")
+    ]
+
+    assert [(account["id"], account["display_name"], account["account_number"]) for account in bank_accounts] == [
+        ("bank_transfer", "الحساب الرئيسي", "SA001"),
+        ("bank_transfer__2", "الحساب الاحتياطي", "SA002"),
+    ]
+    assert all(account["type"] == "bank" for account in bank_accounts)
+
+
+def test_default_luxury_accounts_are_grouped_for_manual_orders() -> None:
+    accounts = payment_account_options(_default_method_rows())
+
+    wallets = [account for account in accounts if account["type"] == "wallet"]
+    banks = [account for account in accounts if account["type"] == "bank"]
+
+    assert [(account["display_name"], account["account_number"]) for account in wallets] == [
+        ("محفظة جيب", "549179"),
+        ("جوالي", "126638"),
+        ("ون كاش", "177552"),
+    ]
+    assert [(account["display_name"], account["account_number"]) for account in banks] == [
+        ("خدمة حاسب الكريمي - إيداع يمني", "1171211"),
+        ("الكريمي - إيداع يمني", "3087726117"),
+        ("الكريمي - إيداع سعودي", "3101858013"),
+        ("الكريمي - إيداع دولار", "3101751294"),
+        ("رقم الهاتف", "781010460"),
+    ]
+    assert all(account["payment_method"] == "bank_transfer" for account in banks)

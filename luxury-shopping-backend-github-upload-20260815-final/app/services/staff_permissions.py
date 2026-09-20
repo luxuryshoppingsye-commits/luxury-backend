@@ -278,6 +278,9 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
     "partner": frozenset({
         "products.view", "products.create", "products.update", "products.delete",
         "products.activate", "products.feature", "dashboard.view",
+        "brands.create",
+        "product_options.create",
+        "product_options.delete",
     }),
 }
 

@@ -226,6 +226,27 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
         )
         assert accepted.status_code == 200 and accepted.json()["data"]["accepted"] is True
 
+        invalid_deletion_request = await client.post(
+            "/partner/account-deletion-request",
+            headers=merchant_headers,
+            json={"confirmation": "رفاهية"},
+        )
+        assert invalid_deletion_request.status_code == 422, invalid_deletion_request.text
+        deletion_request = await client.post(
+            "/partner/account-deletion-request",
+            headers=merchant_headers,
+            json={"confirmation": "رفاهية التسوق"},
+        )
+        assert deletion_request.status_code == 201, deletion_request.text
+        assert deletion_request.json()["data"]["status"] == "pending"
+        pending_deletion_request = await client.get(
+            "/partner/account-deletion-request", headers=merchant_headers
+        )
+        assert pending_deletion_request.status_code == 200, pending_deletion_request.text
+        assert pending_deletion_request.json()["data"]["status"] == "pending"
+        still_active = await client.get("/partner/storefront", headers=merchant_headers)
+        assert still_active.status_code == 200, still_active.text
+
         preferences = await client.put(
             "/partner/notification-preferences",
             headers=merchant_headers,
@@ -276,6 +297,29 @@ async def test_merchant_full_operations_are_executable_in_isolated_postgres() ->
                     == update_payload["logoUrl"]
                 )
             option_ids.append((option, record_id))
+
+        expired_coupon = await client.post(
+            "/partner/coupons",
+            headers=merchant_headers,
+            json={
+                "code": f"EXPIRED{suffix.upper()}",
+                "amount": 100,
+                "valid_from": "1999-01-01",
+                "valid_until": "2000-01-01",
+            },
+        )
+        assert expired_coupon.status_code == 422, expired_coupon.text
+        assert expired_coupon.json()["detail"] == "coupon_start_date_in_past"
+
+        generic_coupon = await client.post(
+            "/resources/partner_coupons/query",
+            headers=merchant_headers,
+            json={
+                "operation": "insert",
+                "data": {"code": f"BYPASS{suffix.upper()}", "amount": 100},
+            },
+        )
+        assert generic_coupon.status_code == 403, generic_coupon.text
 
         coupon = await client.post(
             "/partner/coupons",

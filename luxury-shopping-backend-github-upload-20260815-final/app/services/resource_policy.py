@@ -255,6 +255,7 @@ GENERIC_WRITE_BLOCKED_FOR_NON_STAFF = frozenset(
         "partner_settlements",
         "partner_payments",
         "partner_contracts",
+        "partner_coupons",
         "marketer_commissions",
         "marketer_payments",
         "user_loyalty",

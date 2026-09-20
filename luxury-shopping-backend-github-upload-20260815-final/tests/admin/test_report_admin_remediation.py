@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 from pypdf import PdfReader
 from sqlalchemy import func, select
 
-from backend.app.config import get_settings
+from backend.app.config import BACKEND_DIR, get_settings
 from backend.app.database import SessionFactory
 from backend.app.main import app
 from backend.app.models import MODEL_BY_TABLE
@@ -24,6 +24,8 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_financial_report_pdf_is_localized_instead_of_a_technical_dump() -> None:
+    assert (BACKEND_DIR / "assets" / "fonts" / "Tajawal-Regular.ttf").is_file()
+
     metadata = {
         "date_basis": "orders.created_at plus successful payment/refund status",
         "order_count": "5",

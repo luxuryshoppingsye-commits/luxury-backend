@@ -62,6 +62,7 @@ from ...services.auth_service import (
     revoke_auth_session,
     revoke_all_refresh_tokens,
     revoke_refresh_token,
+    _optional_table_ready,
     rotate_auth_session,
     rotate_refresh_token,
 )
@@ -917,14 +918,18 @@ async def web_refresh(
     if not token and not session_token:
         raise HTTPException(status_code=401, detail="refresh_token_required")
     try:
-        if session_token:
+        session_table_ready = await _optional_table_ready(session, AuthSession.__tablename__)
+        if session_token and session_table_ready:
             # A durable session is the source of truth for the web login. Do
             # not fall back to a refresh token after it has been revoked.
             payload = await rotate_auth_session(session, str(session_token), request)
-        else:
+        elif token:
             # Keep compatibility with cookies issued before the durable
-            # session cookie was introduced.
+            # session cookie was introduced, and with deployments that have
+            # not run the durable-session migration yet.
             payload = await rotate_refresh_token(session, str(token), request)
+        else:
+            raise HTTPException(status_code=401, detail="refresh_token_required")
     except HTTPException:
         await session.commit()
         raise
@@ -1627,8 +1632,9 @@ async def admin_staff_roles(
     session: AsyncSession = Depends(get_session),
 ):
     rows = (await session.execute(
-        select(UserRole, Profile)
+        select(UserRole, Profile, User)
         .join(Profile, Profile.user_id == UserRole.user_id, isouter=True)
+        .join(User, User.id == UserRole.user_id)
         .where(UserRole.role.in_(STAFF_ROLE_KEYS))
         .order_by(UserRole.created_at.desc())
     )).all()
@@ -1638,12 +1644,15 @@ async def admin_staff_roles(
             "user_id": str(row.user_id),
             "role": row.role,
             "created_at": row.created_at.isoformat() if row.created_at else None,
+            "is_active": user.is_active,
             "profile": {
                 "full_name": profile.full_name if profile else None,
+                "email": profile.email if profile else None,
                 "phone": profile.phone if profile else None,
+                "extra_data": profile.extra_data if profile else {},
             },
         }
-        for row, profile in rows
+        for row, profile, user in rows
     ]}
 
 
@@ -1661,6 +1670,75 @@ async def admin_user_options(
         {"id": str(user.id), "user_id": str(user.id), "email": user.email, "full_name": profile.full_name if profile else user.email}
         for user, profile in rows
     ]}
+
+
+@router.post("/api/admin/staff/members", status_code=201)
+async def admin_create_staff_member(
+    request: Request,
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a dedicated staff login without reusing a customer account."""
+    body = await request.json()
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    full_name = str(body.get("full_name") or body.get("fullName") or "").strip()
+    phone = str(body.get("phone") or "").strip()
+    job_title = str(body.get("job_title") or body.get("jobTitle") or "").strip()
+    department = str(body.get("department") or "").strip()
+    employee_code = str(body.get("employee_code") or body.get("employeeCode") or "").strip()
+    role = str(body.get("role") or "employee").strip()
+    is_active = body.get("is_active", body.get("isActive", True))
+
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="invalid_staff_email")
+    if len(full_name) < 2 or len(full_name) > 240:
+        raise HTTPException(status_code=422, detail="invalid_staff_full_name")
+    if not is_valid_yemen_mobile_phone(phone):
+        raise HTTPException(status_code=422, detail="invalid_staff_phone")
+    if len(job_title) < 2 or len(job_title) > 160:
+        raise HTTPException(status_code=422, detail="invalid_staff_job_title")
+    if len(department) < 2 or len(department) > 160:
+        raise HTTPException(status_code=422, detail="invalid_staff_department")
+    if len(employee_code) > 64:
+        raise HTTPException(status_code=422, detail="invalid_staff_employee_code")
+    if role not in STAFF_ROLE_KEYS:
+        raise HTTPException(status_code=422, detail="invalid_staff_role")
+    if not isinstance(is_active, bool):
+        raise HTTPException(status_code=422, detail="invalid_staff_active_state")
+
+    try:
+        user = await create_user(
+            session,
+            email=email,
+            password=password,
+            full_name=full_name,
+            phone=phone,
+            city=None,
+            extra_data={
+                "employment": {
+                    "job_title": job_title,
+                    "department": department,
+                    "employee_code": employee_code,
+                },
+            },
+            role=role,
+            is_active=is_active,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    await session.commit()
+    return {
+        "data": {
+            "user_id": str(user.id),
+            "email": user.email,
+            "full_name": full_name,
+            "phone": phone,
+            "role": role,
+            "is_active": user.is_active,
+        }
+    }
 
 
 @router.post("/api/admin/staff/roles", status_code=201)

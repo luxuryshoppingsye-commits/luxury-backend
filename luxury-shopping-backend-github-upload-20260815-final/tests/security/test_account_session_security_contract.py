@@ -158,6 +158,55 @@ async def test_web_refresh_prefers_the_durable_session_cookie(monkeypatch: pytes
     assert any("rt=new-refresh-token" in header for header in response.headers.getlist("set-cookie"))
 
 
+async def test_web_refresh_falls_back_only_when_session_table_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def unavailable_table(_session: object, _table_name: str) -> bool:
+        return False
+
+    async def unexpected_session(*_args: object, **_kwargs: object) -> dict[str, object]:
+        pytest.fail("the durable session must not be used when its table is unavailable")
+
+    async def rotate_refresh(_session: object, token: str, _request: Request) -> dict[str, object]:
+        calls.append(token)
+        return {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+            "roles": [],
+        }
+
+    class Session:
+        async def commit(self) -> None:
+            return None
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    monkeypatch.setattr(auth_routes, "_optional_table_ready", unavailable_table)
+    monkeypatch.setattr(auth_routes, "rotate_auth_session", unexpected_session)
+    monkeypatch.setattr(auth_routes, "rotate_refresh_token", rotate_refresh)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/auth/refresh",
+            "headers": [
+                (b"cookie", b"luxury_session=durable-session-token; rt=legacy-refresh-token; luxury_remember_me=1"),
+                (b"content-type", b"application/json"),
+            ],
+        },
+        receive,
+    )
+    response = Response()
+
+    await auth_routes.web_refresh(request, response, Session())
+
+    assert calls == ["legacy-refresh-token"]
+
+
 async def test_web_login_cookie_persists_the_durable_session_for_one_year(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

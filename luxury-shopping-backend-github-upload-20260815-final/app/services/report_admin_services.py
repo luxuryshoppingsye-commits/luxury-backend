@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import and_, func, literal_column, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import get_settings
+from ..config import BACKEND_DIR, get_settings
 from ..models import MODEL_BY_TABLE
 from ..models.domain import FileAsset, Order, OrderItem, Product, Profile, User, UserRole
 from ..repositories.resources import serialize_record
@@ -60,6 +61,55 @@ PLACEHOLDER_TEXT = frozenset(
     }
 )
 _DANGEROUS_THEME_PATTERN = re.compile(r"(<script|javascript:|expression\s*\(|url\s*\(\s*javascript:)", re.I)
+_THEME_HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-f]{3,8}$", re.I)
+_THEME_HSL_COLOR_PATTERN = re.compile(
+    r"^(?:hsl\(\s*)?(?P<hue>\d{1,3}(?:\.\d+)?)\s+"
+    r"(?P<saturation>\d{1,3}(?:\.\d+)?)%\s+"
+    r"(?P<lightness>\d{1,3}(?:\.\d+)?)%(?:\s*\))?$",
+    re.I,
+)
+_THEME_CSS_MEASURE_PATTERN = re.compile(
+    r"^(?P<number>\d+(?:\.\d+)?)(?P<unit>px|rem|em|%|ms|s)?$",
+    re.I,
+)
+_THEME_FONT_FAMILIES = frozenset(
+    {"Tajawal", "Cairo", "Almarai", "IBM Plex Sans Arabic", "Noto Sans Arabic"}
+)
+_THEME_SETTING_KEYS = frozenset(
+    {"colors", "typography", "layout", "cards", "buttons", "inputs", "animations", "hero"}
+)
+
+
+def _pdf_arabic_font_candidates() -> tuple[Path, ...]:
+    configured_path = os.getenv("PDF_ARABIC_FONT_PATH", "").strip()
+    candidates = [
+        BACKEND_DIR / "assets" / "fonts" / "Tajawal-Regular.ttf",
+        BACKEND_DIR.parent / "assets" / "fonts" / "Tajawal-Regular.ttf",
+    ]
+    if configured_path:
+        candidates.insert(0, Path(configured_path).expanduser())
+    candidates.extend(
+        (
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
+            Path("/usr/share/fonts/opentype/noto/NotoSansArabic-Regular.ttf"),
+            Path("/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
+        )
+    )
+    return tuple(dict.fromkeys(candidates))
+
+
+def _register_pdf_arabic_font(pdfmetrics: Any, ttfont: Any) -> str | None:
+    for index, font_path in enumerate(_pdf_arabic_font_candidates()):
+        if not font_path.is_file():
+            continue
+        font_name = f"ArabicReportFont{index}"
+        try:
+            pdfmetrics.registerFont(ttfont(font_name, str(font_path)))
+        except Exception:
+            continue
+        return font_name
+    return None
 
 
 def _now() -> datetime:
@@ -146,6 +196,218 @@ def _theme_payload_safe(value: Any) -> bool:
     if isinstance(value, list):
         return all(_theme_payload_safe(item) for item in value)
     return True
+
+
+def _invalid_theme_setting(setting_key: str, field: str) -> None:
+    raise HTTPException(status_code=422, detail=f"invalid_theme_setting:{setting_key}:{field}")
+
+
+def _require_theme_mapping(setting_key: str, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        _invalid_theme_setting(setting_key, "value")
+    return value
+
+
+def _validate_theme_color(setting_key: str, field: str, value: Any) -> None:
+    text = str(value or "").strip()
+    if _THEME_HEX_COLOR_PATTERN.fullmatch(text):
+        if len(text) not in {4, 5, 7, 9}:
+            _invalid_theme_setting(setting_key, field)
+        return
+    match = _THEME_HSL_COLOR_PATTERN.fullmatch(text)
+    if match is None:
+        _invalid_theme_setting(setting_key, field)
+    hue = float(match.group("hue"))
+    saturation = float(match.group("saturation"))
+    lightness = float(match.group("lightness"))
+    if hue > 360 or saturation > 100 or lightness > 100:
+        _invalid_theme_setting(setting_key, field)
+
+
+def _validate_theme_measure(
+    setting_key: str,
+    field: str,
+    value: Any,
+    *,
+    minimum: float,
+    maximum: float,
+    units: frozenset[str],
+) -> None:
+    match = _THEME_CSS_MEASURE_PATTERN.fullmatch(str(value or "").strip())
+    if match is None:
+        _invalid_theme_setting(setting_key, field)
+    unit = (match.group("unit") or "").lower()
+    if unit not in units:
+        _invalid_theme_setting(setting_key, field)
+    number = float(match.group("number"))
+    if not math.isfinite(number) or number < minimum or number > maximum:
+        _invalid_theme_setting(setting_key, field)
+
+
+def _validate_theme_url(setting_key: str, field: str, value: Any) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if len(text) > 2048 or not (text.startswith("/") or re.match(r"^https?://", text, re.I)):
+        _invalid_theme_setting(setting_key, field)
+
+
+def _validate_theme_setting_value(setting_key: str, value: Any) -> None:
+    """Reject values that can make the published storefront unusable.
+
+    Unknown setting keys stay backward compatible, while every CSS-facing key
+    used by the web design panels is checked against the same bounds exposed by
+    their controls. A rejected save leaves the last published setting intact.
+    """
+
+    if not _theme_payload_safe(value):
+        raise HTTPException(status_code=422, detail="invalid_theme_payload")
+
+    key = str(setting_key or "").strip()
+    if key == "default":
+        data = _require_theme_mapping(key, value)
+        for nested_key in _THEME_SETTING_KEYS:
+            if nested_key in data:
+                _validate_theme_setting_value(nested_key, data[nested_key])
+        for field in ("primary", "background", "foreground", "card", "gold", "goldLight", "goldDark"):
+            if field in data:
+                _validate_theme_color(key, field, data[field])
+        if "fontFamily" in data and str(data["fontFamily"]).strip() not in _THEME_FONT_FAMILIES:
+            _invalid_theme_setting(key, "fontFamily")
+        if "headingSize" in data:
+            _validate_theme_measure(
+                key,
+                "headingSize",
+                data["headingSize"],
+                minimum=1,
+                maximum=4,
+                units=frozenset({"", "rem"}),
+            )
+        if "bodySize" in data:
+            _validate_theme_measure(
+                key,
+                "bodySize",
+                data["bodySize"],
+                minimum=0.75,
+                maximum=1.5,
+                units=frozenset({"", "rem"}),
+            )
+        if "buttonRadius" in data:
+            _validate_theme_measure(
+                key,
+                "buttonRadius",
+                data["buttonRadius"],
+                minimum=0,
+                maximum=32,
+                units=frozenset({"", "px"}),
+            )
+        for field in ("fontScale", "textScale"):
+            if field in data:
+                _validate_theme_measure(
+                    key,
+                    field,
+                    data[field],
+                    minimum=0.5,
+                    maximum=2,
+                    units=frozenset({""}),
+                )
+        if "heroImage" in data:
+            _validate_theme_url(key, "heroImage", data["heroImage"])
+        return
+    if key not in _THEME_SETTING_KEYS:
+        return
+    data = _require_theme_mapping(key, value)
+
+    if key == "colors":
+        if not data:
+            _invalid_theme_setting(key, "value")
+        for field, color in data.items():
+            _validate_theme_color(key, str(field), color)
+        return
+
+    if key == "typography":
+        font_family = data.get("fontFamily")
+        if font_family is not None and str(font_family).strip() not in _THEME_FONT_FAMILIES:
+            _invalid_theme_setting(key, "fontFamily")
+        if "headingSize" in data:
+            _validate_theme_measure(key, "headingSize", data["headingSize"], minimum=1, maximum=4, units=frozenset({"", "rem"}))
+        if "bodySize" in data:
+            _validate_theme_measure(key, "bodySize", data["bodySize"], minimum=0.75, maximum=1.5, units=frozenset({"", "rem"}))
+        return
+
+    if key == "layout":
+        if "containerWidth" in data:
+            _validate_theme_measure(key, "containerWidth", data["containerWidth"], minimum=1000, maximum=1920, units=frozenset({"px"}))
+        if "sectionPadding" in data:
+            _validate_theme_measure(key, "sectionPadding", data["sectionPadding"], minimum=2, maximum=12, units=frozenset({"rem"}))
+        if "borderRadius" in data:
+            _validate_theme_measure(key, "borderRadius", data["borderRadius"], minimum=0, maximum=2, units=frozenset({"rem"}))
+        if data.get("headerStyle") is not None and data.get("headerStyle") not in {"fixed", "sticky", "static"}:
+            _invalid_theme_setting(key, "headerStyle")
+        return
+
+    if key in {"cards", "buttons", "inputs"}:
+        radius_key = "inputRadius" if key == "inputs" else f"{key[:-1]}Radius"
+        radius = data.get("borderRadius", data.get(radius_key))
+        if radius is not None:
+            _validate_theme_measure(key, "borderRadius", radius, minimum=0, maximum=2, units=frozenset({"", "rem"}))
+        if key == "cards":
+            shadow = data.get("shadow", data.get("cardShadow"))
+            if shadow is not None and shadow not in {"none", "sm", "md", "lg", "elegant", "dramatic"}:
+                _invalid_theme_setting(key, "shadow")
+            hover = data.get("hoverEffect", data.get("cardHover"))
+            if hover is not None and not isinstance(hover, bool):
+                _invalid_theme_setting(key, "hoverEffect")
+        if key == "buttons":
+            size = data.get("size", data.get("buttonSize"))
+            if size is not None and size not in {"compact", "default", "large"}:
+                _invalid_theme_setting(key, "size")
+        return
+
+    if key == "animations":
+        if data.get("enabled") is not None and not isinstance(data["enabled"], bool):
+            _invalid_theme_setting(key, "enabled")
+        if "duration" in data:
+            _validate_theme_measure(key, "duration", data["duration"], minimum=0, maximum=1, units=frozenset({"s"}))
+        if data.get("type") is not None and data.get("type") not in {"none", "fade", "slide", "scale", "spring"}:
+            _invalid_theme_setting(key, "type")
+        return
+
+    if key == "hero":
+        for field, maximum in (("title", 160), ("subtitle", 500)):
+            if field in data and (not isinstance(data[field], str) or len(data[field].strip()) > maximum):
+                _invalid_theme_setting(key, field)
+        image_value = data.get("imageUrl", data.get("image_url"))
+        if image_value is not None:
+            _validate_theme_url(key, "imageUrl", image_value)
+        if data.get("showCta") is not None and not isinstance(data["showCta"], bool):
+            _invalid_theme_setting(key, "showCta")
+
+
+def _validate_theme_settings_collection(value: Any) -> None:
+    data = _require_theme_mapping("preview", value)
+    for key, item in data.items():
+        if key == "components":
+            components = _require_theme_mapping("components", item)
+            card_value = {
+                name: components[name]
+                for name in ("cardRadius", "cardShadow", "cardHover")
+                if name in components
+            }
+            button_value = {
+                name: components[name]
+                for name in ("buttonRadius", "buttonSize")
+                if name in components
+            }
+            input_value = {"inputRadius": components["inputRadius"]} if "inputRadius" in components else {}
+            if card_value:
+                _validate_theme_setting_value("cards", card_value)
+            if button_value:
+                _validate_theme_setting_value("buttons", button_value)
+            if input_value:
+                _validate_theme_setting_value("inputs", input_value)
+            continue
+        _validate_theme_setting_value(str(key), item)
 
 
 def _report_file_path(relative_path: str) -> Path:
@@ -856,30 +1118,111 @@ class ReportGenerationService:
             from reportlab.pdfbase import pdfmetrics
             from reportlab.pdfbase.ttfonts import TTFont
             from reportlab.pdfgen import canvas
+            from reportlab.lib.utils import ImageReader
             from arabic_reshaper import ArabicReshaper
             from bidi.algorithm import get_display
         except Exception as exc:
             raise HTTPException(status_code=503, detail="pdf_renderer_unavailable") from exc
         arabic_text_reshaper = ArabicReshaper({"use_unshaped_instead_of_isolated": True})
-        font_name = "Helvetica"
-        font_path = Path(__file__).resolve().parents[3] / "assets" / "fonts" / "Tajawal-Regular.ttf"
-        if font_path.is_file():
-            try:
-                pdfmetrics.registerFont(TTFont("Tajawal", str(font_path)))
-                font_name = "Tajawal"
-            except Exception:
-                font_name = "Helvetica"
+        font_name = _register_pdf_arabic_font(pdfmetrics, TTFont) or "Helvetica"
         buffer = io.BytesIO()
         page_size = landscape(A4) if report_type in {"sales", "orders", "customers", "merchant_revenue"} else A4
         doc = canvas.Canvas(buffer, pagesize=page_size)
         width, height = page_size
+        if font_name == "Helvetica":
+            raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
+
+        logo_path = BACKEND_DIR / "assets" / "branding" / "luxury-shopping-logo.png"
+        if not logo_path.is_file():
+            raise HTTPException(status_code=503, detail="pdf_brand_logo_unavailable")
+        try:
+            brand_logo = ImageReader(str(logo_path))
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="pdf_brand_logo_unavailable") from exc
+
+        charcoal = HexColor("#1C1917")
+        charcoal_soft = HexColor("#44403C")
+        brand_gold = HexColor("#A16207")
+        warm_white = HexColor("#FAFAF9")
+        soft_surface = HexColor("#F5F5F4")
+        border_color = HexColor("#D6D3D1")
+        muted_text = HexColor("#57534E")
+        ink = HexColor("#0C0A09")
+        generated_at = _now()
+        generated_label = generated_at.strftime("%Y/%m/%d - %H:%M UTC")
+        report_reference = generated_at.strftime("RPT-%Y%m%d-%H%M%S")
+        report_titles = {
+            "summary": ("الملخص المالي", "ملخص مؤشرات الإيرادات والمدفوعات"),
+            "sales": ("تقرير المبيعات", "تفاصيل الطلبات والإيرادات"),
+            "orders": ("تقرير الطلبات", "حالات الطلبات والتحصيل المالي"),
+            "revenue": ("تقرير الإيرادات", "تحليل الإيرادات للفترة المحددة"),
+            "customers": ("تقرير العملاء", "ملخص العملاء والإنفاق للفترة المحددة"),
+            "merchant_revenue": ("تقرير إيرادات التاجر", "ملخص مستحقات التاجر للفترة المحددة"),
+        }
+        report_title, report_subtitle = report_titles.get(
+            report_type,
+            ("التقرير المالي", "تقرير مالي رسمي"),
+        )
+
+        def rtl(value: Any) -> str:
+            return get_display(arabic_text_reshaper.reshape(str(value)))
+
+        def draw_page_background() -> None:
+            doc.setFillColor(warm_white)
+            doc.rect(0, 0, width, height, fill=1, stroke=0)
+
+        def draw_brand_header(margin: float) -> None:
+            right = width - margin
+            content_width = width - (margin * 2)
+            header_y = height - 118
+            doc.setFillColor(charcoal)
+            doc.roundRect(margin, header_y, content_width, 84, 12, fill=1, stroke=0)
+            doc.setFillColor(brand_gold)
+            doc.roundRect(right - 7, header_y, 7, 84, 3, fill=1, stroke=0)
+            doc.drawImage(
+                brand_logo,
+                margin + 17,
+                header_y + 12,
+                width=60,
+                height=60,
+                preserveAspectRatio=True,
+                anchor="c",
+                mask="auto",
+            )
+            doc.setFillColor(HexColor("#E8C66A"))
+            doc.setFont(font_name, 9)
+            doc.drawRightString(right - 22, header_y + 62, rtl("رفاهية التسوق"))
+            doc.setFillColor(white)
+            doc.setFont(font_name, 18)
+            doc.drawRightString(right - 22, header_y + 39, rtl(report_title))
+            doc.setFillColor(HexColor("#E7E5E4"))
+            doc.setFont(font_name, 9)
+            doc.drawRightString(right - 22, header_y + 19, rtl(report_subtitle))
+            doc.setStrokeColor(brand_gold)
+            doc.setLineWidth(1.2)
+            doc.line(margin, header_y - 12, right, header_y - 12)
+            doc.setFillColor(muted_text)
+            doc.setFont(font_name, 7.5)
+            doc.drawRightString(right, header_y - 27, rtl(f"تاريخ الإنشاء: {generated_label}"))
+            doc.drawString(margin, header_y - 27, report_reference)
+
+        def draw_report_footer(margin: float, page_number: int) -> None:
+            right = width - margin
+            doc.setStrokeColor(brand_gold)
+            doc.setLineWidth(0.7)
+            doc.line(margin, 34, right, 34)
+            doc.setFillColor(muted_text)
+            doc.setFont(font_name, 7.5)
+            doc.drawRightString(right, 20, rtl("رفاهية التسوق - تقرير رسمي"))
+            doc.drawCentredString(width / 2, 20, report_reference)
+            doc.drawString(margin, 20, rtl(f"صفحة {page_number}"))
+
+        doc.setTitle(f"رفاهية التسوق - {report_title}")
+        doc.setAuthor("رفاهية التسوق")
+        doc.setCreator("رفاهية التسوق - المركز المحاسبي")
+        doc.setSubject(report_subtitle)
+
         if report_type in {"sales", "orders"}:
-            if font_name == "Helvetica":
-                raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
-
-            def rtl(value: Any) -> str:
-                return get_display(arabic_text_reshaper.reshape(str(value)))
-
             def amount(value: Any) -> str:
                 try:
                     return f"{Decimal(str(value)).quantize(Decimal('0.01')):,.2f} ريال يمني"
@@ -924,22 +1267,8 @@ class ReportGenerationService:
             margin = 30
             right = width - margin
             content_width = width - (margin * 2)
-            doc.setTitle("تقرير رفاهية التسوق - المبيعات" if report_type == "sales" else "تقرير رفاهية التسوق - الطلبات")
-            doc.setAuthor("رفاهية التسوق")
-
-            def draw_page_background() -> None:
-                doc.setFillColor(white)
-                doc.rect(0, 0, width, height, fill=1, stroke=0)
-
             draw_page_background()
-            doc.setFillColor(HexColor("#1b202a"))
-            doc.roundRect(margin, height - 98, content_width, 54, 10, fill=1, stroke=0)
-            doc.setFillColor(HexColor("#f5c542"))
-            doc.setFont(font_name, 18)
-            doc.drawRightString(right - 16, height - 70, rtl("تقرير رفاهية التسوق"))
-            doc.setFillColor(HexColor("#d9dee8"))
-            doc.setFont(font_name, 11)
-            doc.drawRightString(right - 16, height - 87, rtl("تقرير المبيعات" if report_type == "sales" else "تقرير الطلبات"))
+            draw_brand_header(margin)
 
             summary_cards = (
                 ("إجمالي الإيرادات", amount(metadata.get("gross_revenue"))),
@@ -949,28 +1278,28 @@ class ReportGenerationService:
             )
             card_gap = 12
             card_width = (content_width - (card_gap * 3)) / 4
-            card_y = height - 160
+            card_y = height - 210
             for index, (label, value) in enumerate(summary_cards):
                 card_x = margin + index * (card_width + card_gap)
-                doc.setFillColor(HexColor("#f3f5f8"))
-                doc.setStrokeColor(HexColor("#e4e7ec"))
+                doc.setFillColor(soft_surface)
+                doc.setStrokeColor(border_color)
                 doc.roundRect(card_x, card_y, card_width, 48, 7, fill=1, stroke=1)
-                doc.setFillColor(HexColor("#667085"))
+                doc.setFillColor(muted_text)
                 doc.setFont(font_name, 8)
                 doc.drawCentredString(card_x + card_width / 2, card_y + 31, rtl(label))
-                doc.setFillColor(HexColor("#11141b"))
+                doc.setFillColor(ink)
                 doc.setFont(font_name, 9)
                 doc.drawCentredString(card_x + card_width / 2, card_y + 14, rtl(value))
 
-            doc.setFillColor(HexColor("#344054"))
+            doc.setFillColor(charcoal_soft)
             doc.setFont(font_name, 9)
             doc.drawRightString(
                 right,
-                height - 180,
+                height - 230,
                 rtl("أساس التقرير: تاريخ إنشاء الطلب مع احتساب الدفع والاسترداد الناجحين"),
             )
-            doc.setStrokeColor(HexColor("#d0d5dd"))
-            doc.line(margin, height - 190, right, height - 190)
+            doc.setStrokeColor(border_color)
+            doc.line(margin, height - 240, right, height - 240)
 
             table_columns = (
                 ("net", "الصافي", "amount", 100),
@@ -986,38 +1315,36 @@ class ReportGenerationService:
 
             def draw_table_header(table_y: float) -> float:
                 x = margin
-                doc.setFillColor(HexColor("#1b202a"))
-                doc.setStrokeColor(HexColor("#1b202a"))
+                doc.setFillColor(charcoal)
+                doc.setStrokeColor(charcoal)
                 doc.setFont(font_name, 8)
                 for _, label, _, column_width in table_columns:
                     doc.rect(x, table_y - row_height, column_width, row_height, fill=1, stroke=1)
                     doc.setFillColor(white)
                     doc.drawCentredString(x + column_width / 2, table_y - 17, rtl(label))
-                    doc.setFillColor(HexColor("#1b202a"))
+                    doc.setFillColor(charcoal)
                     x += column_width
                 return table_y - row_height
 
             def draw_footer(page_number: int) -> None:
-                doc.setFillColor(HexColor("#667085"))
-                doc.setFont(font_name, 8)
-                doc.drawRightString(right, 20, rtl("تم إنشاء التقرير من المركز المحاسبي"))
-                doc.drawString(margin, 20, str(page_number))
+                draw_report_footer(margin, page_number)
 
-            y = draw_table_header(height - 204)
+            y = draw_table_header(height - 254)
             page_number = 1
             for index, row in enumerate(rows, start=1):
-                if y < 42:
+                if y - row_height < 46:
                     draw_footer(page_number)
                     doc.showPage()
                     page_number += 1
                     draw_page_background()
-                    y = draw_table_header(height - 44)
+                    draw_brand_header(margin)
+                    y = draw_table_header(height - 174)
                 x = margin
                 for key, _, kind, column_width in table_columns:
                     if index % 2 == 1:
-                        doc.setFillColor(HexColor("#f3f5f8"))
+                        doc.setFillColor(soft_surface)
                     else:
-                        doc.setFillColor(white)
+                        doc.setFillColor(warm_white)
                     doc.rect(x, y - row_height, column_width, row_height, fill=1, stroke=0)
                     if kind == "amount":
                         value = rtl(amount(row.get(key)))
@@ -1029,7 +1356,7 @@ class ReportGenerationService:
                         value = str(row.get(key) or row.get("order_id") or "-")
                     else:
                         value = str(index)
-                    doc.setFillColor(HexColor("#11141b"))
+                    doc.setFillColor(ink)
                     doc.setFont(font_name, 8 if kind == "order_number" else 9)
                     doc.drawCentredString(x + column_width / 2, y - 17, value)
                     x += column_width
@@ -1038,12 +1365,6 @@ class ReportGenerationService:
             doc.save()
             return buffer.getvalue()
         if report_type == "summary":
-            if font_name == "Helvetica":
-                raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
-
-            def rtl(value: Any) -> str:
-                return get_display(arabic_text_reshaper.reshape(str(value)))
-
             def amount(value: Any) -> str:
                 try:
                     return f"{Decimal(str(value)).quantize(Decimal('0.01')):,.2f} ريال يمني"
@@ -1080,53 +1401,39 @@ class ReportGenerationService:
             margin = 44
             right = width - margin
             content_width = width - (margin * 2)
-            doc.setTitle("تقرير رفاهية التسوق - الملخص المالي")
-            doc.setAuthor("رفاهية التسوق")
-            doc.setFillColor(white)
-            doc.rect(0, 0, width, height, fill=1, stroke=0)
-            doc.setFillColor(HexColor("#1b202a"))
-            doc.roundRect(margin, height - 112, content_width, 56, 10, fill=1, stroke=0)
-            doc.setFillColor(HexColor("#f5c542"))
-            doc.setFont(font_name, 18)
-            doc.drawRightString(right - 16, height - 80, rtl("تقرير رفاهية التسوق"))
-            doc.setFillColor(HexColor("#d9dee8"))
-            doc.setFont(font_name, 11)
-            doc.drawRightString(right - 16, height - 98, rtl("الملخص المالي"))
+            page_number = 1
+            draw_page_background()
+            draw_brand_header(margin)
 
-            y = height - 146
-            doc.setFillColor(HexColor("#f5c542"))
+            y = height - 174
+            doc.setFillColor(charcoal)
             doc.setFont(font_name, 12)
-            doc.drawRightString(right, y, rtl("تفاصيل التقرير"))
+            doc.drawRightString(right, y, rtl("ملخص التقرير"))
             y -= 14
-            doc.setStrokeColor(HexColor("#343b49"))
+            doc.setStrokeColor(brand_gold)
             doc.line(margin, y, right, y)
             y -= 22
             doc.setFont(font_name, 10)
             for index, (key, value) in enumerate(metadata.items()):
                 if y < 86:
+                    draw_report_footer(margin, page_number)
                     doc.showPage()
-                    doc.setFillColor(white)
-                    doc.rect(0, 0, width, height, fill=1, stroke=0)
+                    page_number += 1
+                    draw_page_background()
+                    draw_brand_header(margin)
                     doc.setFont(font_name, 10)
-                    y = height - 56
+                    y = height - 174
                 if index % 2 == 0:
-                    doc.setFillColor(HexColor("#f3f5f8"))
+                    doc.setFillColor(soft_surface)
                     doc.roundRect(margin, y - 8, content_width, 28, 5, fill=1, stroke=0)
-                doc.setFillColor(HexColor("#344054"))
+                doc.setFillColor(charcoal_soft)
                 doc.drawRightString(right - 12, y, rtl(labels.get(key, key)))
-                doc.setFillColor(HexColor("#11141b"))
+                doc.setFillColor(ink)
                 doc.drawString(margin + 12, y, rtl(summary_value(key, value)))
                 y -= 34
-            doc.setFillColor(HexColor("#667085"))
-            doc.setFont(font_name, 8)
-            doc.drawRightString(right, 42, rtl("تم إنشاء التقرير من المركز المحاسبي"))
+            draw_report_footer(margin, page_number)
             doc.save()
             return buffer.getvalue()
-        if font_name == "Helvetica":
-            raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
-
-        def rtl(value: Any) -> str:
-            return get_display(arabic_text_reshaper.reshape(str(value)))
 
         def localized_value(key: str, value: Any) -> str:
             if value is None or str(value).strip() == "":
@@ -1212,93 +1519,77 @@ class ReportGenerationService:
             "metric": "المؤشر",
             "value": "القيمة",
         }
-        titles = {
-            "revenue": ("تقرير الإيرادات", "تحليل الإيرادات للفترة المحددة"),
-            "customers": ("تقرير العملاء", "ملخص العملاء والإنفاق للفترة المحددة"),
-            "merchant_revenue": ("تقرير إيرادات التاجر", "ملخص مستحقات التاجر للفترة المحددة"),
-        }
-        title, subtitle = titles.get(report_type, ("التقرير المالي", "تقرير مالي مختصر"))
         margin = 36
         right = width - margin
         content_width = width - (margin * 2)
-        doc.setTitle(f"تقرير رفاهية التسوق - {title}")
-        doc.setAuthor("رفاهية التسوق")
-
-        def draw_background() -> None:
-            doc.setFillColor(white)
-            doc.rect(0, 0, width, height, fill=1, stroke=0)
-
-        def draw_header() -> None:
-            doc.setFillColor(HexColor("#1b202a"))
-            doc.roundRect(margin, height - 94, content_width, 54, 10, fill=1, stroke=0)
-            doc.setFillColor(HexColor("#f5c542"))
-            doc.setFont(font_name, 18)
-            doc.drawRightString(right - 16, height - 66, rtl("تقرير رفاهية التسوق"))
-            doc.setFillColor(HexColor("#d9dee8"))
-            doc.setFont(font_name, 11)
-            doc.drawRightString(right - 16, height - 83, rtl(subtitle))
-
-        draw_background()
-        draw_header()
-        y = height - 126
-        doc.setFillColor(HexColor("#f5c542"))
-        doc.setFont(font_name, 14)
-        doc.drawRightString(right, y, rtl(title))
+        page_number = 1
+        draw_page_background()
+        draw_brand_header(margin)
+        y = height - 174
+        doc.setFillColor(charcoal)
+        doc.setFont(font_name, 12)
+        doc.drawRightString(right, y, rtl("ملخص التقرير"))
         y -= 16
-        doc.setStrokeColor(HexColor("#d0d5dd"))
+        doc.setStrokeColor(brand_gold)
         doc.line(margin, y, right, y)
         y -= 24
         doc.setFont(font_name, 9)
         for index, (key, value) in enumerate(metadata.items()):
             if y < 86:
+                draw_report_footer(margin, page_number)
                 doc.showPage()
-                draw_background()
-                y = height - 46
+                page_number += 1
+                draw_page_background()
+                draw_brand_header(margin)
+                y = height - 174
                 doc.setFont(font_name, 9)
             if index % 2 == 0:
-                doc.setFillColor(HexColor("#f3f5f8"))
+                doc.setFillColor(soft_surface)
                 doc.roundRect(margin, y - 8, content_width, 28, 5, fill=1, stroke=0)
-            doc.setFillColor(HexColor("#344054"))
+            doc.setFillColor(charcoal_soft)
             doc.drawRightString(right - 12, y, rtl(labels.get(key, key)))
-            doc.setFillColor(HexColor("#11141b"))
+            doc.setFillColor(ink)
             doc.drawString(margin + 12, y, rtl(localized_value(key, value)))
             y -= 34
 
         if rows:
             if y < 100:
+                draw_report_footer(margin, page_number)
                 doc.showPage()
-                draw_background()
-                y = height - 46
+                page_number += 1
+                draw_page_background()
+                draw_brand_header(margin)
+                y = height - 174
             y -= 8
-            doc.setFillColor(HexColor("#f5c542"))
+            doc.setFillColor(charcoal)
             doc.setFont(font_name, 12)
             doc.drawRightString(right, y, rtl("تفاصيل التقرير"))
+            doc.setStrokeColor(brand_gold)
+            doc.line(margin, y - 8, right, y - 8)
             y -= 20
             for row_index, row in enumerate(rows, start=1):
                 block_height = 24 + (len(columns) * 18)
                 if y - block_height < 46:
-                    doc.setFillColor(HexColor("#667085"))
-                    doc.setFont(font_name, 8)
-                    doc.drawRightString(right, 24, rtl("تم إنشاء التقرير من المركز المحاسبي"))
+                    draw_report_footer(margin, page_number)
                     doc.showPage()
-                    draw_background()
-                    y = height - 46
+                    page_number += 1
+                    draw_page_background()
+                    draw_brand_header(margin)
+                    y = height - 174
                 if row_index % 2 == 1:
-                    doc.setFillColor(HexColor("#f3f5f8"))
+                    doc.setFillColor(soft_surface)
                     doc.roundRect(margin, y - block_height + 8, content_width, block_height, 6, fill=1, stroke=0)
                 line_y = y - 10
                 for key in columns:
-                    doc.setFillColor(HexColor("#344054"))
+                    doc.setFillColor(charcoal_soft)
                     doc.setFont(font_name, 8)
                     doc.drawRightString(right - 12, line_y, rtl(labels.get(key, key)))
-                    doc.setFillColor(HexColor("#11141b"))
+                    doc.setFillColor(ink)
                     doc.setFont(font_name, 8)
                     doc.drawString(margin + 12, line_y, rtl(localized_value(key, row.get(key))))
                     line_y -= 18
                 y -= block_height
-        doc.setFillColor(HexColor("#667085"))
-        doc.setFont(font_name, 8)
-        doc.drawRightString(right, 24, rtl("تم إنشاء التقرير من المركز المحاسبي"))
+        draw_report_footer(margin, page_number)
         doc.save()
         return buffer.getvalue()
 
@@ -1877,10 +2168,22 @@ class ThemeAdminService:
     def require_access(roles: set[str]) -> None:
         _require_roles(roles, AUTHORIZED_THEME_ROLES, "theme_permission_denied")
 
-    async def save(self, session: AsyncSession, *, actor: User, roles: set[str], body: dict[str, Any], setting_key: str = "default", publish: bool = True) -> dict[str, Any]:
+    async def save(
+        self,
+        session: AsyncSession,
+        *,
+        actor: User,
+        roles: set[str],
+        body: dict[str, Any],
+        setting_key: str = "default",
+        publish: bool = True,
+        commit: bool = True,
+    ) -> dict[str, Any]:
         self.require_access(roles)
         if not isinstance(body, dict) or not _theme_payload_safe(body):
             raise HTTPException(status_code=422, detail="invalid_theme_payload")
+        value = body.get("value", body)
+        _validate_theme_setting_value(setting_key, value)
         model = MODEL_BY_TABLE["theme_settings"]
         row = (
             await session.execute(
@@ -1897,7 +2200,7 @@ class ThemeAdminService:
         row.is_active = publish
         row.extra_data = {
             "key": setting_key,
-            "value": _jsonable(body.get("value", body)),
+            "value": _jsonable(value),
             "version": version,
             "published_at": _now().isoformat() if publish else None,
             "updated_by": str(actor.id),
@@ -1917,13 +2220,18 @@ class ThemeAdminService:
         )
         session.add(history)
         session.add(MODEL_BY_TABLE["audit_logs"](user_id=actor.id, type="theme.publish" if publish else "theme.draft", description=f"Updated theme {setting_key}"))
-        await session.commit()
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
         return serialize_record(row)
 
     async def preview(self, session: AsyncSession, *, actor: User, roles: set[str], body: dict[str, Any]) -> dict[str, Any]:
         self.require_access(roles)
         if not isinstance(body, dict) or not _theme_payload_safe(body):
             raise HTTPException(status_code=422, detail="invalid_theme_payload")
+        value = body.get("value", body)
+        _validate_theme_settings_collection(value)
         token = uuid.uuid4().hex
         expires_at = _now() + timedelta(minutes=30)
         model = MODEL_BY_TABLE["theme_settings"]
@@ -1931,7 +2239,7 @@ class ThemeAdminService:
             name=f"preview:{token}",
             status="preview",
             is_active=False,
-            extra_data={"token": token, "value": _jsonable(body.get("value", body)), "expires_at": expires_at.isoformat(), "created_by": str(actor.id)},
+            extra_data={"token": token, "value": _jsonable(value), "expires_at": expires_at.isoformat(), "created_by": str(actor.id)},
         )
         session.add(row)
         await session.commit()

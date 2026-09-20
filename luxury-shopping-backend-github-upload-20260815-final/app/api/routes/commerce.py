@@ -56,6 +56,7 @@ from ...services.financial_calculator import (
     approved_payment_total,
     calculate_checkout_financials,
     line_total,
+    loyalty_points,
     money,
     refunded_total,
     serialize_local_shopping_requests,
@@ -2841,23 +2842,36 @@ async def _record_financial_side_effects(
             extra_data={"coupon_id": financials.coupon_id, "amount": str(financials.coupon_discount)},
         ))
     if financials.loyalty_discount > 0:
+        loyalty_meta = financials.breakdown.get("loyalty") if isinstance(financials.breakdown, dict) else None
+        redeemed_points = loyalty_points(
+            loyalty_meta.get("points") if isinstance(loyalty_meta, dict) else 0
+        )
+        if redeemed_points <= 0:
+            raise HTTPException(status_code=500, detail="loyalty_points_missing")
         loyalty_model = MODEL_BY_TABLE["user_loyalty"]
         loyalty = (
             await session.execute(
                 select(loyalty_model).where(loyalty_model.user_id == user_id).with_for_update().limit(1)
             )
         ).scalar_one_or_none()
-        if loyalty is None or money(loyalty.balance or 0) < financials.loyalty_discount:
+        balance = int(money(loyalty.balance or 0)) if loyalty is not None else 0
+        if loyalty is None or balance < redeemed_points:
             raise HTTPException(status_code=409, detail="insufficient_loyalty_points")
-        loyalty.balance = money(loyalty.balance or 0) - financials.loyalty_discount
+        loyalty.balance = money(balance - redeemed_points)
         tx_model = MODEL_BY_TABLE["points_transactions"]
         session.add(tx_model(
             user_id=user_id,
             order_id=order_id,
             type="redeem",
-            amount=financials.loyalty_discount,
+            amount=redeemed_points,
             description="Redeemed loyalty points during checkout",
-            extra_data={"policy": "1_point_equals_1_YER", "order_id": str(order_id)},
+            extra_data={
+                "policy": "configured_point_value_yer",
+                "points": redeemed_points,
+                "point_value_yer": (loyalty_meta or {}).get("point_value_yer") if isinstance(loyalty_meta, dict) else None,
+                "discount_yer": str(financials.loyalty_discount),
+                "order_id": str(order_id),
+            },
         ))
 
 

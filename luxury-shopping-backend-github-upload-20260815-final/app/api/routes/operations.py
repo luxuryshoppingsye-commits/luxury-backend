@@ -31,6 +31,7 @@ from ...repositories.resources import (
     ResourceRepository,
     _notify_customer_resource_update,
     _resource_order_status_labels,
+    record_data_access,
     serialize_record,
 )
 from ...security.tokens import decode_token
@@ -147,6 +148,9 @@ from ...services.report_admin_services import (
     SyncCursorService,
     ThemeAdminService,
     _date_range,
+    _theme_payload_safe,
+    _validate_theme_setting_value,
+    _validate_theme_settings_collection,
 )
 from ...services.r2_migration import R2MigrationService
 from ...services.secure_backup import BackupCoordinator
@@ -624,6 +628,11 @@ def _partner_coupon_values(body: dict[str, Any], existing: dict[str, Any] | None
         body.get("valid_until") if body.get("valid_until") is not None else current.get("valid_until"),
         "valid_until",
     )
+    today = datetime.now(timezone.utc).date()
+    if valid_from and valid_from.date() < today:
+        raise HTTPException(status_code=422, detail="coupon_start_date_in_past")
+    if valid_until and valid_until.date() < today:
+        raise HTTPException(status_code=422, detail="coupon_end_date_in_past")
     if valid_from and valid_until and valid_until <= valid_from:
         raise HTTPException(status_code=422, detail="coupon_end_must_follow_start")
     scope = _first_text(body.get("scope"), current.get("scope"), default="all").lower()
@@ -2045,6 +2054,67 @@ async def accept_partner_agreement(
     return {"data": payload}
 
 
+@router.get("/partner/account-deletion-request")
+@router.get("/api/partner/account-deletion-request")
+async def get_partner_account_deletion_request(
+    user: User = Depends(require_partner),
+    session: AsyncSession = Depends(get_session),
+):
+    model = MODEL_BY_TABLE["account_deletion_requests"]
+    row = (
+        await session.execute(
+            select(model)
+            .where(
+                model.user_id == user.id,
+                model.status.in_(("pending", "processing")),
+                model.deleted_at.is_(None),
+            )
+            .order_by(model.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return {"data": serialize_record(row) if row is not None else None}
+
+
+@router.post("/partner/account-deletion-request", status_code=201)
+@router.post("/api/partner/account-deletion-request", status_code=201)
+async def request_partner_account_deletion(
+    request: Request,
+    user: User = Depends(require_partner),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    if str(body.get("confirmation") or "").strip() != "رفاهية التسوق":
+        raise HTTPException(
+            status_code=422,
+            detail="partner_account_deletion_confirmation_required",
+        )
+    model = MODEL_BY_TABLE["account_deletion_requests"]
+    existing = (
+        await session.execute(
+            select(model)
+            .where(
+                model.user_id == user.id,
+                model.status.in_(("pending", "processing")),
+                model.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="account_deletion_already_pending")
+    row = model(
+        user_id=user.id,
+        status="pending",
+        reason="طلب حذف حساب التاجر بانتظار موافقة الإدارة.",
+    )
+    session.add(row)
+    await session.flush()
+    payload = serialize_record(row)
+    await session.commit()
+    return {"data": payload}
+
+
 async def _latest_partner_contract(
     session: AsyncSession,
     partner_id: uuid.UUID,
@@ -2366,6 +2436,8 @@ def _partner_option_response(row: Any, partner_id: uuid.UUID) -> dict[str, Any]:
     can_manage = _partner_option_owner_id(payload) == str(partner_id)
     payload["can_manage"] = can_manage
     payload["is_default"] = not can_manage
+    if can_manage:
+        payload["approval_status"] = "approved" if bool(payload.get("is_active", True)) else "pending"
     return payload
 
 
@@ -2382,9 +2454,10 @@ async def list_partner_product_options(
     # also see options it owns, but never options created by another merchant.
     visible_rows = []
     for row in rows:
-        if not include_inactive and getattr(row, "is_active", True) is False:
-            continue
         owner_id = _partner_option_owner_id(row)
+        is_owned = owner_id == str(user.id)
+        if not include_inactive and getattr(row, "is_active", True) is False and not is_owned:
+            continue
         if owner_id in (None, "", str(user.id)):
             visible_rows.append(row)
     return {"data": [_partner_option_response(row, user.id) for row in visible_rows]}
@@ -2410,16 +2483,19 @@ async def create_partner_product_option(
     if not name:
         raise HTTPException(status_code=422, detail="option_name_required")
     logo_url = _first_text(body.get("logo_url"), body.get("logoUrl"))
+    is_brand = table == "brands"
     row = await _api_create(
         session,
         table,
         {
             "name": name,
+            **({"name_en": _first_text(body.get("name_en"), body.get("nameEn")) or None} if is_brand else {}),
             "code": body.get("code"),
-            "is_active": True,
-            "status": "active",
+            "is_active": not is_brand,
+            "status": "pending" if is_brand else "active",
+            **({"approval_status": "pending"} if is_brand else {}),
             "partner_id": user.id,
-            **({"logo_url": logo_url} if table == "brands" and logo_url else {}),
+            **({"logo_url": logo_url} if is_brand and logo_url else {}),
         },
         user,
     )
@@ -2553,6 +2629,56 @@ async def public_product_coupons(
     return {"data": campaigns}
 
 
+@router.get("/api/catalog/coupons")
+async def public_catalog_coupons(session: AsyncSession = Depends(get_session)):
+    """Return currently published coupons for customer discovery."""
+    now = datetime.now(timezone.utc)
+    coupon_model = MODEL_BY_TABLE["coupons"]
+    rows = (
+        await session.execute(
+            select(coupon_model)
+            .where(
+                coupon_model.is_active.is_(True),
+                coupon_model.deleted_at.is_(None),
+                or_(coupon_model.expires_at.is_(None), coupon_model.expires_at > now),
+            )
+            .order_by(coupon_model.created_at.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+    coupons: list[dict[str, Any]] = []
+    for coupon in rows:
+        extra = dict(coupon.extra_data or {})
+        valid_from = _coupon_datetime(extra.get("valid_from"), "valid_from")
+        if valid_from and valid_from > now:
+            continue
+        valid_until = _coupon_datetime(extra.get("valid_until"), "valid_until")
+        if valid_until and valid_until <= now:
+            continue
+        try:
+            max_uses = int(extra.get("max_uses") or 0)
+            current_uses = int(extra.get("current_uses") or 0)
+        except (TypeError, ValueError):
+            max_uses = 0
+            current_uses = 0
+        if max_uses > 0 and current_uses >= max_uses:
+            continue
+        expires_at = valid_until or coupon.expires_at
+        coupons.append(
+            {
+                "id": str(coupon.id),
+                "code": coupon.code,
+                "title": extra.get("title") or coupon.title or "كوبون خصم",
+                "discount_type": extra.get("discount_type") or "fixed",
+                "discount_value": extra.get("discount_value", float(coupon.amount or 0)),
+                "minimum_order_amount": extra.get("minimum_order_amount", 0),
+                "valid_until": expires_at.isoformat() if isinstance(expires_at, datetime) else expires_at,
+                "store_name": extra.get("store_name") or "رفاهية التسوق",
+            }
+        )
+    return {"data": coupons}
+
+
 @router.post("/partner/coupons", status_code=201)
 async def create_partner_coupon(
     request: Request,
@@ -2629,6 +2755,7 @@ async def update_partner_coupon(
     existing["code"] = row.code
     existing["discount_value"] = existing.get("discount_value", float(row.amount or 0))
     values = _partner_coupon_values(body, existing)
+    is_active = _coupon_bool(body.get("is_active"), bool(row.is_active))
     await _assert_partner_coupon_targets(session, partner_id=user.id, values=values)
     linked_id = existing.get("customer_coupon_id")
     customer_coupon_id = _uuid(linked_id, "customer_coupon_id") if linked_id else None
@@ -2649,6 +2776,8 @@ async def update_partner_coupon(
     row.code = values["code"]
     row.amount = values["amount"]
     row.expires_at = values["expires_at"]
+    row.is_active = is_active
+    row.status = "active" if is_active else "inactive"
     row.extra_data = {
         **campaign,
         "customer_coupon_id": str(customer_coupon_id) if customer_coupon_id else None,
@@ -2662,8 +2791,8 @@ async def update_partner_coupon(
             customer_coupon.title = values["title"]
             customer_coupon.amount = values["amount"]
             customer_coupon.expires_at = values["expires_at"]
-            customer_coupon.is_active = True
-            customer_coupon.status = "active"
+            customer_coupon.is_active = is_active
+            customer_coupon.status = "active" if is_active else "inactive"
             customer_coupon.extra_data = {
                 **campaign,
                 "partner_coupon_id": str(row.id),
@@ -4360,6 +4489,7 @@ async def _create_local_request_notification(
             },
             created_by=created_by,
             source="local_shopping",
+            delivery_channels=("in_app", "mobile_push"),
             deduplication_key=f"local-request-created:{request_id}" if created else f"local-request-status:{request_id}:{status_key}",
         )
     )
@@ -6335,28 +6465,20 @@ async def api_finance_summary(
             if clause is not None
         )
 
-    total_expenses = sum(
-        (
-            await _sum_amount(session, table, *expense_date_clauses(table))
-            for table in expense_tables
-        ),
-        Decimal("0"),
-    )
+    total_expenses = Decimal("0")
+    for table in expense_tables:
+        total_expenses += await _sum_amount(session, table, *expense_date_clauses(table))
     month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     monthly_income = Decimal(
         (await RevenueRecognitionService.summary(session, start=month_start))["net_revenue"]
     )
-    monthly_expenses = sum(
-        (
-            await _sum_amount(
-                session,
-                table,
-                MODEL_BY_TABLE[table].created_at >= month_start,
-            )
-            for table in expense_tables
-        ),
-        Decimal("0"),
-    )
+    monthly_expenses = Decimal("0")
+    for table in expense_tables:
+        monthly_expenses += await _sum_amount(
+            session,
+            table,
+            MODEL_BY_TABLE[table].created_at >= month_start,
+        )
     # The accounting card must reflect outstanding order balances and receipt
     # reviews.  Reading only ``payment_receipts`` made it show zero for orders
     # whose checkout ledger was still pending.
@@ -6597,7 +6719,64 @@ async def api_activity_access(
     staff: User = Depends(require_staff),
     session: AsyncSession = Depends(get_session),
 ):
-    return {"data": []}
+    existing_rows = await _rows(session, "data_access_logs", limit=limit)
+    record_data_access(
+        session,
+        user_id=staff.id,
+        table="data_access_logs",
+        result=existing_rows,
+        source="access_log_report",
+    )
+    await session.commit()
+
+    access_rows = await _rows(session, "data_access_logs", limit=limit)
+    user_ids = {getattr(row, "user_id", None) for row in access_rows}
+    user_ids.discard(None)
+    user_labels: dict[str, str] = {}
+    if user_ids:
+        profile_rows = (
+            await session.execute(
+                select(Profile.user_id, Profile.full_name, Profile.email)
+                .where(Profile.user_id.in_(user_ids), Profile.deleted_at.is_(None))
+            )
+        ).all()
+        for user_id, full_name, email in profile_rows:
+            user_labels[str(user_id)] = _first_text(full_name, email)
+        user_rows = (
+            await session.execute(
+                select(User.id, User.email)
+                .where(User.id.in_(user_ids), User.deleted_at.is_(None))
+            )
+        ).all()
+        for user_id, email in user_rows:
+            user_labels.setdefault(str(user_id), str(email or ""))
+
+    data = []
+    for row in access_rows:
+        payload = serialize_record(row)
+        user_id = str(payload.get("user_id") or "")
+        action_type = _first_text(payload.get("action_type"), payload.get("type"), default="view").lower()
+        if action_type in {"select", "read", "list"}:
+            action_type = "view"
+        try:
+            record_count = max(0, int(payload.get("record_count") or 0))
+        except (TypeError, ValueError):
+            record_count = 0
+        accessed_at = payload.get("accessed_at") or payload.get("created_at")
+        data.append(
+            {
+                "id": str(payload.get("id") or ""),
+                "user_id": user_id or None,
+                "user_name": user_labels.get(user_id) or _first_text(payload.get("user_name"), default="مستخدم غير معروف"),
+                "action_type": action_type,
+                "table_name": _first_text(payload.get("table_name"), default="unknown"),
+                "data_category": _first_text(payload.get("data_category"), default="general"),
+                "record_count": record_count,
+                "search_query": _first_text(payload.get("search_query")) or None,
+                "accessed_at": accessed_at,
+            }
+        )
+    return {"data": data}
 
 
 @router.get("/api/analytics/activity/audit")
@@ -6975,6 +7154,7 @@ def _analytics_event_payload(row: Any) -> dict[str, Any]:
         default="/",
     )
     session_id = _first_text(payload.get("session_id"), metadata.get("session_id")) or None
+    visitor_id = _first_text(payload.get("visitor_id"), metadata.get("visitor_id")) or None
     if session_id is None and event_type in {
         "page_view",
         "product_view",
@@ -6995,6 +7175,7 @@ def _analytics_event_payload(row: Any) -> dict[str, Any]:
     payload["page_path"] = page_path
     payload["metadata"] = metadata
     payload["session_id"] = session_id
+    payload["visitor_id"] = visitor_id
     return payload
 
 
@@ -7021,6 +7202,31 @@ def _analytics_event_type(payload: dict[str, Any]) -> str:
         "checkout": "checkout_start",
         "purchase": "order_placed",
     }.get(raw_type, raw_type)
+
+
+def _analytics_user_id(payload: dict[str, Any]) -> str:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    return _first_text(payload.get("user_id"), metadata.get("user_id"))
+
+
+def _analytics_visitor_id(payload: dict[str, Any]) -> str:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    return _first_text(payload.get("visitor_id"), metadata.get("visitor_id"))
+
+
+def _analytics_visitor_key(payload: dict[str, Any], visitor_user_aliases: dict[str, str]) -> str:
+    user_id = _analytics_user_id(payload)
+    visitor_id = _analytics_visitor_id(payload)
+    session_id = _first_text(payload.get("session_id"))
+    if user_id:
+        return f"user:{user_id}"
+    if visitor_id and visitor_id in visitor_user_aliases:
+        return f"user:{visitor_user_aliases[visitor_id]}"
+    if visitor_id:
+        return f"visitor:{visitor_id}"
+    if session_id:
+        return f"session:{session_id}"
+    return ""
 
 
 @router.post("/api/analytics/events", status_code=202)
@@ -7060,6 +7266,7 @@ async def api_create_analytics_events(
                 "page_path": page_path,
                 "metadata": _jsonable(metadata),
                 "session_id": _first_text(payload.get("session_id"))[:120] or None,
+                "visitor_id": _first_text(payload.get("visitor_id"), metadata.get("visitor_id"))[:120] or None,
             }
         )
         values: dict[str, Any] = {
@@ -7155,34 +7362,43 @@ async def api_analytics_summary(
     )
     events = [_analytics_event_payload(row) for row in event_result.scalars()]
     sessions: set[str] = set()
+    visitors: set[str] = set()
     page_counts: dict[str, int] = {}
     search_counts: dict[str, int] = {}
-    daily_sessions: dict[str, set[str]] = {}
+    daily_visitors: dict[str, set[str]] = {}
     funnel_sessions = {key: set() for key in ("page_view", "product_view", "cart_add", "checkout_start", "checkout_shipping", "checkout_payment", "order_placed")}
     total_page_views = 0
     total_time = 0
     time_samples = 0
-    mobile_devices = 0
-    desktop_devices = 0
+    visitor_devices: dict[str, str] = {}
+    visitor_user_aliases = {
+        visitor_id: user_id
+        for event in events
+        if (visitor_id := _analytics_visitor_id(event))
+        and (user_id := _analytics_user_id(event))
+    }
     for event in events:
         event_type = _analytics_event_type(event)
         session_id = _first_text(event.get("session_id"))
+        visitor_key = _analytics_visitor_key(event, visitor_user_aliases)
         metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
         if session_id:
             sessions.add(session_id)
             if event_type in funnel_sessions:
                 funnel_sessions[event_type].add(session_id)
-        if metadata.get("is_mobile") is True:
-            mobile_devices += 1
-        elif metadata.get("is_mobile") is False:
-            desktop_devices += 1
         if event_type == "page_view":
             total_page_views += 1
+            if visitor_key:
+                visitors.add(visitor_key)
+                if metadata.get("is_mobile") is True:
+                    visitor_devices[visitor_key] = "mobile"
+                elif metadata.get("is_mobile") is False:
+                    visitor_devices[visitor_key] = "desktop"
             page = _first_text(event.get("page_path"), default="/")
             page_counts[page] = page_counts.get(page, 0) + 1
             date_key = str(event.get("created_at") or "").split("T", 1)[0]
-            if date_key and session_id:
-                daily_sessions.setdefault(date_key, set()).add(session_id)
+            if date_key and visitor_key:
+                daily_visitors.setdefault(date_key, set()).add(visitor_key)
         elif event_type == "search":
             query = _first_text(metadata.get("query"))
             if query:
@@ -7199,7 +7415,9 @@ async def api_analytics_summary(
     orders = await RevenueRecognitionService.eligible_orders(session, start=start, end=end)
     total_orders = len(orders)
     funnel_sessions["order_placed"].update(str(order.user_id) for order in orders if order.user_id)
-    conversion_base = len(sessions)
+    conversion_base = len(visitors)
+    mobile_devices = sum(device == "mobile" for device in visitor_devices.values())
+    desktop_devices = sum(device == "desktop" for device in visitor_devices.values())
     top_pages = [
         {"page": page, "views": count}
         for page, count in sorted(page_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
@@ -7225,7 +7443,7 @@ async def api_analytics_summary(
     return {
         "data": {
             "totalVisitors": total_page_views,
-            "uniqueVisitors": len(sessions),
+            "uniqueVisitors": len(visitors),
             "totalOrders": total_orders,
             "conversionRate": (total_orders / conversion_base * 100) if conversion_base else 0,
             "avgTimeOnSite": (total_time / time_samples) if time_samples else 0,
@@ -7234,8 +7452,8 @@ async def api_analytics_summary(
             "deviceBreakdown": {"mobile": mobile_devices, "desktop": desktop_devices},
             "funnel": funnel,
             "dailyVisitors": [
-                {"date": date_key, "count": len(visitor_sessions)}
-                for date_key, visitor_sessions in sorted(daily_sessions.items())
+                {"date": date_key, "count": len(visitor_ids)}
+                for date_key, visitor_ids in sorted(daily_visitors.items())
             ],
         }
     }
@@ -8958,6 +9176,7 @@ async def _create_international_order_status_notification(
             },
             created_by=created_by,
             source="international_order_status",
+            delivery_channels=("in_app", "mobile_push"),
             deduplication_key=f"international-order-status:{order.id}:{previous_status}:{next_status}",
         )
     )
@@ -10617,6 +10836,20 @@ async def api_link_admin_courier_account(
         if already_linked is not None:
             raise HTTPException(status_code=409, detail="courier_account_already_linked")
     courier.user_id = user_id
+    assignment_model = MODEL_BY_TABLE["courier_assignments"]
+    current_assignments = list(
+        (
+            await session.execute(
+                select(assignment_model).where(
+                    assignment_model.courier_id == record_id,
+                    assignment_model.deleted_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+    for assignment in current_assignments:
+        if _assignment_is_current(assignment):
+            assignment.user_id = user_id
     await session.commit()
     return {"data": serialize_record(courier), "account_linked": user_id is not None}
 
@@ -10771,8 +11004,30 @@ async def api_content_theme_history(
 async def api_content_create_theme_history(request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     ThemeAdminService.require_access(roles)
     body = await request.json()
+    setting_key = str(body.get("setting_key") or "").strip()
+    new_value = _jsonable(body.get("new_value"))
+    model = MODEL_BY_TABLE["theme_settings"]
+    recent_history = await _rows(
+        session,
+        "theme_settings",
+        clauses=(model.status == "history",),
+        limit=20,
+    )
+    for existing in recent_history:
+        extra = dict(existing.extra_data or {})
+        if (
+            setting_key
+            and str(extra.get("setting_key") or "") == setting_key
+            and _jsonable(extra.get("new_value")) == new_value
+            and str(extra.get("updated_by") or extra.get("changed_by") or "") == str(staff.id)
+        ):
+            description = str(body.get("description") or "").strip()
+            if description:
+                existing.extra_data = {**extra, "description": description}
+            await session.commit()
+            return {"data": serialize_record(existing)}
     row = await _api_create(session, "theme_settings", {
-        "name": f"history:{body.get('setting_key') or uuid.uuid4()}",
+        "name": f"history:{setting_key or uuid.uuid4()}",
         "status": "history",
         "is_active": False,
         "description": body.get("description") or "",
@@ -10792,11 +11047,13 @@ async def api_content_revert_theme_history(history_id: uuid.UUID, staff: User = 
     extra = dict(history.extra_data or {})
     key = extra.get("setting_key")
     if key:
+        old_value = extra.get("old_value", {})
+        _validate_theme_setting_value(str(key), old_value)
         rows = await _rows(session, "theme_settings", clauses=(model.name == str(key),), limit=1)
         row = rows[0] if rows else model(name=str(key), status="active", is_active=True, extra_data={})
         if not rows:
             session.add(row)
-        row.extra_data = {"key": str(key), "value": _jsonable(extra.get("old_value", {}))}
+        row.extra_data = {"key": str(key), "value": _jsonable(old_value)}
     await session.commit()
     return {"data": serialize_record(history)}
 
@@ -10922,6 +11179,7 @@ async def api_content_create_theme_template(
         raise HTTPException(status_code=422, detail="template_settings_required")
     if not _theme_payload_safe(body):
         raise HTTPException(status_code=422, detail="invalid_theme_payload")
+    _validate_theme_settings_collection(settings)
 
     model = MODEL_BY_TABLE["theme_settings"]
     existing = await _rows(
@@ -10991,42 +11249,85 @@ async def api_content_apply_theme_template(template_id: uuid.UUID, staff: User =
     template_settings = template_extra.get("settings") if isinstance(template_extra.get("settings"), dict) else template_extra
     if isinstance(template_settings, dict) and isinstance(template_settings.get("settings"), dict):
         template_settings = template_settings["settings"]
-    setting_keys = {
-        "colors": "colors",
-        "typography": "typography",
-        "layout": "layout",
-        "components": "cards",
-        "cards": "cards",
-        "buttons": "buttons",
-        "inputs": "inputs",
-        "animations": "animations",
-        "hero": "hero",
-    }
-    updates = {
-        setting_keys[key]: value
-        for key, value in (template_settings.items() if isinstance(template_settings, dict) else [])
-        if key in setting_keys and value is not None
-    }
+    updates: dict[str, Any] = {}
+    if isinstance(template_settings, dict):
+        components = template_settings.get("components")
+        if isinstance(components, dict):
+            card_value = {
+                target: components[source]
+                for source, target in (
+                    ("cardRadius", "borderRadius"),
+                    ("cardShadow", "shadow"),
+                    ("cardHover", "hoverEffect"),
+                )
+                if source in components
+            }
+            button_value = {
+                target: components[source]
+                for source, target in (
+                    ("buttonRadius", "borderRadius"),
+                    ("buttonSize", "size"),
+                )
+                if source in components
+            }
+            input_value = (
+                {"borderRadius": components["inputRadius"]}
+                if "inputRadius" in components
+                else {}
+            )
+            if card_value:
+                updates["cards"] = card_value
+            if button_value:
+                updates["buttons"] = button_value
+            if input_value:
+                updates["inputs"] = input_value
+        for setting_key in (
+            "colors",
+            "typography",
+            "layout",
+            "cards",
+            "buttons",
+            "inputs",
+            "animations",
+            "hero",
+        ):
+            value = template_settings.get(setting_key)
+            if value is not None:
+                # Explicit template sections override their legacy combined
+                # component values when both formats are present.
+                updates[setting_key] = value
     if not updates:
         raise HTTPException(status_code=422, detail="template_has_no_theme_settings")
-    theme_service = ThemeAdminService()
     for setting_key, value in updates.items():
-        # Apply each setting through the same audited publish path used by the
-        # design panel, so this endpoint cannot leave the public site unchanged.
-        await theme_service.save(
-            session,
-            actor=staff,
-            roles=roles,
-            body={"value": _jsonable(value)},
-            setting_key=setting_key,
-            publish=True,
-        )
-    rows = await _rows(session, "theme_settings", clauses=(model.name == "active_template",), limit=1)
-    row = rows[0] if rows else model(name="active_template", status="active", is_active=True, extra_data={})
-    if not rows:
-        session.add(row)
-    row.extra_data = {"template_id": str(template_id), "settings": _jsonable(updates), "applied_at": _now().isoformat(), "updated_by": str(staff.id)}
-    await session.commit()
+        _validate_theme_setting_value(setting_key, value)
+    theme_service = ThemeAdminService()
+    try:
+        for setting_key, value in updates.items():
+            # Apply the complete template in one transaction. A failure in one
+            # section must not publish a half-old, half-new storefront theme.
+            await theme_service.save(
+                session,
+                actor=staff,
+                roles=roles,
+                body={"value": _jsonable(value)},
+                setting_key=setting_key,
+                publish=True,
+                commit=False,
+            )
+        rows = await _rows(session, "theme_settings", clauses=(model.name == "active_template",), limit=1)
+        row = rows[0] if rows else model(name="active_template", status="active", is_active=True, extra_data={})
+        if not rows:
+            session.add(row)
+        row.extra_data = {
+            "template_id": str(template_id),
+            "settings": _jsonable(updates),
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+            "updated_by": str(staff.id),
+        }
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
     return {"data": serialize_record(row)}
 
 
@@ -11707,9 +12008,6 @@ async def api_set_order_courier_assignment(
         courier_status = str(getattr(courier, "status", "active") or "active").strip().lower()
         if courier_status in {"inactive", "disabled", "deleted"} or getattr(courier, "is_active", True) is False:
             raise HTTPException(status_code=409, detail="courier_inactive")
-        if not getattr(courier, "user_id", None):
-            raise HTTPException(status_code=409, detail="courier_account_not_linked")
-
     for old_assignment in current_rows:
         if not _assignment_is_current(old_assignment):
             continue
@@ -11738,7 +12036,9 @@ async def api_set_order_courier_assignment(
     await session.commit()
     courier_map = {}
     if courier is not None:
-        courier_map = {str(courier.id): courier, str(courier.user_id): courier}
+        courier_map = {str(courier.id): courier}
+        if getattr(courier, "user_id", None):
+            courier_map[str(courier.user_id)] = courier
     data = _courier_assignment_payload(assignment, courier_map) if assignment is not None else None
     return {"data": data, "courier_linked": bool(data and data.get("courier_linked"))}
 
@@ -13266,6 +13566,8 @@ async def _partner_sales_analytics(
         select(
             Order.id.label("order_id"),
             Order.status.label("status"),
+            Order.order_number.label("order_number"),
+            Order.payment_status.label("payment_status"),
             Order.created_at.label("created_at"),
             Order.user_id.label("customer_id"),
             Order.subtotal.label("order_subtotal"),
@@ -13287,18 +13589,27 @@ async def _partner_sales_analytics(
         status = str(row["status"] or "pending").strip().lower() or "pending"
         created_at = row["created_at"]
         amount = money(row["total_price"] or 0)
+        product_name = str(row["product_name"] or "منتج بدون اسم").strip() or "منتج بدون اسم"
+        quantity = int(row["quantity"] or 0)
         order = orders.setdefault(
             order_id,
             {
                 "status": status,
+                "order_number": str(row["order_number"] or ""),
+                "payment_status": str(row["payment_status"] or "unpaid"),
                 "created_at": created_at,
                 "customer_id": row["customer_id"],
                 "subtotal": money(row["order_subtotal"] or 0),
                 "discount_total": money(row["order_discount_total"] or 0),
                 "total": Decimal("0.00"),
+                "product_names": [],
+                "quantity": 0,
             },
         )
         order["total"] = money(order["total"] + amount)
+        if product_name not in order["product_names"]:
+            order["product_names"].append(product_name)
+        order["quantity"] += quantity
 
         status_total = status_totals.setdefault(
             status,
@@ -13309,12 +13620,11 @@ async def _partner_sales_analytics(
 
         if status in _PARTNER_SALES_EXCLUDED_STATUSES:
             continue
-        product_name = str(row["product_name"] or "منتج بدون اسم").strip() or "منتج بدون اسم"
         product_total = product_totals.setdefault(
             product_name,
             {"quantity": 0, "revenue": Decimal("0.00")},
         )
-        product_total["quantity"] += int(row["quantity"] or 0)
+        product_total["quantity"] += quantity
         product_total["revenue"] = money(product_total["revenue"] + amount)
 
     sale_orders = [
@@ -13324,6 +13634,14 @@ async def _partner_sales_analytics(
     ]
     gross_revenue = money(sum((row["total"] for row in sale_orders), Decimal("0.00")))
     orders_count = len(sale_orders)
+    contract = await _latest_partner_contract(session, partner_id)
+    contract_data = contract.extra_data if contract is not None and isinstance(contract.extra_data, dict) else {}
+    partner_share_rate = Decimal(
+        str(_partner_rate(contract_data.get("commissionRate", contract_data.get("rate"))))
+    )
+    platform_commission_rate = Decimal("100.00") - partner_share_rate
+    expected_partner_earnings = money(gross_revenue * partner_share_rate / Decimal("100.00"))
+    expected_platform_commission = money(gross_revenue - expected_partner_earnings)
     pending = sum(1 for row in sale_orders if row["status"] in _PARTNER_SALES_PENDING_STATUSES)
     completed = sum(1 for row in sale_orders if row["status"] == "delivered")
     average_order = money(gross_revenue / orders_count) if orders_count else Decimal("0.00")
@@ -13391,6 +13709,30 @@ async def _partner_sales_analytics(
         )
     ).one()
     recorded_due = money(due_amount or 0)
+    paid_settlement_amount = (
+        await session.execute(
+            select(func.coalesce(func.sum(settlement_model.amount), 0)).where(
+                settlement_model.partner_id == partner_id,
+                settlement_model.deleted_at.is_(None),
+                func.lower(settlement_model.status) == "paid",
+            )
+        )
+    ).scalar_one()
+    paid_partner_earnings = money(paid_settlement_amount or 0)
+    pending_partner_earnings = money(max(Decimal("0.00"), expected_partner_earnings - paid_partner_earnings))
+    settlement_rows = list(
+        (
+            await session.execute(
+                select(settlement_model)
+                .where(
+                    settlement_model.partner_id == partner_id,
+                    settlement_model.deleted_at.is_(None),
+                )
+                .order_by(settlement_model.created_at.desc())
+                .limit(10)
+            )
+        ).scalars()
+    )
     return {
         "period": normalized_period,
         "range": {
@@ -13404,6 +13746,12 @@ async def _partner_sales_analytics(
         "totalRevenue": recognized["net_revenue"],
         "merchantRevenue": recognized["net_revenue"],
         "grossRevenue": format(gross_revenue, "f"),
+        "partnerShareRate": float(partner_share_rate),
+        "platformCommissionRate": float(platform_commission_rate),
+        "expectedPartnerEarnings": format(expected_partner_earnings, "f"),
+        "expectedPlatformCommission": format(expected_platform_commission, "f"),
+        "paidPartnerEarnings": format(paid_partner_earnings, "f"),
+        "pendingPartnerEarnings": format(pending_partner_earnings, "f"),
         "discountsAmount": format(allocated_discounts, "f"),
         "averageOrder": format(average_order, "f"),
         "pending": pending,
@@ -13438,6 +13786,38 @@ async def _partner_sales_analytics(
                 key=lambda item: (-item[1]["revenue"], item[0]),
             )[:5]
         ],
+        "recentOrders": [
+            {
+                "id": str(order_id),
+                "order_id": str(order_id),
+                "order_amount": format(row["total"], "f"),
+                "partner_amount": format(
+                    money(row["total"] * partner_share_rate / Decimal("100.00")),
+                    "f",
+                ),
+                "commission_amount": format(
+                    money(row["total"] * platform_commission_rate / Decimal("100.00")),
+                    "f",
+                ),
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else None,
+                "order": {
+                    "order_number": row["order_number"],
+                    "payment_status": row["payment_status"],
+                },
+                "product": {"name": "، ".join(row["product_names"])},
+                "order_item": {
+                    "product_name": "، ".join(row["product_names"]),
+                    "quantity": row["quantity"],
+                },
+            }
+            for order_id, row in sorted(
+                ((order_id, row) for order_id, row in orders.items() if row["status"] not in _PARTNER_SALES_EXCLUDED_STATUSES),
+                key=lambda item: item[1]["created_at"] or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )[:10]
+        ],
+        "settlements": [serialize_record(row) for row in settlement_rows],
         "customerSummary": {
             "uniqueCustomers": customers_count,
             "returningCustomers": returning_customers,
@@ -13807,6 +14187,7 @@ async def create_refund(
     )
 
 
+@router.post("/api/receipts/signed-url")
 @router.post("/receipts/signed-url")
 async def receipt_url(
     request: Request,
@@ -13832,6 +14213,7 @@ async def receipt_url(
     )
 
 
+@router.get("/api/receipts/access")
 @router.get("/receipts/access")
 async def receipt_access(token: str, session: AsyncSession = Depends(get_session)):
     return await signed_receipt_file_response(session, token=token, storage=storage)

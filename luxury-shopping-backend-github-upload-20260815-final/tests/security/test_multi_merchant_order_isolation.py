@@ -282,6 +282,23 @@ async def test_partner_order_list_detail_report_and_generic_resources_are_scoped
         assert report_body["revenue"] == "25000.00"
         assert report_body["period"] == "month"
         assert report_body["grossRevenue"] == "25000.00"
+        assert report_body["partnerShareRate"] == 85.0
+        assert report_body["expectedPartnerEarnings"] == "21250.00"
+        assert report_body["pendingPartnerEarnings"] == "21250.00"
+        assert report_body["recentOrders"] == [
+            {
+                "id": str(order_id),
+                "order_id": str(order_id),
+                "order_amount": "25000.00",
+                "partner_amount": "21250.00",
+                "commission_amount": "3750.00",
+                "status": "processing",
+                "created_at": report_body["recentOrders"][0]["created_at"],
+                "order": {"order_number": seeded["order_number"], "payment_status": "paid"},
+                "product": {"name": seeded["product_a_name"]},
+                "order_item": {"product_name": seeded["product_a_name"], "quantity": 2},
+            }
+        ]
         assert report_body["averageOrder"] == "25000.00"
         assert report_body["salesSeries"]
         assert any(row["revenue"] == "25000.00" for row in report_body["salesSeries"])

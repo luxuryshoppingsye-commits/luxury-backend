@@ -550,6 +550,9 @@ async def _notify_customer_resource_update(
             order_id=getattr(record, "id", None) if table == "international_orders" else None,
             payload=payload,
             created_by=actor_id,
+            delivery_channels=("in_app", "mobile_push")
+            if notification_type in {"order_status", "order_update"}
+            else None,
             deduplication_key=(
                 f"partner-application-review:{entity_id}:{_resource_status(getattr(record, 'status', None))}"
                 if table == "partner_applications"
@@ -763,6 +766,78 @@ def _normalize_resource_payload(
             active = active.strip().lower() not in {"false", "0", "no", "inactive"}
         values["status"] = "active" if active else "inactive"
     return values
+
+
+def data_access_category(table: str) -> str:
+    normalized = str(table or "").strip().lower()
+    if any(marker in normalized for marker in ("payment", "financial", "finance", "expense", "invoice", "settlement", "voucher", "refund", "wallet")):
+        return "financial"
+    if any(marker in normalized for marker in ("user", "profile", "customer", "address", "staff", "employee", "partner")):
+        return "personal"
+    if any(marker in normalized for marker in ("order", "cart", "shipping", "delivery", "return", "purchase")):
+        return "orders"
+    if any(marker in normalized for marker in ("message", "contact", "support", "ticket", "notification", "review")):
+        return "contact"
+    return "general"
+
+
+def data_access_record_count(result: Any) -> int:
+    if isinstance(result, list):
+        return len(result)
+    if isinstance(result, dict):
+        for key in ("count", "total"):
+            value = result.get(key)
+            if isinstance(value, int) and value >= 0:
+                return value
+        items = result.get("items")
+        if isinstance(items, list):
+            return len(items)
+        return 1 if result else 0
+    return 1 if result is not None else 0
+
+
+def data_access_search_query(payload: dict[str, Any]) -> str | None:
+    values: list[str] = []
+    for item in payload.get("filters") or []:
+        if not isinstance(item, dict):
+            continue
+        operator = str(item.get("operator") or "").strip().lower()
+        if operator not in {"like", "ilike", "contains", "text_search", "fts"}:
+            continue
+        value = str(item.get("value") or "").strip().strip("%")
+        if value:
+            values.append(value)
+    query = " ".join(values).strip()
+    return query[:160] or None
+
+
+def record_data_access(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    table: str,
+    result: Any,
+    payload: dict[str, Any] | None = None,
+    source: str = "resource_api",
+) -> None:
+    model = MODEL_BY_TABLE["data_access_logs"]
+    safe_table = str(table or "unknown").strip()[:120] or "unknown"
+    request_payload = payload if isinstance(payload, dict) else {}
+    session.add(
+        model(
+            user_id=user_id,
+            type="view",
+            description=f"Viewed {safe_table}",
+            extra_data={
+                "action_type": "view",
+                "table_name": safe_table,
+                "data_category": data_access_category(safe_table),
+                "record_count": data_access_record_count(result),
+                "search_query": data_access_search_query(request_payload),
+                "source": source,
+            },
+        )
+    )
 
 
 class ResourceRepository:

@@ -2,8 +2,49 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 from backend.app.services import report_admin_services as ras
+
+
+def test_pdf_arabic_font_registration_skips_missing_candidate(monkeypatch, tmp_path) -> None:
+    packaged_font = ras.BACKEND_DIR / "assets" / "fonts" / "Tajawal-Regular.ttf"
+    assert packaged_font.is_file()
+    monkeypatch.setattr(
+        ras,
+        "_pdf_arabic_font_candidates",
+        lambda: (tmp_path / "missing.ttf", packaged_font),
+    )
+
+    assert ras._register_pdf_arabic_font(pdfmetrics, TTFont) == "ArabicReportFont1"
+
+
+@pytest.mark.parametrize(
+    "report_type",
+    ("summary", "sales", "orders", "revenue", "customers", "merchant_revenue"),
+)
+def test_pdf_reports_use_arabic_font_and_brand_identity(report_type: str) -> None:
+    logo = ras.BACKEND_DIR / "assets" / "branding" / "luxury-shopping-logo.png"
+    assert logo.is_file()
+    metadata = {
+        "date_basis": "orders.created_at plus successful payment/refund status",
+        "order_count": "3",
+        "eligible_order_count": "3",
+        "gross_revenue": "140042.25",
+        "paid_amount": "120000.00",
+        "refund_amount": "0.00",
+        "net_revenue": "140042.25",
+        "currency_code": "YER",
+        "partner_scope": None,
+    }
+
+    pdf = ras.ReportGenerationService._render_pdf(report_type, [], ("metric", "value"), metadata)
+
+    assert pdf.startswith(b"%PDF")
+    assert len(pdf) > 10_000
+    assert b"/Subtype /Image" in pdf
+    assert b"/Title" in pdf
 
 
 @pytest.mark.asyncio

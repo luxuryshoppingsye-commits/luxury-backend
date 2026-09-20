@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..models import MODEL_BY_TABLE
 from ..models.domain import Brand, Category, Product, ProductVariant
-from .partner_subscription import active_partner_ids, public_partner_product_clause
+from .partner_subscription import public_partner_product_clause
 
 
 PUBLIC_APPROVAL_STATUSES = ("approved", "accepted", "active", "published", "visible", "live")
@@ -689,12 +689,6 @@ async def build_public_product_rows(
             for key in (getattr(storefront, "partner_id", None), getattr(storefront, "user_id", None)):
                 if key:
                     storefronts[key] = storefront
-        active_ids = await active_partner_ids(session, partner_ids)
-        storefronts = {
-            key: storefront
-            for key, storefront in storefronts.items()
-            if key in active_ids
-        }
     if supplier_ids and "local_merchants" in MODEL_BY_TABLE:
         local_model = MODEL_BY_TABLE["local_merchants"]
         result = await session.execute(

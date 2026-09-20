@@ -38,6 +38,22 @@ def money_or_zero(value: Any) -> Decimal:
         return Decimal("0.00")
 
 
+def loyalty_points(value: Any) -> int:
+    """Parse a customer loyalty balance or redemption request as whole points."""
+
+    try:
+        parsed = Decimal(str(value if value is not None else "0"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_loyalty_points")
+    if (
+        not parsed.is_finite()
+        or parsed < 0
+        or parsed != parsed.to_integral_value(rounding=ROUND_FLOOR)
+    ):
+        raise HTTPException(status_code=400, detail="invalid_loyalty_points")
+    return int(parsed)
+
+
 LOCAL_PAYMENT_SUCCESS_STATUSES = ("confirmed", "approved", "paid", "completed")
 LOYALTY_EARNING_ORDER_STATUSES = frozenset({"delivered", "completed"})
 
@@ -698,19 +714,42 @@ async def _loyalty_discount(
     requested_points: Any,
     eligible_amount: Decimal,
 ) -> tuple[Decimal, dict[str, Any]]:
-    points = money_or_zero(requested_points)
+    points = loyalty_points(requested_points)
     if points <= 0:
         return Decimal("0.00"), {"source": "none"}
+    settings = await loyalty_program_settings(session)
+    if not settings.is_active:
+        raise HTTPException(status_code=409, detail="loyalty_program_inactive")
     loyalty_model = MODEL_BY_TABLE["user_loyalty"]
     result = await session.execute(
         select(loyalty_model).where(loyalty_model.user_id == user_id).with_for_update().limit(1)
     )
     loyalty = result.scalar_one_or_none()
-    balance = money_or_zero(loyalty.balance if loyalty is not None else 0)
+    balance = int(money_or_zero(loyalty.balance if loyalty is not None else 0))
     if balance < points:
         raise HTTPException(status_code=409, detail="insufficient_loyalty_points")
-    discount = min(points, eligible_amount)
-    return discount, {"source": "user_loyalty", "points": str(points), "balance_before": str(balance)}
+    max_percentage = min(max(settings.max_redeem_percentage, 0), 100)
+    max_discount = eligible_amount * Decimal(max_percentage) / Decimal("100")
+    max_points_by_order = int(
+        (max_discount / Decimal(settings.point_value_yer)).to_integral_value(
+            rounding=ROUND_FLOOR,
+        )
+    )
+    if points < settings.min_redeem_points:
+        raise HTTPException(status_code=409, detail="loyalty_minimum_points")
+    if points > max_points_by_order:
+        raise HTTPException(status_code=409, detail="loyalty_points_exceed_order_limit")
+    discount = min(
+        Decimal(points) * Decimal(settings.point_value_yer),
+        eligible_amount,
+    )
+    return money(discount), {
+        "source": "user_loyalty",
+        "points": str(points),
+        "point_value_yer": settings.point_value_yer,
+        "max_redeem_percentage": max_percentage,
+        "balance_before": str(balance),
+    }
 
 
 async def _shipping_total(session: AsyncSession, body: dict[str, Any]) -> tuple[Decimal, str, dict[str, Any]]:

@@ -7,7 +7,7 @@ from ...database import get_session
 from ...dependencies import optional_user
 from ...models.domain import User
 from ...services.auth_service import roles_for
-from ...repositories.resources import ResourceRepository
+from ...repositories.resources import ResourceRepository, record_data_access
 
 
 router = APIRouter(tags=["resources"])
@@ -25,7 +25,17 @@ async def query_resource(
     repository = ResourceRepository(session, table, user.id if user else None, roles)
     operation = str(body.get("operation") or "select")
     if operation == "select":
-        return await repository.select(body)
+        result = await repository.select(body)
+        if repository.is_staff and table != "data_access_logs" and user is not None:
+            record_data_access(
+                session,
+                user_id=user.id,
+                table=table,
+                result=result,
+                payload=body,
+            )
+            await session.commit()
+        return result
     async with session.begin_nested():
         if operation == "insert":
             result = await repository.insert(body)
@@ -40,4 +50,3 @@ async def query_resource(
             raise HTTPException(status_code=400, detail="unsupported_resource_operation")
     await session.commit()
     return result
-
