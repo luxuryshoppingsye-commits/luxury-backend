@@ -91,6 +91,8 @@ MERCHANT_SENSITIVE_PRODUCT_FIELDS = frozenset(
         "brand_id",
         "sku",
         "image_url",
+        "ar_image_url",
+        "arImageUrl",
         "images",
     }
 )
@@ -485,6 +487,12 @@ def public_product_response(
     images = [_public_upload_url(image) for image in (product.images or [])]
     images = [image for image in images if image]
     image_url = _public_upload_url(product.image_url) or (images[0] if images else None)
+    product_extra = product.extra_data if isinstance(product.extra_data, dict) else {}
+    ar_image_url = _public_upload_url(
+        product.ar_image_url
+        or product_extra.get("ar_image_url")
+        or product_extra.get("arImageUrl")
+    )
     primary_image = image_url or (images[0] if images else None)
     track_inventory = product.track_inventory is not False
     stock_quantity = int(product.stock_quantity or 0)
@@ -512,6 +520,8 @@ def public_product_response(
         "discount_percentage": _discount_percentage(product.price, product.original_price),
         "image_url": image_url,
         "imageUrl": image_url,
+        "ar_image_url": ar_image_url,
+        "arImageUrl": ar_image_url,
         "images": images,
         "primary_image": primary_image,
         "category": public_category_summary(category),
@@ -796,6 +806,11 @@ def normalize_product_mutation_values(values: dict[str, Any], *, partial: bool =
             value = image.get("url") if isinstance(image, dict) else image
             if isinstance(value, str) and value.strip().lower().startswith(("javascript:", "data:")):
                 raise HTTPException(status_code=422, detail={"code": "invalid_images", "message": "Product images payload is invalid"})
+    if "ar_image_url" in normalized:
+        ar_image_url = str(normalized.get("ar_image_url") or "").strip()
+        if len(ar_image_url) > 4000 or ar_image_url.lower().startswith(("javascript:", "data:")):
+            raise HTTPException(status_code=422, detail={"code": "invalid_ar_image_url", "message": "AR image URL is invalid"})
+        normalized["ar_image_url"] = ar_image_url or None
     return normalized
 
 

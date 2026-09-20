@@ -273,6 +273,7 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
     supplier_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
     partner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
     image_url: Mapped[str | None] = mapped_column(Text)
+    ar_image_url: Mapped[str | None] = mapped_column(Text)
     images: Mapped[list[Any]] = mapped_column(JSONB, default=list, server_default="[]")
     tags: Mapped[list[Any]] = mapped_column(JSONB, default=list, server_default="[]")
     meta_title: Mapped[str | None] = mapped_column(String(500))

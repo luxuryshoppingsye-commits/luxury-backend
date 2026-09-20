@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _HANDOVER_PUBLIC_SQL = """
@@ -57,16 +58,11 @@ RETURNING id, user_id, rating, comment, customer_name,
           is_approved, is_rejected, admin_notes, status, created_at, updated_at
 """
 
-_HANDOVER_STATUS_UPDATE_SQL = """
-UPDATE public.store_reviews
-SET status = :status,
-    is_approved = :is_approved,
-    is_rejected = :is_rejected,
-    admin_notes = COALESCE(:admin_notes, admin_notes),
-    updated_at = NOW()
-WHERE id = :review_id
-RETURNING id, user_id, rating, comment, customer_name,
-          is_approved, is_rejected, admin_notes, status, created_at, updated_at
+_STORE_REVIEW_COLUMNS_SQL = """
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'store_reviews'
 """
 
 _HANDOVER_CONTENT_UPDATE_SQL = """
@@ -196,6 +192,11 @@ def mask_store_review_name(value: Any) -> str:
 
 
 def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
+    extra_data = row.get("extra_data")
+    if isinstance(extra_data, dict):
+        row = dict(row)
+        for key, value in extra_data.items():
+            row.setdefault(key, value)
     profile_name = str(row.get("profile_full_name") or "").strip()
     customer_name = str(row.get("customer_name") or "").strip()
     if (not customer_name or customer_name in _STORE_LABEL_NAMES) and profile_name:
@@ -350,20 +351,54 @@ async def update_handover_store_review_status(
     is_rejected: bool,
     admin_notes: str | None,
 ) -> dict[str, Any] | None:
-    """Update moderation fields in the direct-column store-review schema."""
+    """Update moderation fields across legacy and resource-table schemas."""
     try:
+        columns_result = await session.execute(text(_STORE_REVIEW_COLUMNS_SQL))
+        columns = {str(column) for column in columns_result.scalars().all()}
+        assignments: list[str] = []
+        params: dict[str, Any] = {
+            "review_id": review_id,
+            "status": status,
+            "is_approved": is_approved,
+            "is_rejected": is_rejected,
+            "admin_notes": admin_notes,
+        }
+        if "status" in columns:
+            assignments.append("status = :status")
+        if "is_approved" in columns:
+            assignments.append("is_approved = :is_approved")
+        if "is_rejected" in columns:
+            assignments.append("is_rejected = :is_rejected")
+        if "admin_notes" in columns:
+            assignments.append("admin_notes = :admin_notes")
+        if "extra_data" in columns:
+            assignments.append(
+                "extra_data = COALESCE(extra_data, '{}'::jsonb) || CAST(:moderation_metadata AS jsonb)"
+            )
+            params["moderation_metadata"] = json.dumps(
+                {
+                    "status": status,
+                    "is_approved": is_approved,
+                    "is_rejected": is_rejected,
+                    "admin_notes": admin_notes,
+                },
+                ensure_ascii=False,
+            )
+        if "updated_at" in columns:
+            assignments.append("updated_at = NOW()")
+        if not assignments or not ({"status", "is_approved", "is_rejected", "extra_data"} & columns):
+            return None
+
         result = await session.execute(
-            text(_HANDOVER_STATUS_UPDATE_SQL),
-            {
-                "review_id": review_id,
-                "status": status,
-                "is_approved": is_approved,
-                "is_rejected": is_rejected,
-                "admin_notes": admin_notes,
-            },
+            text(
+                "UPDATE public.store_reviews "
+                f"SET {', '.join(assignments)} "
+                "WHERE id = :review_id RETURNING *"
+            ),
+            params,
         )
         row = result.mappings().one_or_none()
         return normalize_store_review_row(dict(row)) if row is not None else {}
-    except ProgrammingError:
+    except SQLAlchemyError:
         await session.rollback()
         return None

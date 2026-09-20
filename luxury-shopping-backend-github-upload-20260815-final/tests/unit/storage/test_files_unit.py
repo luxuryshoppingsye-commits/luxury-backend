@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 from PIL import Image
 
+from backend.app.services import payment_refund_security
 from backend.app.services.image_pipeline import prepare_image_upload
 from backend.app.storage.files import FileStorage, LocalSignatureScanner
 
@@ -164,7 +165,19 @@ def test_public_upload_can_write_to_r2_and_returns_r2_url(monkeypatch, tmp_path:
     assert stored.quarantine_path == ""
 
 
-def test_customer_request_attachment_uses_durable_r2_storage_without_public_url(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("policy_key", "file_name"),
+    [
+        ("customer_request_attachment", "request.png"),
+        ("payment_receipt", "receipt.png"),
+    ],
+)
+def test_private_customer_files_use_durable_r2_storage_without_public_url(
+    monkeypatch,
+    tmp_path: Path,
+    policy_key: str,
+    file_name: str,
+) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeR2Client:
@@ -189,8 +202,8 @@ def test_customer_request_attachment_uses_durable_r2_storage_without_public_url(
     storage.scanner = LocalSignatureScanner()
 
     stored = storage.save_bytes(
-        "customer_request_attachment",
-        "request.png",
+        policy_key,
+        file_name,
         PNG_BYTES,
         "http://api.test",
         roles={"customer"},
@@ -222,6 +235,37 @@ def test_private_policy_is_not_publicly_servable(tmp_path: Path) -> None:
     assert stored.relative_path.startswith("_private/payment-receipts/")
     assert stored.public_url is None
     assert FileStorage.is_public_relative_path(stored.relative_path) is False
+
+
+def test_private_receipt_can_be_streamed_from_r2() -> None:
+    class FakeBody(io.BytesIO):
+        pass
+
+    class FakeR2Client:
+        def get_object(self, **kwargs):
+            assert kwargs["Bucket"] == "luxury-private-assets"
+            assert kwargs["Key"] == "_private/payment-receipts/receipt.webp"
+            return {"Body": FakeBody(b"receipt-bytes")}
+
+    storage = object.__new__(FileStorage)
+    storage.settings = SimpleNamespace(r2_bucket="luxury-private-assets")
+    storage._r2_client_cache = FakeR2Client()
+
+    response = payment_refund_security._inline_r2_receipt_response(
+        storage,
+        storage_key="_private/payment-receipts/receipt.webp",
+        media_type="image/webp",
+    )
+
+    async def collect_body() -> bytes:
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    assert asyncio.run(collect_body()) == b"receipt-bytes"
+    assert response.media_type == "image/webp"
+    assert response.headers["content-disposition"] == "inline"
 
 
 def test_eicar_upload_is_quarantined_and_rejected(tmp_path: Path) -> None:

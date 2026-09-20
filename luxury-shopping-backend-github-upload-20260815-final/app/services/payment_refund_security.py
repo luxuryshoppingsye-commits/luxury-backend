@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse
-from sqlalchemy import func, or_, select
+from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -859,10 +859,6 @@ async def find_file_asset_for_access(
 
 
 def _file_asset_storage_path(asset: FileAsset, storage: FileStorage) -> Path:
-    if str(asset.storage_provider or "").strip() == "cloudflare_r2":
-        # Private receipt policies are kept on the backend filesystem.  Do
-        # not silently turn a private R2 key into a local path.
-        raise HTTPException(status_code=503, detail="private_receipt_storage_unavailable")
     target = storage._safe_join(str(asset.storage_key or ""))
     if not target.is_file():
         raise HTTPException(status_code=404, detail="receipt_file_not_found")
@@ -886,6 +882,96 @@ def _receipt_storage_path(row: Any, storage: FileStorage) -> Path:
     if not target.is_file():
         raise HTTPException(status_code=404, detail="receipt_file_not_found")
     return target
+
+
+def _storage_fingerprint(storage_provider: str, storage_key: str) -> str:
+    normalized_provider = str(storage_provider or "local_uploads").strip().lower()
+    normalized_key = str(storage_key or "").replace("\\", "/").lstrip("/")
+    return hashlib.sha256(f"{normalized_provider}:{normalized_key}".encode("utf-8")).hexdigest()
+
+
+async def _receipt_file_asset(session: AsyncSession, row: Any) -> FileAsset | None:
+    extra = dict(getattr(row, "extra_data", {}) or {})
+    file_asset_id = str(extra.get("file_asset_id") or "").strip()
+    clauses = []
+    if file_asset_id:
+        try:
+            clauses.append(FileAsset.id == uuid.UUID(file_asset_id))
+        except (TypeError, ValueError):
+            pass
+    row_id = getattr(row, "id", None)
+    if row_id is not None:
+        clauses.append(
+            and_(
+                FileAsset.entity_type == "payment_receipt",
+                FileAsset.entity_id == row_id,
+            )
+        )
+    if not clauses:
+        return None
+    return (
+        await session.execute(
+            select(FileAsset)
+            .where(
+                or_(*clauses),
+                FileAsset.deleted_at.is_(None),
+                FileAsset.status == "available",
+                FileAsset.policy_key == "payment_receipt",
+            )
+            .order_by(FileAsset.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _receipt_storage_descriptor(
+    session: AsyncSession,
+    row: Any,
+    storage: FileStorage,
+) -> dict[str, Any]:
+    extra = dict(getattr(row, "extra_data", {}) or {})
+    asset = await _receipt_file_asset(session, row)
+    storage_provider = str(
+        getattr(asset, "storage_provider", None)
+        or extra.get("storage_provider")
+        or "local_uploads"
+    ).strip().lower()
+    storage_key = str(
+        getattr(asset, "storage_key", None)
+        or extra.get("storage_key")
+        or ""
+    ).replace("\\", "/").lstrip("/")
+    content_type = str(
+        getattr(asset, "content_type", None)
+        or extra.get("mime_type")
+        or "application/octet-stream"
+    )
+    if not storage_key:
+        target = _receipt_storage_path(row, storage)
+        storage_key = target.relative_to(storage.root).as_posix()
+    elif storage_provider != "cloudflare_r2":
+        target = storage._safe_join(storage_key)
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="receipt_file_not_found")
+    return {
+        "provider": storage_provider,
+        "key": storage_key,
+        "content_type": content_type,
+    }
+
+
+def _file_asset_storage_descriptor(asset: FileAsset, storage: FileStorage) -> dict[str, Any]:
+    storage_provider = str(asset.storage_provider or "local_uploads").strip().lower()
+    storage_key = str(asset.storage_key or "").replace("\\", "/").lstrip("/")
+    if not storage_key:
+        raise HTTPException(status_code=404, detail="receipt_file_not_found")
+    if storage_provider != "cloudflare_r2":
+        _file_asset_storage_path(asset, storage)
+    return {
+        "provider": storage_provider,
+        "key": storage_key,
+        "content_type": str(asset.content_type or "application/octet-stream"),
+    }
 
 
 def _b64url(data: bytes) -> str:
@@ -954,19 +1040,19 @@ async def issue_signed_receipt_url(
             user=user,
             roles=roles,
         )
-        target = _file_asset_storage_path(asset, storage)
+        descriptor = _file_asset_storage_descriptor(asset, storage)
         record_id = asset.id
         file_asset_id = str(asset.id)
     else:
         row = await find_receipt_for_access(session, receipt_ref=receipt_ref, user=user, roles=roles)
-        target = _receipt_storage_path(row, storage)
+        descriptor = await _receipt_storage_descriptor(session, row, storage)
         record_id = row.id
         file_asset_id = None
     exp = _now() + timedelta(seconds=expires_in_effective)
     payload = {
         "sub": str(user.id),
         "receipt_id": str(record_id),
-        "storage_sha256": hashlib.sha256(str(target.relative_to(storage.root)).encode("utf-8")).hexdigest(),
+        "storage_sha256": _storage_fingerprint(descriptor["provider"], descriptor["key"]),
         "exp": int(exp.timestamp()),
         "purpose": "payment_receipt_access",
     }
@@ -1009,12 +1095,72 @@ def _inline_receipt_file_response(target: Path, *, media_type: str) -> FileRespo
     )
 
 
+def _inline_r2_receipt_response(
+    storage: FileStorage,
+    *,
+    storage_key: str,
+    media_type: str,
+) -> StreamingResponse:
+    try:
+        response = storage._r2_client().get_object(
+            Bucket=str(storage.settings.r2_bucket),
+            Key=storage_key,
+        )
+        body = response["Body"]
+    except Exception as exc:
+        error = getattr(exc, "response", {}) or {}
+        code = str((error.get("Error") or {}).get("Code") or "") if isinstance(error, dict) else ""
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            raise HTTPException(status_code=404, detail="receipt_file_not_found") from exc
+        raise HTTPException(status_code=503, detail="receipt_storage_unavailable") from exc
+
+    def stream():
+        try:
+            while True:
+                chunk = body.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            body.close()
+
+    return StreamingResponse(
+        stream(),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def _inline_storage_response(
+    storage: FileStorage,
+    *,
+    descriptor: dict[str, Any],
+) -> FileResponse | StreamingResponse:
+    if descriptor["provider"] == "cloudflare_r2":
+        return _inline_r2_receipt_response(
+            storage,
+            storage_key=descriptor["key"],
+            media_type=descriptor["content_type"],
+        )
+    target = storage._safe_join(descriptor["key"])
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="receipt_file_not_found")
+    return _inline_receipt_file_response(
+        target,
+        media_type=descriptor["content_type"],
+    )
+
+
 async def signed_receipt_file_response(
     session: AsyncSession,
     *,
     token: str,
     storage: FileStorage,
-) -> FileResponse:
+) -> FileResponse | StreamingResponse:
     payload = _verify_signed_token(token)
     if payload.get("purpose") != "payment_receipt_access":
         raise HTTPException(status_code=403, detail="invalid_receipt_token")
@@ -1039,14 +1185,11 @@ async def signed_receipt_file_response(
         ).scalar_one_or_none()
         if asset is None:
             raise HTTPException(status_code=404, detail="receipt_not_found")
-        target = _file_asset_storage_path(asset, storage)
-        storage_hash = hashlib.sha256(str(target.relative_to(storage.root)).encode("utf-8")).hexdigest()
+        descriptor = _file_asset_storage_descriptor(asset, storage)
+        storage_hash = _storage_fingerprint(descriptor["provider"], descriptor["key"])
         if payload.get("storage_sha256") != storage_hash:
             raise HTTPException(status_code=403, detail="invalid_receipt_token")
-        return _inline_receipt_file_response(
-            target,
-            media_type=str(asset.content_type or "application/octet-stream"),
-        )
+        return _inline_storage_response(storage, descriptor=descriptor)
     try:
         receipt_id = uuid.UUID(str(payload["receipt_id"]))
     except (KeyError, TypeError, ValueError):
@@ -1057,15 +1200,11 @@ async def signed_receipt_file_response(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="receipt_not_found")
-    target = _receipt_storage_path(row, storage)
-    storage_hash = hashlib.sha256(str(target.relative_to(storage.root)).encode("utf-8")).hexdigest()
+    descriptor = await _receipt_storage_descriptor(session, row, storage)
+    storage_hash = _storage_fingerprint(descriptor["provider"], descriptor["key"])
     if payload.get("storage_sha256") != storage_hash:
         raise HTTPException(status_code=403, detail="invalid_receipt_token")
-    extra = dict(getattr(row, "extra_data", {}) or {})
-    return _inline_receipt_file_response(
-        target,
-        media_type=str(extra.get("mime_type") or "application/octet-stream"),
-    )
+    return _inline_storage_response(storage, descriptor=descriptor)
 
 
 async def receipt_database_audit(session: AsyncSession) -> dict[str, Any]:

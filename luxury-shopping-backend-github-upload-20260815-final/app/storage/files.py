@@ -101,10 +101,13 @@ IMAGE_OR_PDF_MIMES = frozenset({"image/jpeg", "image/png", "image/webp", "applic
 # they must be able to upload the product images used by that same workflow.
 PUBLIC_IMAGE_ROLES = frozenset({"admin", "manager", "staff", "employee", "logistics", "partner"})
 CUSTOMER_ATTACHMENT_ROLES = frozenset({"customer", "admin", "manager", "staff"})
-# Customer request images are private, but they must survive Render restarts
-# just like public catalog images. They remain inaccessible without the
-# authenticated attachment endpoint; only their storage is durable on R2.
-DURABLE_PRIVATE_R2_POLICIES = frozenset({"customer_request_attachment"})
+# Customer request images and payment receipts are private, but they must
+# survive Render restarts just like public catalog images. They remain
+# inaccessible without their authenticated endpoints; only their storage is
+# durable on R2.
+DURABLE_PRIVATE_R2_POLICIES = frozenset(
+    {"customer_request_attachment", "payment_receipt"}
+)
 
 
 class StoragePolicyRegistry:

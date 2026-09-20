@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...config import BACKEND_DIR, get_settings
@@ -133,6 +135,8 @@ from ...services.realtime import (
     receive_secure_message,
     realtime_hub,
 )
+
+logger = logging.getLogger(__name__)
 from ...services.report_admin_services import (
     AdminCustomerAccessService,
     BootstrapVisibilityService,
@@ -8256,15 +8260,20 @@ async def api_update_store_review_status(review_id: uuid.UUID, request: Request,
         raise HTTPException(status_code=404, detail="review_not_found")
     if row is None:
         row = await _api_update(session, "store_reviews", review_id, body, staff)
-    if row.get("user_id") and (row.get("is_approved") is True or row.get("status") in {"approved", "active", "published"}):
-        await NotificationService(session).create_notification(NotificationPayload(
-            user_id=uuid.UUID(str(row["user_id"])), title="تم قبول تقييمك",
-            body="شكرًا لمشاركتنا تجربتك. تمت الموافقة على تقييمك في رفاهية التسوق.",
-            notification_type="store_review_approved", category="system", action_url="/",
-            deduplication_key=f"store-review-approved:{review_id}",
-            delivery_channels=("in_app", "mobile_push", "web_push"),
-        ))
     await session.commit()
+    if row.get("user_id") and (row.get("is_approved") is True or row.get("status") in {"approved", "active", "published"}):
+        try:
+            await NotificationService(session).create_notification(NotificationPayload(
+                user_id=uuid.UUID(str(row["user_id"])), title="تم قبول تقييمك",
+                body="شكرًا لمشاركتنا تجربتك. تمت الموافقة على تقييمك في رفاهية التسوق.",
+                notification_type="store_review_approved", category="system", action_url="/",
+                deduplication_key=f"store-review-approved:{review_id}",
+                delivery_channels=("in_app", "mobile_push", "web_push"),
+            ))
+            await session.commit()
+        except SQLAlchemyError:
+            await session.rollback()
+            logger.warning("Store-review approval saved, but its notification could not be created", exc_info=True)
     return {"data": row}
 
 

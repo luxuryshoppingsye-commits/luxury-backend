@@ -114,6 +114,13 @@ def test_hidden_store_review_name_keeps_only_a_safe_preview() -> None:
 def test_handover_status_update_sets_visible_approval_fields() -> None:
     review_id = uuid.uuid4()
 
+    class Scalars:
+        def __init__(self, values):
+            self.values = values
+
+        def all(self):
+            return self.values
+
     class Mappings:
         def one_or_none(self):
             return {
@@ -131,16 +138,29 @@ def test_handover_status_update_sets_visible_approval_fields() -> None:
             }
 
     class Result:
+        def __init__(self, row=None, columns=None):
+            self.row = row
+            self.columns = columns or []
+
+        def scalars(self):
+            return Scalars(self.columns)
+
         def mappings(self):
-            return Mappings()
+            return Mappings() if self.row is None else self.row
 
     class Session:
         statement = ""
         params: dict[str, object] = {}
 
-        async def execute(self, statement, params):
+        async def execute(self, statement, params=None):
             self.statement = str(statement)
-            self.params = params
+            if "information_schema.columns" in self.statement:
+                return Result(columns=[
+                    "id", "user_id", "rating", "comment", "customer_name",
+                    "status", "is_approved", "is_rejected", "admin_notes",
+                    "created_at", "updated_at",
+                ])
+            self.params = params or {}
             return Result()
 
     session = Session()
@@ -161,6 +181,80 @@ def test_handover_status_update_sets_visible_approval_fields() -> None:
     assert result is not None
     assert result["status"] == "approved"
     assert result["is_approved"] is True
+
+
+def test_handover_status_update_supports_resource_extra_data_schema() -> None:
+    review_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    class Scalars:
+        def all(self):
+            return [
+                "id", "user_id", "status", "title", "body", "extra_data",
+                "created_at", "updated_at",
+            ]
+
+    class Mappings:
+        def one_or_none(self):
+            return {
+                "id": review_id,
+                "user_id": user_id,
+                "status": "rejected",
+                "title": "عميل",
+                "body": "تجربة",
+                "extra_data": {
+                    "rating": 4,
+                    "is_approved": False,
+                    "is_rejected": True,
+                    "admin_notes": "غير مناسب",
+                },
+                "created_at": None,
+                "updated_at": None,
+            }
+
+    class Result:
+        def __init__(self, columns=False):
+            self.columns = columns
+
+        def scalars(self):
+            return Scalars()
+
+        def mappings(self):
+            return Mappings()
+
+    class Session:
+        statements: list[str]
+        params: dict[str, object]
+
+        def __init__(self):
+            self.statements = []
+            self.params = {}
+
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            self.statements.append(sql)
+            if "information_schema.columns" not in sql:
+                self.params = params or {}
+            return Result(columns="information_schema.columns" in sql)
+
+    session = Session()
+    result = asyncio.run(
+        update_handover_store_review_status(
+            session,
+            review_id=review_id,
+            status="rejected",
+            is_approved=False,
+            is_rejected=True,
+            admin_notes="غير مناسب",
+        )
+    )
+
+    assert "extra_data = COALESCE(extra_data" in session.statements[-1]
+    assert '"is_rejected": true' in str(session.params["moderation_metadata"])
+    assert result is not None
+    assert result["status"] == "rejected"
+    assert result["is_rejected"] is True
+    assert result["admin_notes"] == "غير مناسب"
 
 
 def test_handover_content_update_is_scoped_to_the_review_owner() -> None:

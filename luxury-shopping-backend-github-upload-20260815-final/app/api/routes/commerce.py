@@ -241,7 +241,7 @@ def _resolve_manage_product_image_urls(row: dict[str, Any]) -> dict[str, Any]:
             return text
         return value
 
-    for key in ("image_url", "imageUrl"):
+    for key in ("image_url", "imageUrl", "ar_image_url", "arImageUrl"):
         if key in row and row.get(key) is not None:
             row[key] = _resolve(row.get(key))
     images = row.get("images")
@@ -623,7 +623,7 @@ def _product_image_values(product: Product, variants: list[ProductVariant]) -> s
     values: set[str] = set()
     rows: list[Any] = [product, *variants]
     for row in rows:
-        for field in ("image_url", "imageUrl"):
+        for field in ("image_url", "imageUrl", "ar_image_url", "arImageUrl"):
             key = _product_storage_key(getattr(row, field, None))
             if key:
                 values.add(key)
@@ -672,7 +672,7 @@ async def _delete_product_file_assets(
     )
     referenced_elsewhere: set[str] = set()
     for row in [*other_products, *other_variants]:
-        for field in ("image_url", "imageUrl"):
+        for field in ("image_url", "imageUrl", "ar_image_url", "arImageUrl"):
             key = _product_storage_key(getattr(row, field, None))
             if key:
                 referenced_elsewhere.add(key)
@@ -2370,6 +2370,78 @@ async def _attach_current_customer_names(
             }
 
 
+async def _payment_receipts_by_order(
+    session: AsyncSession,
+    order_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[Any]]:
+    if not order_ids:
+        return {}
+    receipt_model = MODEL_BY_TABLE["payment_receipts"]
+    result = await session.execute(
+        select(receipt_model)
+        .where(
+            receipt_model.order_id.in_(order_ids),
+            receipt_model.deleted_at.is_(None),
+        )
+        .order_by(receipt_model.created_at.desc())
+    )
+    rows: dict[uuid.UUID, list[Any]] = {}
+    for receipt in result.scalars():
+        rows.setdefault(receipt.order_id, []).append(receipt)
+    return rows
+
+
+def _attach_receipts_to_payment_payloads(
+    payment_payloads: list[dict[str, Any]],
+    receipts: list[Any],
+) -> None:
+    used_receipt_ids: set[str] = set()
+    for payment in payment_payloads:
+        current_ref = str(
+            payment.get("receipt_url") or payment.get("receiptPath") or ""
+        ).strip()
+        if current_ref.lower().startswith("receipt:"):
+            used_receipt_ids.add(current_ref.split(":", 1)[1])
+            payment.setdefault("payment_receipt_id", current_ref.split(":", 1)[1])
+
+    for payment in payment_payloads:
+        current_ref = str(
+            payment.get("receipt_url") or payment.get("receiptPath") or ""
+        ).strip()
+        if current_ref:
+            continue
+        receipt = next(
+            (item for item in receipts if str(item.id) not in used_receipt_ids),
+            None,
+        )
+        if receipt is None:
+            break
+        receipt_ref = f"receipt:{receipt.id}"
+        payment.update(
+            {
+                "receipt_url": receipt_ref,
+                "receiptPath": receipt_ref,
+                "payment_receipt_id": str(receipt.id),
+                "payment_receipt_status": str(receipt.status or "pending_review"),
+            }
+        )
+        used_receipt_ids.add(str(receipt.id))
+
+
+def _attach_latest_receipt_to_order_payload(
+    payload: dict[str, Any],
+    receipts: list[Any],
+) -> None:
+    if not receipts:
+        return
+    latest = receipts[0]
+    receipt_ref = f"receipt:{latest.id}"
+    payload["receipt_url"] = receipt_ref
+    payload["receiptPath"] = receipt_ref
+    payload["payment_receipt_id"] = str(latest.id)
+    payload["payment_receipt_status"] = str(latest.status or "pending_review")
+
+
 async def _serialize_orders_with_financials(session: AsyncSession, orders: list[Order]) -> list[dict[str, Any]]:
     """Return order rows with one consistent paid/remaining summary.
 
@@ -2388,6 +2460,12 @@ async def _serialize_orders_with_financials(session: AsyncSession, orders: list[
     await _attach_current_customer_names(session, orders, payloads)
 
     order_ids = [order.id for order in orders]
+    receipts_by_order = await _payment_receipts_by_order(session, order_ids)
+    for order, payload in zip(orders, payloads):
+        _attach_latest_receipt_to_order_payload(
+            payload,
+            receipts_by_order.get(order.id, []),
+        )
     # The admin order-linking screen uses this endpoint to compare a local
     # order with an international request.  Returning only the order header
     # leaves legacy/production rows looking like "0 products" and makes a
@@ -3418,6 +3496,10 @@ async def order_detail(
     history = await session.execute(select(history_model).where(history_model.order_id == order_id).order_by(history_model.created_at))
     payment_model = MODEL_BY_TABLE["order_payments"]
     payments = await session.execute(select(payment_model).where(payment_model.order_id == order_id))
+    payment_payloads = [serialize_record(row) for row in payments.scalars()]
+    receipts_by_order = await _payment_receipts_by_order(session, [order_id])
+    order_receipts = receipts_by_order.get(order_id, [])
+    _attach_receipts_to_payment_payloads(payment_payloads, order_receipts)
     shipping_model = MODEL_BY_TABLE["order_shipping"]
     shipping = await session.execute(select(shipping_model).where(shipping_model.order_id == order_id).limit(1))
     shipping_row = shipping.scalar_one_or_none()
@@ -3444,14 +3526,17 @@ async def order_detail(
     items_by_return: dict[str, list[Any]] = {}
     for return_item in return_item_rows:
         items_by_return.setdefault(str(return_item.return_id), []).append(return_item)
+    order_payload = _serialize_order(order)
+    _attach_latest_receipt_to_order_payload(order_payload, order_receipts)
     payload = {
-        "order": _serialize_order(order),
+        "order": order_payload,
         "items": serialized_items,
-        "payments": [serialize_record(row) for row in payments.scalars()],
+        "payments": payment_payloads,
         "history": [serialize_record(row) for row in history.scalars()],
         "shipping": serialize_record(shipping_row) if shipping_row is not None else None,
         "shippingHistory": [],
         "notes": order.notes,
+        "receiptPath": order_payload.get("receiptPath"),
         "customerReceived": bool((order.extra_data or {}).get("customer_received_at")),
         "returns": [_serialize_return(row, items_by_return.get(str(row.id), [])) for row in return_rows],
     }
@@ -4271,7 +4356,7 @@ def _product_values(body: dict[str, Any], user: User, roles: set[str], *, partia
         "trackInventory": "track_inventory", "isActive": "is_active", "isFeatured": "is_featured",
         "approvalStatus": "approval_status", "approvalNotes": "approval_notes", "categoryId": "category_id",
         "brandId": "brand_id", "supplierId": "supplier_id", "partnerId": "partner_id",
-        "imageUrl": "image_url", "images": "images", "tags": "tags", "metaTitle": "meta_title",
+        "imageUrl": "image_url", "arImageUrl": "ar_image_url", "images": "images", "tags": "tags", "metaTitle": "meta_title",
         "metaDescription": "meta_description", "promotionalTitle": "promotional_title",
         # The React admin client uses the database-style snake_case names.
         # Keep both contracts valid so create/update behave identically.
@@ -4280,7 +4365,7 @@ def _product_values(body: dict[str, Any], user: User, roles: set[str], *, partia
         "track_inventory": "track_inventory", "is_active": "is_active", "is_featured": "is_featured",
         "approval_status": "approval_status", "approval_notes": "approval_notes", "category_id": "category_id",
         "brand_id": "brand_id", "supplier_id": "supplier_id", "partner_id": "partner_id",
-        "image_url": "image_url", "meta_title": "meta_title", "meta_description": "meta_description",
+        "image_url": "image_url", "ar_image_url": "ar_image_url", "meta_title": "meta_title", "meta_description": "meta_description",
         "promotional_title": "promotional_title",
     }
     is_merchant = "partner" in roles and not roles.intersection({"admin", "manager"})

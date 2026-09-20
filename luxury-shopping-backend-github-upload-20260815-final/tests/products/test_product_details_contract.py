@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from backend.app.models import MODEL_BY_TABLE
 from backend.app.models.domain import Product, ProductVariant
+from backend.app.api.routes.commerce import _product_values
 from backend.app.services.catalog_policy import public_product_response
 from backend.app.services.api_protection import policy_for_route
 
@@ -38,6 +39,37 @@ def test_public_product_response_exposes_variant_options() -> None:
 
     assert payload["has_variant_options"] is True
     assert payload["variants"][0]["size"] == "M"
+
+
+def test_product_ar_image_is_persisted_and_exposed_to_clients() -> None:
+    ar_image_url = "/uploads/products/ar-watch.png"
+    product = Product(
+        id=uuid.uuid4(),
+        name="AR watch",
+        price=Decimal("10"),
+        images=[],
+        ar_image_url=ar_image_url,
+    )
+
+    values = _product_values(
+        {"name": "AR watch", "price": 10, "arImageUrl": ar_image_url},
+        user=object(),
+        roles={"admin"},
+        partial=False,
+    )
+    cleared_values = _product_values(
+        {"arImageUrl": None},
+        user=object(),
+        roles={"admin"},
+        partial=True,
+    )
+    payload = public_product_response(product)
+
+    assert "ar_image_url" in Product.__table__.c
+    assert values["ar_image_url"] == ar_image_url
+    assert cleared_values["ar_image_url"] is None
+    assert payload["ar_image_url"] == ar_image_url
+    assert payload["arImageUrl"] == ar_image_url
 
 
 def test_product_details_mutations_require_authentication_policy() -> None:

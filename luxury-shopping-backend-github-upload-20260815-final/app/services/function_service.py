@@ -2833,7 +2833,8 @@ async def execute_function(
         if ai_ledger_id is not None:
             await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
         return {"matches": [serialize_record(item) for item in products], "configured": True, "request_id": current_request_id()}
-    if function_name == "ai-product-assistant" and _text(body, "action").lower() == "deep_analyze":
+    product_assistant_action = _text(body, "action").lower()
+    if function_name == "ai-product-assistant" and product_assistant_action in {"analyze_image", "deep_analyze"}:
         ai_ledger_id = await _reserve_ai_usage(
             function_name=function_name,
             body=body,
@@ -2850,17 +2851,53 @@ async def execute_function(
         from .image_search import deep_analyze_product_image
 
         try:
-            result = await deep_analyze_product_image(image_url)
+            structured_result = await deep_analyze_product_image(image_url)
         except HTTPException as exc:
             detail = exc.detail
             error_code = detail.get("code") if isinstance(detail, dict) else str(detail)
             await AIQuotaService(session).fail(ai_ledger_id, error_code_safe=error_code)
             raise
-        actual_tokens = max(1, sum(
-            len(value) if isinstance(value, str) else sum(len(item) for item in value if isinstance(item, str))
-            for value in result.values()
+        if product_assistant_action == "analyze_image":
+            labels = (
+                ("المنتج", "productName"),
+                ("الاسم بالإنجليزية", "productNameEn"),
+                ("التصنيف", "category"),
+                ("التصنيف الفرعي", "subcategory"),
+                ("الوصف", "description"),
+                ("الماركة", "brand"),
+                ("الخامة", "material"),
+                ("الحالة", "condition"),
+                ("الفئة المستهدفة", "targetAudience"),
+            )
+            analysis_lines = [
+                f"{label}: {structured_result[key]}"
+                for label, key in labels
+                if structured_result.get(key)
+            ]
+            for label, key in (
+                ("الكلمات المفتاحية", "keywords"),
+                ("الخصائص", "attributes"),
+                ("الألوان", "colors"),
+                ("المميزات", "features"),
+            ):
+                values = structured_result.get(key)
+                if isinstance(values, list) and values:
+                    analysis_lines.append(f"{label}: {', '.join(values)}")
+            result: str | dict = "\n".join(analysis_lines)
+        else:
+            result = structured_result
+
+        actual_tokens = max(1, (
+            len(result)
+            if isinstance(result, str)
+            else sum(
+                len(value) if isinstance(value, str) else sum(len(item) for item in value if isinstance(item, str))
+                for value in result.values()
+            )
         ) // 4)
         await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=actual_tokens)
+        if isinstance(result, str):
+            return result
         return {**result, "configured": True, "request_id": current_request_id()}
     if function_name in {"ai-product-assistant", "ai-chat-support"}:
         ai_ledger_id = await _reserve_ai_usage(

@@ -377,3 +377,49 @@ async def test_product_assistant_deep_analyze_dispatches_to_image_service(monkey
 
     assert result["productName"] == "حقيبة"
     analyzer.assert_awaited_once_with("https://images.example.test/product.jpg")
+
+
+@pytest.mark.asyncio
+async def test_product_assistant_analyze_image_returns_displayable_summary(monkeypatch):
+    from backend.app.services import function_service
+
+    analyzer = AsyncMock(return_value={
+        "productName": "حقيبة جلدية",
+        "productNameEn": "Leather bag",
+        "category": "حقائب",
+        "subcategory": "حقائب يد",
+        "description": "حقيبة عملية للاستخدام اليومي.",
+        "keywords": ["حقيبة", "يومي"],
+        "attributes": ["مقبض علوي"],
+        "colors": ["بني"],
+        "features": ["تصميم عملي"],
+        "brand": "",
+        "material": "جلد",
+        "condition": "جديدة",
+        "targetAudience": "نساء",
+    })
+    monkeypatch.setattr(service, "deep_analyze_product_image", analyzer)
+    monkeypatch.setattr(function_service, "roles_for", AsyncMock(return_value=["admin"]))
+    monkeypatch.setattr(function_service, "_reserve_ai_usage", AsyncMock(return_value="ledger"))
+
+    class Quota:
+        def __init__(self, session): pass
+        async def complete(self, ledger_id, *, actual_tokens):
+            assert ledger_id == "ledger"
+            assert actual_tokens > 0
+        async def fail(self, ledger_id, *, error_code_safe): raise AssertionError(error_code_safe)
+
+    monkeypatch.setattr(function_service, "AIQuotaService", Quota)
+    result = await function_service.execute_function(
+        "ai-product-assistant",
+        {"action": "analyze_image", "imageUrl": "https://images.example.test/product.jpg"},
+        SimpleNamespace(id="user-id"),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    assert isinstance(result, str)
+    assert "المنتج: حقيبة جلدية" in result
+    assert "الألوان: بني" in result
+    assert "المميزات: تصميم عملي" in result
+    analyzer.assert_awaited_once_with("https://images.example.test/product.jpg")

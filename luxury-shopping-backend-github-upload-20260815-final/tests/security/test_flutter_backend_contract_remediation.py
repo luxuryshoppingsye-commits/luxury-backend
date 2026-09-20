@@ -129,8 +129,15 @@ async def test_signed_receipt_url_honors_requested_expiry(monkeypatch: pytest.Mo
     async def _fake_find(*_args, **_kwargs):
         return row
 
+    async def _fake_descriptor(*_args, **_kwargs):
+        return {
+            "provider": "local_uploads",
+            "key": "_private/receipts/proof.png",
+            "content_type": "image/png",
+        }
+
     monkeypatch.setattr(payment_refund_security, "find_receipt_for_access", _fake_find)
-    monkeypatch.setattr(payment_refund_security, "_receipt_storage_path", lambda *_args, **_kwargs: receipt_path)
+    monkeypatch.setattr(payment_refund_security, "_receipt_storage_descriptor", _fake_descriptor)
     session = SimpleNamespace(add=lambda *_args, **_kwargs: None, commit=lambda: None)
 
     async def _commit():

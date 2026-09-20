@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import OFFICIAL_RENDER_API_ORIGIN, get_settings
@@ -106,7 +106,7 @@ def _replacement_map(storage_key: str, public_base_url: str) -> dict[str, str]:
 
 
 class R2MigrationService:
-    """Move public Render-local assets without deleting the Render copy."""
+    """Move durable Render-local assets without deleting the Render copy."""
 
     def __init__(self, storage: FileStorage | None = None) -> None:
         self.storage = storage or FileStorage()
@@ -155,7 +155,10 @@ class R2MigrationService:
             select(FileAsset)
             .where(
                 FileAsset.deleted_at.is_(None),
-                FileAsset.visibility == "public",
+                or_(
+                    FileAsset.visibility == "public",
+                    FileAsset.policy_key == "payment_receipt",
+                ),
                 FileAsset.storage_provider != "cloudflare_r2",
                 FileAsset.status != "deleted",
             )
@@ -178,7 +181,11 @@ class R2MigrationService:
         for asset in assets:
             report["scanned_assets"] += 1
             storage_key = str(asset.storage_key or "").replace("\\", "/").lstrip("/")
-            if not self.storage.is_public_relative_path(storage_key):
+            is_private_receipt = (
+                asset.policy_key == "payment_receipt"
+                and storage_key.startswith("_private/payment-receipts/")
+            )
+            if not is_private_receipt and not self.storage.is_public_relative_path(storage_key):
                 report["skipped_invalid_path"] += 1
                 continue
             local_path = self.storage._safe_join(storage_key)
@@ -186,8 +193,9 @@ class R2MigrationService:
                 report["skipped_missing_local_file"] += 1
                 continue
             report["candidate_assets"] += 1
-            public_base = str(self.settings.r2_public_base_url).rstrip("/")
-            replacements.update(_replacement_map(storage_key, public_base))
+            if asset.visibility == "public":
+                public_base = str(self.settings.r2_public_base_url).rstrip("/")
+                replacements.update(_replacement_map(storage_key, public_base))
             if not apply:
                 continue
             try:
@@ -317,10 +325,11 @@ class R2MigrationService:
                     }
                 )
 
-        if apply and replacements:
-            reference_report = await self._update_references(session, replacements, scan_tables)
-            report["updated_references"] = reference_report["updated_references"]
-            report["updated_tables"] = reference_report["updated_tables"]
+        if apply:
+            if replacements:
+                reference_report = await self._update_references(session, replacements, scan_tables)
+                report["updated_references"] = reference_report["updated_references"]
+                report["updated_tables"] = reference_report["updated_tables"]
             await session.commit()
         return report
 
@@ -410,7 +419,12 @@ class R2MigrationService:
     ) -> None:
         client = self.storage._r2_client()
         bucket = str(self.settings.r2_bucket)
-        cache_control = "public, max-age=31536000, immutable"
+        policy = self.storage_policy(policy_key)
+        cache_control = (
+            "private, max-age=0, no-store"
+            if policy.visibility == "private"
+            else "public, max-age=31536000, immutable"
+        )
         head = None
         try:
             head = client.head_object(Bucket=bucket, Key=storage_key)
