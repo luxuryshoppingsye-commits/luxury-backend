@@ -596,17 +596,14 @@ def _public_upload_url(value: Any) -> str | None:
             str(get_settings().api_base_url or "")
         ).hostname
         parsed = urlparse(raw)
-        # Legacy product objects were uploaded under this hostname with a
-        # `.webp` suffix even when the bytes were JPEG. Route these objects
-        # through the API normalizer so clients receive a truthful MIME type
-        # and a complete byte stream instead of trusting the stale suffix.
+        # Public R2 objects are immutable and are served from the Cloudflare
+        # custom domain. Returning that URL directly removes an unnecessary
+        # Render round trip for every product image. Explicit image-proxy URLs
+        # remain supported for any legacy object that still needs repair.
         if parsed.scheme == "https" and parsed.hostname and parsed.hostname.lower() == "images.luxuryshoppings.com":
             relative = parsed.path.lstrip("/")
             if relative and ".." not in relative.split("/"):
-                settings = get_settings()
-                if settings.app_env == "production" and str(settings.api_base_url).strip():
-                    return f"{str(settings.api_base_url).rstrip('/')}/api/catalog/image-proxy/{relative}"
-                return f"/api/catalog/image-proxy/{relative}"
+                return raw
         if (
             parsed.scheme == "https"
             and parsed.hostname

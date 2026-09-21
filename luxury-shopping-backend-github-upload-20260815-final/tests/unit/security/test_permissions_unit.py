@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 
 from backend.app import dependencies
+from backend.app.api.routes import commerce, operations
 
 
 @pytest.mark.asyncio
@@ -169,3 +170,62 @@ async def test_user_roles_uses_shared_auth_role_resolver(monkeypatch: pytest.Mon
     monkeypatch.setattr(dependencies, "roles_for", fake_roles_for)
 
     assert await dependencies.user_roles(user=user, session=session) == {"admin", "manager"}
+
+
+@pytest.mark.asyncio
+async def test_admin_order_list_requires_orders_view_permission(monkeypatch: pytest.MonkeyPatch) -> None:
+    user = SimpleNamespace(id=uuid4())
+    session = object()
+    calls: list[tuple[object, object, set[str], str]] = []
+
+    async def require_permission(received_session, user_id, roles, permission):
+        calls.append((received_session, user_id, roles, permission))
+
+    async def visible_orders(*_args, **_kwargs):
+        return []
+
+    async def serialize_orders(_session, rows):
+        assert rows == []
+        return []
+
+    monkeypatch.setattr(commerce, "require_staff_permission", require_permission)
+    monkeypatch.setattr(commerce, "_visible_orders", visible_orders)
+    monkeypatch.setattr(commerce, "_serialize_orders_with_financials", serialize_orders)
+
+    request = SimpleNamespace(url=SimpleNamespace(path="/api/orders"))
+    response = await commerce.orders(
+        request=request,
+        scope="admin",
+        user=user,
+        roles={"employee"},
+        session=session,
+    )
+
+    assert calls == [(session, user.id, {"employee"}, "orders.view")]
+    assert response == {"data": []}
+
+
+@pytest.mark.asyncio
+async def test_order_profile_lookup_uses_orders_view_permission(monkeypatch: pytest.MonkeyPatch) -> None:
+    staff = SimpleNamespace(id=uuid4())
+    session = object()
+    calls: list[tuple[object, object, set[str], str]] = []
+
+    async def require_permission(received_session, user_id, roles, permission):
+        calls.append((received_session, user_id, roles, permission))
+
+    class Request:
+        async def json(self):
+            return {"user_ids": []}
+
+    monkeypatch.setattr(operations, "require_staff_permission", require_permission)
+
+    response = await operations.api_admin_profiles_lookup(
+        request=Request(),
+        staff=staff,
+        roles={"employee"},
+        session=session,
+    )
+
+    assert calls == [(session, staff.id, {"employee"}, "orders.view")]
+    assert response == {"data": []}

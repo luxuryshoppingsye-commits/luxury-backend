@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 import uuid
+from collections import OrderedDict
 from io import BytesIO
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -1888,6 +1890,131 @@ async def _partner_storefronts_uncached(limit: int, session: AsyncSession):
 
 
 MAX_CATALOG_IMAGE_BYTES = 12 * 1024 * 1024
+CATALOG_IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+CATALOG_IMAGE_CACHE_MAX_ENTRIES = 512
+
+_catalog_image_client: httpx.AsyncClient | None = None
+_catalog_image_cache: OrderedDict[str, tuple[bytes, str, str]] = OrderedDict()
+_catalog_image_cache_bytes = 0
+_catalog_image_locks: dict[str, asyncio.Lock] = {}
+
+
+def start_catalog_image_proxy() -> httpx.AsyncClient:
+    """Create one pooled upstream client for the lifetime of the API process."""
+    global _catalog_image_client
+    if _catalog_image_client is None or _catalog_image_client.is_closed:
+        _catalog_image_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0, read=15.0, write=5.0, pool=5.0),
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16, keepalive_expiry=30.0),
+            follow_redirects=False,
+            headers={"Accept": "image/*", "User-Agent": "LuxuryShoppingImageProxy/1.0"},
+        )
+    return _catalog_image_client
+
+
+async def close_catalog_image_proxy() -> None:
+    global _catalog_image_client
+    client = _catalog_image_client
+    _catalog_image_client = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+def _catalog_image_variant_key(relative: str, width: int | None, quality: int) -> str:
+    return f"{relative}|w={width or 0}|q={quality if width is not None else 0}"
+
+
+def _catalog_image_cache_get(key: str) -> tuple[bytes, str, str] | None:
+    entry = _catalog_image_cache.get(key)
+    if entry is not None:
+        _catalog_image_cache.move_to_end(key)
+    return entry
+
+
+def _catalog_image_cache_put(key: str, entry: tuple[bytes, str, str]) -> None:
+    global _catalog_image_cache_bytes
+    data, _, _ = entry
+    if len(data) > CATALOG_IMAGE_CACHE_MAX_BYTES:
+        return
+    previous = _catalog_image_cache.pop(key, None)
+    if previous is not None:
+        _catalog_image_cache_bytes -= len(previous[0])
+    _catalog_image_cache[key] = entry
+    _catalog_image_cache_bytes += len(data)
+    while (
+        len(_catalog_image_cache) > CATALOG_IMAGE_CACHE_MAX_ENTRIES
+        or _catalog_image_cache_bytes > CATALOG_IMAGE_CACHE_MAX_BYTES
+    ):
+        _, removed = _catalog_image_cache.popitem(last=False)
+        _catalog_image_cache_bytes -= len(removed[0])
+
+
+def _catalog_image_response(
+    request: Request,
+    entry: tuple[bytes, str, str],
+    *,
+    cache_status: str,
+) -> Response:
+    data, media_type, etag = entry
+    headers = {
+        "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+        "X-Image-Cache": cache_status,
+    }
+    candidates = {
+        value.strip()
+        for value in str(request.headers.get("if-none-match") or "").split(",")
+        if value.strip()
+    }
+    if etag in candidates or "*" in candidates:
+        return Response(status_code=304, headers=headers)
+    return Response(data, media_type=media_type, headers=headers)
+
+
+async def _load_catalog_image_variant(
+    relative: str,
+    *,
+    width: int | None,
+    quality: int,
+) -> tuple[bytes, str, str]:
+    # Legacy banner records may point at the public site's hashed /assets
+    # files, while older catalog records point at the historical image CDN.
+    # Keep both upstreams explicit; this remains an allow-listed image proxy,
+    # never a general URL fetcher.
+    upstream_host = "luxuryshoppings.com" if relative.lower().startswith("assets/") else "images.luxuryshoppings.com"
+    source = f"https://{upstream_host}/{relative}"
+    try:
+        client = start_catalog_image_proxy()
+        async with client.stream("GET", source) as upstream:
+            if upstream.status_code != 200:
+                raise HTTPException(status_code=404, detail="image_not_found")
+            declared_size = int(upstream.headers.get("content-length") or 0)
+            if declared_size > MAX_CATALOG_IMAGE_BYTES:
+                raise HTTPException(status_code=413, detail="image_too_large")
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in upstream.aiter_bytes(64 * 1024):
+                total += len(chunk)
+                if total > MAX_CATALOG_IMAGE_BYTES:
+                    raise HTTPException(status_code=413, detail="image_too_large")
+                chunks.append(chunk)
+            if declared_size and total != declared_size:
+                raise HTTPException(status_code=502, detail="image_incomplete")
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, OSError, ValueError) as error:
+        raise HTTPException(status_code=502, detail="image_upstream_unavailable") from error
+    canonical = await asyncio.to_thread(
+        _canonicalize_catalog_image,
+        b"".join(chunks),
+        max_width=width,
+        quality=quality,
+    )
+    if canonical is None:
+        raise HTTPException(status_code=502, detail="image_invalid")
+    data, media_type = canonical
+    return data, media_type, f'"{hashlib.sha256(data).hexdigest()}"'
 
 
 def _catalog_image_mime(data: bytes) -> str | None:
@@ -1902,7 +2029,12 @@ def _catalog_image_mime(data: bytes) -> str | None:
     return None
 
 
-def _canonicalize_catalog_image(data: bytes) -> tuple[bytes, str] | None:
+def _canonicalize_catalog_image(
+    data: bytes,
+    *,
+    max_width: int | None = None,
+    quality: int = 82,
+) -> tuple[bytes, str] | None:
     media_type = _catalog_image_mime(data)
     if media_type is None:
         return None
@@ -1915,6 +2047,26 @@ def _canonicalize_catalog_image(data: bytes) -> tuple[bytes, str] | None:
 
         with Image.open(BytesIO(data)) as image:
             image.load()
+            if max_width is not None:
+                if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, (255, 255, 255))
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    converted = background
+                else:
+                    converted = image.convert("RGB")
+                if converted.width > max_width:
+                    target_height = max(1, round(converted.height * max_width / converted.width))
+                    converted = converted.resize((max_width, target_height), Image.Resampling.LANCZOS)
+                output = BytesIO()
+                converted.save(
+                    output,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                    progressive=True,
+                )
+                return output.getvalue(), "image/jpeg"
             # Android devices are not consistent when an object is named
             # .webp but the edge/CDN metadata is incomplete. Return one
             # decoder-safe representation from the proxy so the URL suffix,
@@ -1974,7 +2126,12 @@ async def catalog_brand_logo(file_id: uuid.UUID, session: AsyncSession = Depends
 
 
 @router.get("/catalog/image-proxy/{image_path:path}")
-async def catalog_image_proxy(image_path: str):
+async def catalog_image_proxy(
+    request: Request,
+    image_path: str,
+    width: int | None = Query(None, alias="w", ge=64, le=1600),
+    quality: int = Query(82, alias="q", ge=55, le=90),
+):
     """Serve legacy CDN images with bytes and Content-Type aligned.
 
     This route is deliberately allow-listed to one historical image hostname;
@@ -1983,49 +2140,19 @@ async def catalog_image_proxy(image_path: str):
     relative = str(image_path or "").replace("\\", "/").lstrip("/")
     if not relative or ".." in Path(relative).parts:
         raise HTTPException(status_code=404, detail="image_not_found")
-    # Legacy banner records may point at the public site's hashed /assets
-    # files, while older catalog records point at the historical image CDN.
-    # Keep both upstreams explicit; this remains an allow-listed image proxy,
-    # never a general URL fetcher.
-    upstream_host = "luxuryshoppings.com" if relative.lower().startswith("assets/") else "images.luxuryshoppings.com"
-    source = f"https://{upstream_host}/{relative}"
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=5.0),
-            follow_redirects=False,
-            headers={"Accept": "image/*", "User-Agent": "LuxuryShoppingImageProxy/1.0"},
-        ) as client:
-            async with client.stream("GET", source) as upstream:
-                if upstream.status_code != 200:
-                    raise HTTPException(status_code=404, detail="image_not_found")
-                declared_size = int(upstream.headers.get("content-length") or 0)
-                if declared_size > MAX_CATALOG_IMAGE_BYTES:
-                    raise HTTPException(status_code=413, detail="image_too_large")
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in upstream.aiter_bytes(64 * 1024):
-                    total += len(chunk)
-                    if total > MAX_CATALOG_IMAGE_BYTES:
-                        raise HTTPException(status_code=413, detail="image_too_large")
-                    chunks.append(chunk)
-                if declared_size and total != declared_size:
-                    raise HTTPException(status_code=502, detail="image_incomplete")
-    except HTTPException:
-        raise
-    except (httpx.HTTPError, OSError, ValueError) as error:
-        raise HTTPException(status_code=502, detail="image_upstream_unavailable") from error
-    canonical = _canonicalize_catalog_image(b"".join(chunks))
-    if canonical is None:
-        raise HTTPException(status_code=502, detail="image_invalid")
-    data, media_type = canonical
-    return Response(
-        data,
-        media_type=media_type,
-        headers={
-            "Cache-Control": "public, max-age=86400, s-maxage=604800, immutable",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    variant_key = _catalog_image_variant_key(relative, width, quality)
+    cached = _catalog_image_cache_get(variant_key)
+    if cached is not None:
+        return _catalog_image_response(request, cached, cache_status="HIT")
+
+    lock = _catalog_image_locks.setdefault(variant_key, asyncio.Lock())
+    async with lock:
+        cached = _catalog_image_cache_get(variant_key)
+        if cached is not None:
+            return _catalog_image_response(request, cached, cache_status="HIT")
+        entry = await _load_catalog_image_variant(relative, width=width, quality=quality)
+        _catalog_image_cache_put(variant_key, entry)
+        return _catalog_image_response(request, entry, cache_status="MISS")
 
 
 @router.get("/stores")
@@ -2523,6 +2650,8 @@ async def orders(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
+    if scope == "admin":
+        await require_staff_permission(session, user.id, roles, "orders.view")
     if scope == "partner" and "partner" in roles and not roles.intersection({"admin", "manager", "finance", "logistics", "staff", "employee"}):
         rows = await merchant_order_list(session, partner_id=user.id, limit=limit)
         return {"data": rows} if request.url.path.startswith("/api/") else rows

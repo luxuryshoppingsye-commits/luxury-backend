@@ -87,7 +87,7 @@ services:
       - key: MESSAGE_WORKER_POLL_SECONDS
         value: "5"
       - key: PUBLIC_READ_CACHE_TTL_SECONDS
-        value: "30"
+        value: "60"
       - key: FIREBASE_PROJECT_ID
         value: luxury-345be
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON

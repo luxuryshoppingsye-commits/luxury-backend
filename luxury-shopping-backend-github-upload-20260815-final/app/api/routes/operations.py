@@ -4221,8 +4221,7 @@ async def api_admin_profiles_lookup(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    if not roles.intersection({"admin", "manager", "finance"}):
-        raise HTTPException(status_code=403, detail="profile_lookup_permission_denied")
+    await require_staff_permission(session, staff.id, roles, "orders.view")
     body = await request.json()
     ids = [uuid.UUID(str(value)) for value in body.get("user_ids", [])]
     model = MODEL_BY_TABLE["profiles"]
@@ -5616,6 +5615,13 @@ async def api_list_coupons(staff: User = Depends(require_staff), session: AsyncS
 
 @router.get("/api/marketing/campaigns/active")
 async def api_public_active_campaigns(type: str | None = None, session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("active-marketing-campaigns", campaign_type=type),
+        lambda: _api_public_active_campaigns_uncached(type, session),
+    )
+
+
+async def _api_public_active_campaigns_uncached(type: str | None, session: AsyncSession) -> dict[str, Any]:
     model = MODEL_BY_TABLE["marketing_campaigns"]
     now_text = datetime.now(timezone.utc).isoformat()
     clauses = [
@@ -10711,6 +10717,13 @@ async def _create_update_delete_resource(table: str, request: Request, session: 
 
 @router.get("/api/catalog/banners")
 async def api_catalog_banners(position: str | None = None, session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("catalog-banners", position=position),
+        lambda: _api_catalog_banners_uncached(position, session),
+    )
+
+
+async def _api_catalog_banners_uncached(position: str | None, session: AsyncSession) -> dict[str, Any]:
     rows = await _resource_data(session, "banners")
     if position:
         rows = [row for row in rows if not row.get("position") or row.get("position") == position or (row.get("extra_data") or {}).get("position") == position]

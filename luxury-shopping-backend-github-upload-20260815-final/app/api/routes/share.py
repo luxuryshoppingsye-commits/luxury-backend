@@ -4,11 +4,12 @@ import html
 import json
 import re
 import uuid
+from io import BytesIO
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -129,6 +130,35 @@ def _detect_image_type(data: bytes) -> str | None:
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _share_image_variant(data: bytes, *, max_width: int, quality: int) -> tuple[bytes, str] | None:
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                converted = background
+            else:
+                converted = image.convert("RGB")
+            if converted.width > max_width:
+                target_height = max(1, round(converted.height * max_width / converted.width))
+                converted = converted.resize((max_width, target_height), Image.Resampling.LANCZOS)
+            output = BytesIO()
+            converted.save(
+                output,
+                format="JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+            )
+            return output.getvalue(), "image/jpeg"
+    except Exception:
+        return None
 
 
 def _local_image_path(source: str):
@@ -264,17 +294,31 @@ async def share_product_page(product_id: str, session: AsyncSession = Depends(ge
 
 
 @router.get("/share/products/{product_id}/image")
-async def share_product_image(product_id: str, session: AsyncSession = Depends(get_session)) -> Response:
+async def share_product_image(
+    product_id: str,
+    width: int | None = Query(None, alias="w", ge=64, le=1600),
+    quality: int = Query(82, alias="q", ge=55, le=90),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
     identifier = _identifier(product_id)
     product = await _get_share_product(identifier, session)
     for source in _product_image_candidates(product):
         image = await _read_image(source)
         if image is not None:
             data, media_type = image
+            if width is not None:
+                variant = _share_image_variant(data, max_width=width, quality=quality)
+                if variant is not None:
+                    data, media_type = variant
             return Response(content=data, media_type=media_type, headers={"Cache-Control": SHARE_IMAGE_CACHE_CONTROL})
     raise HTTPException(status_code=404, detail="product_image_not_found")
 
 
 @router.head("/share/products/{product_id}/image")
-async def share_product_image_head(product_id: str, session: AsyncSession = Depends(get_session)) -> Response:
-    return await share_product_image(product_id, session)
+async def share_product_image_head(
+    product_id: str,
+    width: int | None = Query(None, alias="w", ge=64, le=1600),
+    quality: int = Query(82, alias="q", ge=55, le=90),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    return await share_product_image(product_id, width=width, quality=quality, session=session)

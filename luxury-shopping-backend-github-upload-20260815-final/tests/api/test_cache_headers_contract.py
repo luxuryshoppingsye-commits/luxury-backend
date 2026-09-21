@@ -29,7 +29,7 @@ def test_public_catalog_without_auth_is_edge_cacheable():
 
     _apply_cache_headers(_request("/api/catalog/products"), response)
 
-    assert response.headers["cache-control"] == "public, max-age=30, stale-while-revalidate=30"
+    assert response.headers["cache-control"] == "public, max-age=60, stale-while-revalidate=60"
     assert "pragma" not in response.headers
     assert "expires" not in response.headers
 
@@ -59,7 +59,7 @@ def test_public_catalog_with_non_auth_cookie_is_edge_cacheable():
         response,
     )
 
-    assert response.headers["cache-control"] == "public, max-age=30, stale-while-revalidate=30"
+    assert response.headers["cache-control"] == "public, max-age=60, stale-while-revalidate=60"
     assert "pragma" not in response.headers
 
 
@@ -79,6 +79,20 @@ def test_public_uploads_keep_static_file_cache_headers():
     _apply_cache_headers(_request("/uploads/products/example.webp"), response)
 
     assert response.headers["cache-control"] == "public, max-age=86400, immutable"
+
+
+def test_catalog_image_keeps_handler_long_lived_cache_policy():
+    response = Response(headers={
+        "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
+        "ETag": '"image-etag"',
+    })
+
+    _apply_cache_headers(_request("/api/catalog/image-proxy/products/example.webp"), response)
+
+    assert response.headers["cache-control"] == (
+        "public, max-age=31536000, s-maxage=31536000, immutable"
+    )
+    assert response.headers["etag"] == '"image-etag"'
 
 
 def test_share_images_are_cross_origin_and_cacheable():
@@ -146,3 +160,5 @@ def test_unrelated_writes_do_not_evict_public_read_cache():
 def test_catalog_and_content_writes_evict_public_read_cache():
     assert _should_invalidate_public_cache(_request("/manage/products/123", method="PATCH"))
     assert _should_invalidate_public_cache(_request("/api/content/site/homepage", method="PATCH"))
+    assert _should_invalidate_public_cache(_request("/api/catalog/admin/banners/123", method="PATCH"))
+    assert _should_invalidate_public_cache(_request("/api/marketing/campaigns/123", method="PATCH"))

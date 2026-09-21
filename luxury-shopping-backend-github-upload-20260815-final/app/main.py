@@ -203,12 +203,14 @@ async def lifespan(_: FastAPI):
         message_worker_task = asyncio.create_task(message_worker.run_forever())
         logger.info("message worker enabled in web process")
     try:
+        commerce.start_catalog_image_proxy()
         yield
     finally:
         if message_worker is not None:
             message_worker.stop()
         if message_worker_task is not None:
             await message_worker_task
+        await commerce.close_catalog_image_proxy()
         await engine.dispose()
 
 
@@ -325,6 +327,7 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/api/catalog/image-proxy",
     "/offers",
     "/api/catalog/offers",
+    "/api/catalog/banners",
     "/categories",
     "/api/catalog/categories",
     "/brands",
@@ -347,6 +350,7 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/api/content/social-links",
     "/api/content/shipping-zones",
     "/api/content/settings/public",
+    "/api/marketing/campaigns/active",
     "/uploads",
     "/api/uploads",
 )
@@ -364,6 +368,7 @@ PUBLIC_CACHE_INVALIDATION_PREFIXES = (
     "/resources/categories",
     "/resources/brands",
     "/resources/banners",
+    "/api/catalog/admin/banners",
     "/resources/partner_storefronts",
     "/resources/local_merchants",
     "/api/admin/local-merchants",
@@ -372,6 +377,7 @@ PUBLIC_CACHE_INVALIDATION_PREFIXES = (
     "/admin/partner-storefronts",
     "/api/content",
     "/content",
+    "/api/marketing/campaigns",
 )
 
 AUTH_COOKIE_NAMES = frozenset({"at", "rt"})
@@ -421,7 +427,7 @@ def _apply_cache_headers(request: Request, response) -> None:
         and _matches_prefix(path, ("/uploads", "/api/uploads"))
     )
     if (is_static_file or is_share_image or is_catalog_image_proxy) and not has_auth_context:
-        response.headers["Cache-Control"] = "public, max-age=86400, immutable"
+        response.headers.setdefault("Cache-Control", "public, max-age=86400, immutable")
         if "Pragma" in response.headers:
             del response.headers["Pragma"]
         if "Expires" in response.headers:
