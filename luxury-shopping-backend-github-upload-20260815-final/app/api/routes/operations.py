@@ -3800,6 +3800,13 @@ async def api_catalog_recommendations(
 
 @router.get("/api/catalog/settings")
 async def api_catalog_settings(session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("catalog-settings"),
+        lambda: _api_catalog_settings_uncached(session),
+    )
+
+
+async def _api_catalog_settings_uncached(session: AsyncSession) -> dict[str, Any]:
     rows = await _resource_data(session, "site_settings")
     return {"data": {str(row.get("name") or row.get("key") or row.get("id")): row.get("extra_data") or row for row in rows}}
 
@@ -6808,6 +6815,13 @@ async def api_activity_audit(
 
 @router.get("/api/reviews/store/public")
 async def api_store_reviews_public(session: AsyncSession = Depends(get_session)):
+    return await public_read_cache.get_or_set(
+        cache_key("store-reviews-public"),
+        lambda: _api_store_reviews_public_uncached(session),
+    )
+
+
+async def _api_store_reviews_public_uncached(session: AsyncSession) -> dict[str, Any]:
     return {"data": await fetch_public_store_reviews(session)}
 
 

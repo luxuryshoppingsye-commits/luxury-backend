@@ -1077,10 +1077,30 @@ async def me(
 @router.get("/api/auth/me")
 async def web_me(
     request: Request,
+    response: Response,
     user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    payload = await me(request, user, session)
+    # Upgrade browser sessions created before the durable-session cookie was
+    # introduced. The current bearer token has already been authenticated by
+    # current_user, so it is safe to mint the same one-year server-side
+    # session that a new web login receives. This avoids forcing existing
+    # users to sign in again when their short-lived access token expires.
+    authorization = request.headers.get("authorization", "")
+    should_upgrade_session = (
+        not request.cookies.get(SESSION_COOKIE)
+        and authorization.lower().startswith("bearer ")
+    )
+    payload = await auth_payload(
+        session,
+        user,
+        request=request,
+        issue_tokens=should_upgrade_session,
+    )
+    if should_upgrade_session:
+        await session.commit()
+        if payload.get("session_token") or payload.get("refresh_token"):
+            _set_refresh_cookie(response, payload, persistent=True)
     return _web_auth_payload(payload)
 
 

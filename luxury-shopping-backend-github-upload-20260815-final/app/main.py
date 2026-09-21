@@ -328,6 +328,7 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/offers",
     "/api/catalog/offers",
     "/api/catalog/banners",
+    "/api/catalog/settings",
     "/categories",
     "/api/catalog/categories",
     "/brands",
@@ -351,6 +352,7 @@ PUBLIC_CACHEABLE_PREFIXES = (
     "/api/content/shipping-zones",
     "/api/content/settings/public",
     "/api/marketing/campaigns/active",
+    "/api/reviews/store/public",
     "/uploads",
     "/api/uploads",
 )
@@ -378,6 +380,7 @@ PUBLIC_CACHE_INVALIDATION_PREFIXES = (
     "/api/content",
     "/content",
     "/api/marketing/campaigns",
+    "/api/reviews/store",
 )
 
 AUTH_COOKIE_NAMES = frozenset({"at", "rt"})
@@ -426,7 +429,15 @@ def _apply_cache_headers(request: Request, response) -> None:
         and not has_auth_context
         and _matches_prefix(path, ("/uploads", "/api/uploads"))
     )
-    if (is_static_file or is_share_image or is_catalog_image_proxy) and not has_auth_context:
+    if is_catalog_image_proxy and not has_auth_context:
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        if "Pragma" in response.headers:
+            del response.headers["Pragma"]
+        if "Expires" in response.headers:
+            del response.headers["Expires"]
+        response.headers["Vary"] = "Accept-Encoding"
+        return
+    if (is_static_file or is_share_image) and not has_auth_context:
         response.headers.setdefault("Cache-Control", "public, max-age=86400, immutable")
         if "Pragma" in response.headers:
             del response.headers["Pragma"]

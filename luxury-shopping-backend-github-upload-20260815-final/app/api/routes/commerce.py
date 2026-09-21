@@ -1424,6 +1424,66 @@ async def _catalog_products_page_uncached(
     }
 
 
+_COMPACT_CATALOG_PRODUCT_FIELDS = frozenset(
+    {
+        "id",
+        "short_code",
+        "slug",
+        "name",
+        "name_en",
+        "price",
+        "original_price",
+        "currency_code",
+        "stock_quantity",
+        "stock_status",
+        "availability_status",
+        "approval_status",
+        "is_featured",
+        "is_active",
+        "is_orderable",
+        "is_available_for_checkout",
+        "has_variant_options",
+        "track_inventory",
+        "images",
+        "image_url",
+        "imageUrl",
+        "primary_image",
+        "ar_image_url",
+        "arImageUrl",
+        "brand",
+        "brand_name",
+        "supplier",
+        "merchant",
+        "partner_id",
+        "supplier_id",
+        "store_name",
+        "store_name_en",
+        "store_type",
+        "category",
+        "category_name",
+        "category_slug",
+        "variants",
+        "rating_average",
+        "rating_count",
+        "reviews_count",
+        "discount_percentage",
+    }
+)
+
+
+def _compact_catalog_product_page(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the card data once, without heavy detail-page descriptions."""
+
+    compact_items = [
+        {key: value for key, value in item.items() if key in _COMPACT_CATALOG_PRODUCT_FIELDS}
+        for item in payload.get("items", [])
+        if isinstance(item, dict)
+    ]
+    compact_payload = {key: value for key, value in payload.items() if key != "data"}
+    compact_payload["items"] = compact_items
+    return compact_payload
+
+
 @router.get("/categories")
 async def categories(limit: int = Query(100, ge=1, le=5000), session: AsyncSession = Depends(get_session)):
     key = cache_key("catalog-categories", limit=limit)
@@ -1688,18 +1748,23 @@ async def catalog_products(
     is_new: bool | None = None,
     onSale: bool = False,
     includeTotal: bool = True,
+    compact: bool = False,
     minPrice: Decimal | None = None,
     maxPrice: Decimal | None = None,
     sort: str = "newest",
     session: AsyncSession = Depends(get_session),
 ):
-    return await _catalog_products_page(
+    requested_page_size = page_size or limit or 20
+    compact_card_response = compact or (
+        requested_page_size <= 8 and bool(onSale or featured or featuredOnly)
+    )
+    response = await _catalog_products_page(
         session,
         page=page,
-        page_size=page_size or limit or 20,
+        page_size=requested_page_size,
         offset=offset,
         sort=sort,
-        include_total=includeTotal,
+        include_total=includeTotal and not compact_card_response,
         featured=featured or featuredOnly,
         on_sale=onSale,
         new_only=bool(new_only or newOnly or is_new),
@@ -1717,6 +1782,7 @@ async def catalog_products(
         min_price=minPrice,
         max_price=maxPrice,
     )
+    return _compact_catalog_product_page(response) if compact_card_response else response
 
 
 @router.get("/api/catalog/offers")
@@ -2059,14 +2125,24 @@ def _canonicalize_catalog_image(
                     target_height = max(1, round(converted.height * max_width / converted.width))
                     converted = converted.resize((max_width, target_height), Image.Resampling.LANCZOS)
                 output = BytesIO()
-                converted.save(
-                    output,
-                    format="JPEG",
-                    quality=quality,
-                    optimize=True,
-                    progressive=True,
-                )
-                return output.getvalue(), "image/jpeg"
+                try:
+                    converted.save(
+                        output,
+                        format="WEBP",
+                        quality=quality,
+                        method=4,
+                    )
+                    return output.getvalue(), "image/webp"
+                except OSError:
+                    output = BytesIO()
+                    converted.save(
+                        output,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    return output.getvalue(), "image/jpeg"
             # Android devices are not consistent when an object is named
             # .webp but the edge/CDN metadata is incomplete. Return one
             # decoder-safe representation from the proxy so the URL suffix,

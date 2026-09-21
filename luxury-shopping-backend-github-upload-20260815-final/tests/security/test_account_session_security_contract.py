@@ -264,6 +264,66 @@ async def test_web_login_uses_durable_cookie_even_when_legacy_flag_is_false(
     assert captured == [True]
 
 
+async def test_web_me_upgrades_a_legacy_bearer_session_to_one_year_cookies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issued: list[bool] = []
+
+    async def payload(
+        _session: object,
+        _user: object,
+        *,
+        request: Request,
+        issue_tokens: bool,
+    ) -> dict[str, object]:
+        assert request.headers["authorization"] == "Bearer legacy-access-token"
+        issued.append(issue_tokens)
+        return {
+            "user": {"id": "legacy-user"},
+            "roles": ["customer"],
+            "access_token": "renewed-access-token",
+            "refresh_token": "renewed-refresh-token",
+            "session_token": "durable-session-token",
+            "expires_in": 1800,
+        }
+
+    class Session:
+        commits = 0
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    monkeypatch.setattr(auth_routes, "auth_payload", payload)
+    monkeypatch.setattr(
+        auth_routes,
+        "get_settings",
+        lambda: SimpleNamespace(app_env="test", jwt_refresh_token_days=365, auth_session_max_hours=8760),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/auth/me",
+            "headers": [(b"authorization", b"Bearer legacy-access-token")],
+        }
+    )
+    response = Response()
+    session = Session()
+
+    result = await auth_routes.web_me(request, response, SimpleNamespace(), session)
+
+    assert issued == [True]
+    assert session.commits == 1
+    assert result["session"]["access_token"] == "renewed-access-token"
+    cookies = response.headers.getlist("set-cookie")
+    assert any(
+        "luxury_session=durable-session-token" in header
+        and "Max-Age=31536000" in header
+        and "HttpOnly" in header
+        for header in cookies
+    )
+
+
 async def test_web_logout_revokes_refresh_and_durable_session_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
