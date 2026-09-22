@@ -77,6 +77,7 @@ from ...services.commerce_rules import (
 from ...services.partner_subscription import public_partner_storefront_clause
 from ...services.payment_methods import validate_payment_method_for_checkout
 from ...services.staff_permissions import require_staff_permission
+from ...services.audit_trail import add_audit_log
 from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof, normalize_status
 from ...services.notification_service import NotificationPayload, NotificationService
 from ...storage import FileStorage
@@ -248,19 +249,26 @@ def _resolve_manage_product_image_urls(row: dict[str, Any]) -> dict[str, Any]:
             row[key] = _resolve(row.get(key))
     images = row.get("images")
     if isinstance(images, list):
-        resolved_images: list[Any] = []
+        resolved_images: list[str] = []
+        seen_images: set[str] = set()
         for image in images:
             if isinstance(image, str):
-                resolved_images.append(_resolve(image))
+                resolved = _resolve(image)
+            elif isinstance(image, dict):
+                resolved = next(
+                    (
+                        _resolve(image.get(nested_key))
+                        for nested_key in ("url", "image_url", "imageUrl", "path", "src")
+                        if image.get(nested_key) is not None
+                    ),
+                    None,
+                )
+            else:
+                resolved = None
+            if not isinstance(resolved, str) or not resolved or resolved in seen_images:
                 continue
-            if isinstance(image, dict):
-                copy = dict(image)
-                for nested_key in ("url", "image_url", "imageUrl", "path", "src"):
-                    if nested_key in copy and copy.get(nested_key) is not None:
-                        copy[nested_key] = _resolve(copy.get(nested_key))
-                resolved_images.append(copy)
-                continue
-            resolved_images.append(image)
+            seen_images.add(resolved)
+            resolved_images.append(resolved)
         row["images"] = resolved_images
     return row
 
@@ -3536,13 +3544,19 @@ async def create_manual_order(
             payload={"deep_link": f"/orders/{order.id}"},
             deduplication_key=f"order-created:{order.id}",
         )
-        audit_model = MODEL_BY_TABLE["audit_logs"]
-        session.add(audit_model(
+        add_audit_log(
+            session,
             user_id=admin.id,
-            type="manual_order_created",
+            action="manual_order_created",
             description=f"Created order {order.order_number}",
-            extra_data={"order_id": str(order.id), "customer_id": str(customer.id)},
-        ))
+            extra_data={
+                "action": "create",
+                "table_name": "orders",
+                "record_id": str(order.id),
+                "order_id": str(order.id),
+                "customer_id": str(customer.id),
+            },
+        )
     await session.commit()
     return _serialize_order(order, idempotency_replayed=False if key else None)
 
@@ -4211,13 +4225,20 @@ async def change_order_status(
     await award_loyalty_points_for_fulfilled_order(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
     session.add(history_model(order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status}))
-    audit_model = MODEL_BY_TABLE["audit_logs"]
-    session.add(audit_model(
+    add_audit_log(
+        session,
         user_id=user.id,
-        type="order_status_changed",
+        action="order_status_changed",
         description=f"Changed order {order.order_number} status from {previous} to {next_status}",
-        extra_data={"order_id": str(order.id), "previous_status": previous, "new_status": next_status},
-    ))
+        extra_data={
+            "action": "update",
+            "table_name": "orders",
+            "record_id": str(order.id),
+            "order_id": str(order.id),
+            "previous_status": previous,
+            "new_status": next_status,
+        },
+    )
     await _create_notification(
         session, "notifications", user_id=order.user_id, recipient_id=order.user_id,
         order_id=order.id, title="تحديث حالة الطلب",
@@ -4282,13 +4303,20 @@ async def rollback_order_status(
             "rollback_of": str(latest.id),
         },
     ))
-    audit_model = MODEL_BY_TABLE["audit_logs"]
-    session.add(audit_model(
+    add_audit_log(
+        session,
         user_id=user.id,
-        type="order_status_rolled_back",
+        action="order_status_rolled_back",
         description=f"Rolled back order {order.order_number} status from {current_status} to {previous_status}",
-        extra_data={"order_id": str(order.id), "previous_status": current_status, "new_status": previous_status},
-    ))
+        extra_data={
+            "action": "update",
+            "table_name": "orders",
+            "record_id": str(order.id),
+            "order_id": str(order.id),
+            "previous_status": current_status,
+            "new_status": previous_status,
+        },
+    )
     await session.commit()
     return serialize_record(order)
 
@@ -4349,14 +4377,19 @@ async def cancel_customer_order(
             extra_data={"previous_status": previous, "new_status": next_status, "actor": "customer"},
         )
     )
-    audit_model = MODEL_BY_TABLE["audit_logs"]
-    session.add(
-        audit_model(
-            user_id=user.id,
-            type="customer_order_cancelled",
-            description=f"Customer cancelled order {order.order_number}",
-            extra_data={"order_id": str(order.id), "previous_status": previous, "inventory_restored": True},
-        )
+    add_audit_log(
+        session,
+        user_id=user.id,
+        action="customer_order_cancelled",
+        description=f"Customer cancelled order {order.order_number}",
+        extra_data={
+            "action": "update",
+            "table_name": "orders",
+            "record_id": str(order.id),
+            "order_id": str(order.id),
+            "previous_status": previous,
+            "inventory_restored": True,
+        },
     )
     await _create_notification(
         session,
@@ -4825,19 +4858,18 @@ async def delete_product(product_id: uuid.UUID, user: User = Depends(current_use
         variants=variants,
         actor=user,
     )
-    session.add(
-        MODEL_BY_TABLE["audit_logs"](
-            user_id=user.id,
-            type="products.delete",
-            description=f"Deleted products record {product_id}",
-            extra_data={
-                "action": "delete",
-                "table_name": "products",
-                "record_id": str(product_id),
-                "source": "manage_products_api",
-                "deleted_variant_count": len(variants),
-            },
-        )
+    add_audit_log(
+        session,
+        user_id=user.id,
+        action="products.delete",
+        description=f"Deleted products record {product_id}",
+        extra_data={
+            "action": "delete",
+            "table_name": "products",
+            "record_id": str(product_id),
+            "source": "manage_products_api",
+            "deleted_variant_count": len(variants),
+        },
     )
     await session.commit()
     return {"ok": True, "removed_assets": removed_assets, "data": serialize_record(product)}
@@ -4906,18 +4938,17 @@ async def delete_variant(variant_id: uuid.UUID, user: User = Depends(current_use
     _require_product_owner(product, user, roles)
     variant.deleted_at = datetime.now(timezone.utc)
     variant.is_active = False
-    session.add(
-        MODEL_BY_TABLE["audit_logs"](
-            user_id=user.id,
-            type="product_variants.delete",
-            description=f"Deleted product_variants record {variant_id}",
-            extra_data={
-                "action": "delete",
-                "table_name": "product_variants",
-                "record_id": str(variant_id),
-                "source": "manage_product_variants_api",
-            },
-        )
+    add_audit_log(
+        session,
+        user_id=user.id,
+        action="product_variants.delete",
+        description=f"Deleted product_variants record {variant_id}",
+        extra_data={
+            "action": "delete",
+            "table_name": "product_variants",
+            "record_id": str(variant_id),
+            "source": "manage_product_variants_api",
+        },
     )
     await session.commit()
     return {"ok": True}

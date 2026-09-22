@@ -237,7 +237,7 @@ async def test_web_login_cookie_persists_the_durable_session_for_one_year(
     )
 
 
-async def test_web_login_uses_durable_cookie_even_when_legacy_flag_is_false(
+async def test_web_login_respects_remember_me_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: list[bool] = []
@@ -260,8 +260,14 @@ async def test_web_login_uses_durable_cookie_even_when_legacy_flag_is_false(
         Response(),
         Session(),
     )
+    await auth_routes.web_login(
+        SimpleNamespace(remember_me=True),
+        SimpleNamespace(),
+        Response(),
+        Session(),
+    )
 
-    assert captured == [True]
+    assert captured == [False, True]
 
 
 async def test_web_me_upgrades_a_legacy_bearer_session_to_one_year_cookies(

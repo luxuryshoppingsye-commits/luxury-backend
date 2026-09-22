@@ -47,6 +47,7 @@ from ...services.auth_service import (
     revoke_all_refresh_tokens,
     roles_for,
 )
+from ...services.audit_trail import add_audit_log
 from ...services.staff_permissions import require_staff_permission
 from ...services.store_review_compat import (
     create_handover_store_review,
@@ -60,6 +61,7 @@ from ...services.catalog_policy import (
     build_public_product_rows,
     new_product_clause,
     normalize_product_mutation_values,
+    public_brand_logo_url,
     public_product_base_clauses,
     public_product_clauses,
     public_main_storefront_response,
@@ -381,21 +383,22 @@ async def _record_file_asset(
         },
     )
     session.add(asset)
-    audit_model = MODEL_BY_TABLE["audit_logs"]
-    session.add(
-        audit_model(
-            user_id=user.id,
-            type="file.uploaded",
-            description=f"Uploaded {stored.policy_key} file",
-            extra_data={
-                "file_id": str(asset.id),
-                "policy_key": stored.policy_key,
-                "visibility": stored.visibility,
-                "size_bytes": stored.size,
-                "sha256": stored.sha256,
-                **(image_metadata or {}),
-            },
-        )
+    add_audit_log(
+        session,
+        user_id=user.id,
+        action="file.uploaded",
+        description=f"Uploaded {stored.policy_key} file",
+        extra_data={
+            "action": "create",
+            "table_name": "file_assets",
+            "record_id": str(asset.id),
+            "file_id": str(asset.id),
+            "policy_key": stored.policy_key,
+            "visibility": stored.visibility,
+            "size_bytes": stored.size,
+            "sha256": stored.sha256,
+            **(image_metadata or {}),
+        },
     )
     await session.flush()
     await session.refresh(asset)
@@ -477,6 +480,28 @@ async def _secure_upload_from_request(
         }
     else:
         file_name = upload_filename
+    if policy.key == "product_image":
+        checksum = hashlib.sha256(data).hexdigest()
+        existing_asset = (
+            await session.execute(
+                select(FileAsset)
+                .where(
+                    FileAsset.owner_user_id == (owner_user_id or user.id),
+                    FileAsset.policy_key == policy.key,
+                    FileAsset.checksum_sha256 == checksum,
+                    FileAsset.status == "available",
+                    FileAsset.deleted_at.is_(None),
+                )
+                .order_by(FileAsset.created_at.asc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing_asset is not None:
+            payload = _file_asset_response(
+                existing_asset, public_url=_asset_public_url(request, existing_asset)
+            )
+            payload["reused"] = True
+            return payload
     stored = storage.save_bytes(policy.key, file_name, data, str(request.base_url), roles=roles)
     asset = await _record_file_asset(
         session,
@@ -1077,7 +1102,6 @@ def _add_audit_log(
     table_name: str | None = None,
     record_id: uuid.UUID | str | None = None,
 ) -> None:
-    model = MODEL_BY_TABLE["audit_logs"]
     extra_data = {
         key: value
         for key, value in {
@@ -1087,13 +1111,12 @@ def _add_audit_log(
         }.items()
         if value is not None
     }
-    session.add(
-        model(
-            user_id=user_id,
-            type=action,
-            description=description,
-            extra_data=extra_data,
-        )
+    add_audit_log(
+        session,
+        user_id=user_id,
+        action=action,
+        description=description,
+        extra_data=extra_data,
     )
 
 
@@ -3537,6 +3560,9 @@ async def api_catalog_brands(session: AsyncSession = Depends(get_session)):
     data = []
     for brand, product_count in result.all():
         row = serialize_record(brand)
+        logo_url = public_brand_logo_url(row.get("logo_url") or row.get("logoUrl"))
+        row["logo_url"] = logo_url
+        row["logoUrl"] = logo_url
         row["product_count"] = int(product_count or 0)
         data.append(row)
     return {"data": data}
@@ -5462,7 +5488,14 @@ async def api_admin_list_categories(staff: User = Depends(require_staff), sessio
 
 @router.get("/api/catalog/admin/brands")
 async def api_admin_list_brands(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "brands", limit=5000)]}
+    data = []
+    for brand in await _rows(session, "brands", limit=5000):
+        row = serialize_record(brand)
+        logo_url = public_brand_logo_url(row.get("logo_url") or row.get("logoUrl"))
+        row["logo_url"] = logo_url
+        row["logoUrl"] = logo_url
+        data.append(row)
+    return {"data": data}
 
 
 @router.get("/api/catalog/admin/products")
@@ -6750,6 +6783,7 @@ async def api_activity_access(
     user_ids = {getattr(row, "user_id", None) for row in access_rows}
     user_ids.discard(None)
     user_labels: dict[str, str] = {}
+    user_roles: dict[str, list[str]] = {}
     if user_ids:
         profile_rows = (
             await session.execute(
@@ -6767,10 +6801,14 @@ async def api_activity_access(
         ).all()
         for user_id, email in user_rows:
             user_labels.setdefault(str(user_id), str(email or ""))
+        role_rows = (await session.execute(select(UserRole.user_id, UserRole.role).where(UserRole.user_id.in_(user_ids)))).all()
+        for user_id, role in role_rows:
+            user_roles.setdefault(str(user_id), []).append(str(role))
 
     data = []
     for row in access_rows:
         payload = serialize_record(row)
+        request_metadata = _audit_extra_data(row)
         user_id = str(payload.get("user_id") or "")
         action_type = _first_text(payload.get("action_type"), payload.get("type"), default="view").lower()
         if action_type in {"select", "read", "list"}:
@@ -6785,12 +6823,18 @@ async def api_activity_access(
                 "id": str(payload.get("id") or ""),
                 "user_id": user_id or None,
                 "user_name": user_labels.get(user_id) or _first_text(payload.get("user_name"), default="مستخدم غير معروف"),
+                "user_roles": user_roles.get(user_id, []),
                 "action_type": action_type,
                 "table_name": _first_text(payload.get("table_name"), default="unknown"),
                 "data_category": _first_text(payload.get("data_category"), default="general"),
                 "record_count": record_count,
                 "search_query": _first_text(payload.get("search_query")) or None,
                 "accessed_at": accessed_at,
+                "ip_address": _first_text(request_metadata.get("ip_address")) or None,
+                "client_label": _first_text(request_metadata.get("client_label")) or None,
+                "request_id": _first_text(request_metadata.get("request_id")) or None,
+                "request_path": _first_text(request_metadata.get("request_path")) or None,
+                "request_method": _first_text(request_metadata.get("request_method")) or None,
             }
         )
     return {"data": data}
@@ -6810,7 +6854,33 @@ async def api_activity_audit(
     ``description``.  Both formats must remain visible in one report.
     """
     audit_rows = await _rows(session, "audit_logs", limit=limit)
-    return {"data": [_activity_audit_payload(row) for row in audit_rows]}
+    user_ids = {getattr(row, "user_id", None) for row in audit_rows}
+    user_ids.discard(None)
+    user_labels: dict[str, str] = {}
+    user_roles: dict[str, list[str]] = {}
+    if user_ids:
+        profile_rows = (
+            await session.execute(
+                select(Profile.user_id, Profile.full_name, Profile.email)
+                .where(Profile.user_id.in_(user_ids), Profile.deleted_at.is_(None))
+            )
+        ).all()
+        for user_id, full_name, email in profile_rows:
+            user_labels[str(user_id)] = _first_text(full_name, email)
+        user_rows = (await session.execute(select(User.id, User.email).where(User.id.in_(user_ids), User.deleted_at.is_(None)))).all()
+        for user_id, email in user_rows:
+            user_labels.setdefault(str(user_id), str(email or ""))
+        role_rows = (await session.execute(select(UserRole.user_id, UserRole.role).where(UserRole.user_id.in_(user_ids)))).all()
+        for user_id, role in role_rows:
+            user_roles.setdefault(str(user_id), []).append(str(role))
+    return {"data": [
+        _activity_audit_payload(
+            row,
+            user_name=user_labels.get(str(getattr(row, "user_id", ""))) or "مستخدم غير معروف",
+            user_roles=user_roles.get(str(getattr(row, "user_id", "")), []),
+        )
+        for row in audit_rows
+    ]}
 
 
 @router.get("/api/reviews/store/public")
@@ -7061,7 +7131,12 @@ def _security_audit_changed_fields(row: Any) -> dict[str, bool]:
     return {}
 
 
-def _activity_audit_payload(row: Any) -> dict[str, Any]:
+def _activity_audit_payload(
+    row: Any,
+    *,
+    user_name: str = "مستخدم غير معروف",
+    user_roles: list[str] | None = None,
+) -> dict[str, Any]:
     type_value, table_value, description, record_id, extra_data = _audit_event_values(row)
     action = str(
         _first_audit_value([
@@ -7075,6 +7150,8 @@ def _activity_audit_payload(row: Any) -> dict[str, Any]:
     if not isinstance(details, dict):
         details = _security_audit_changed_fields(row)
     created_at = getattr(row, "created_at", None)
+    ip_address = str(extra_data.get("ip_address") or "").strip() or None
+    client_label = str(extra_data.get("client_label") or "").strip() or None
     return {
         "id": str(getattr(row, "id", "")),
         "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
@@ -7083,6 +7160,15 @@ def _activity_audit_payload(row: Any) -> dict[str, Any]:
         "details": details,
         "description": description,
         "record_id": str(record_id) if record_id is not None else None,
+        "user_id": str(getattr(row, "user_id", "") or "") or None,
+        "user_name": user_name,
+        "user_roles": user_roles or [],
+        "ip_address": ip_address,
+        "client_label": client_label,
+        "request_id": str(extra_data.get("request_id") or "").strip() or None,
+        "request_path": str(extra_data.get("request_path") or "").strip() or None,
+        "request_method": str(extra_data.get("request_method") or "").strip() or None,
+        "result": str(extra_data.get("result") or "نجحت"),
     }
 
 
@@ -11250,12 +11336,17 @@ async def api_content_create_theme_template(
         },
     )
     session.add(row)
-    session.add(
-        MODEL_BY_TABLE["audit_logs"](
-            user_id=staff.id,
-            type="theme.template.create",
-            description=f"Created theme template {name}",
-        )
+    add_audit_log(
+        session,
+        user_id=staff.id,
+        action="theme.template.create",
+        description=f"Created theme template {name}",
+        extra_data={
+            "action": "create",
+            "table_name": "theme_templates",
+            "record_id": str(row.id),
+            "source": "theme_admin",
+        },
     )
     await session.commit()
     return {
@@ -12526,6 +12617,29 @@ async def api_update_ticket_status(
     session: AsyncSession = Depends(get_session),
 ):
     return {"data": await SupportWorkflowService().update_status(session, ticket_id=ticket_id, user=staff, roles=roles, body=await request.json())}
+
+
+@router.delete("/api/support/tickets")
+async def api_delete_support_tickets_bulk(
+    request: Request,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    body = await request.json()
+    raw_ticket_ids = body.get("ticket_ids") if isinstance(body, dict) else None
+    if not isinstance(raw_ticket_ids, list) or not raw_ticket_ids:
+        raise HTTPException(status_code=422, detail="support_ticket_ids_required")
+    try:
+        ticket_ids = [uuid.UUID(str(ticket_id)) for ticket_id in raw_ticket_ids]
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=422, detail="invalid_support_ticket_id")
+    return await SupportWorkflowService().delete_many(
+        session,
+        ticket_ids=ticket_ids,
+        user=staff,
+        roles=roles,
+    )
 
 
 @router.delete("/api/support/tickets/{ticket_id}")
@@ -14462,14 +14576,19 @@ async def storage_remove(request: Request, user: User = Depends(current_user), r
     asset.deleted_at = datetime.now(timezone.utc)
     asset.deleted_by = user.id
     asset.status = "deleted"
-    audit_model = MODEL_BY_TABLE["audit_logs"]
-    session.add(
-        audit_model(
-            user_id=user.id,
-            type="file.deleted",
-            description=f"Deleted file {asset.id}",
-            extra_data={"file_id": str(asset.id), "policy_key": asset.policy_key, "storage_removed": removed},
-        )
+    add_audit_log(
+        session,
+        user_id=user.id,
+        action="file.deleted",
+        description=f"Deleted file {asset.id}",
+        extra_data={
+            "action": "delete",
+            "table_name": "file_assets",
+            "record_id": str(asset.id),
+            "file_id": str(asset.id),
+            "policy_key": asset.policy_key,
+            "storage_removed": removed,
+        },
     )
     await session.commit()
     return {"ok": True, "file_id": str(asset.id), "removed": int(removed)}

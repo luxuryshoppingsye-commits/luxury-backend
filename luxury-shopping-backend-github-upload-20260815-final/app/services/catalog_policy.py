@@ -271,6 +271,19 @@ def _stock_status(quantity: Any) -> str:
     return "in_stock"
 
 
+def _unique_public_product_images(values: list[Any] | None) -> list[str]:
+    """Normalize product-gallery URLs and retain each actual URL once, in order."""
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        image_url = _public_upload_url(value)
+        if not image_url or image_url in seen:
+            continue
+        seen.add(image_url)
+        unique.append(image_url)
+    return unique
+
+
 def public_category_summary(category: Category | None) -> dict[str, Any] | None:
     if category is None:
         return None
@@ -297,8 +310,7 @@ def public_brand_summary(brand: Brand | None) -> dict[str, Any] | None:
 
 
 def public_variant_response(variant: ProductVariant) -> dict[str, Any]:
-    images = [_public_upload_url(image) for image in (variant.images or [])]
-    images = [image for image in images if image]
+    images = _unique_public_product_images(variant.images)
     image_url = _public_upload_url(variant.image_url) or (images[0] if images else None)
     return {
         "id": str(variant.id),
@@ -484,8 +496,7 @@ def public_product_response(
     merchant_type: str | None = None,
     variants: list[ProductVariant] | None = None,
 ) -> dict[str, Any]:
-    images = [_public_upload_url(image) for image in (product.images or [])]
-    images = [image for image in images if image]
+    images = _unique_public_product_images(product.images)
     image_url = _public_upload_url(product.image_url) or (images[0] if images else None)
     product_extra = product.extra_data if isinstance(product.extra_data, dict) else {}
     ar_image_url = _public_upload_url(
@@ -799,10 +810,31 @@ def normalize_product_mutation_values(values: dict[str, Any], *, partial: bool =
         images = normalized["images"] or []
         if not isinstance(images, list) or len(images) > 20:
             raise HTTPException(status_code=422, detail={"code": "invalid_images", "message": "Product images payload is invalid"})
+        unique_images: list[Any] = []
+        seen_images: set[str] = set()
         for image in images:
-            value = image.get("url") if isinstance(image, dict) else image
+            value = (
+                next(
+                    (
+                        image.get(key)
+                        for key in ("url", "image_url", "imageUrl", "path", "src")
+                        if image.get(key) is not None
+                    ),
+                    None,
+                )
+                if isinstance(image, dict)
+                else image
+            )
             if isinstance(value, str) and value.strip().lower().startswith(("javascript:", "data:")):
                 raise HTTPException(status_code=422, detail={"code": "invalid_images", "message": "Product images payload is invalid"})
+            if not isinstance(value, str):
+                continue
+            key = value.strip()
+            if not key or key in seen_images:
+                continue
+            seen_images.add(key)
+            unique_images.append(image)
+        normalized["images"] = unique_images
     if "ar_image_url" in normalized:
         ar_image_url = str(normalized.get("ar_image_url") or "").strip()
         if len(ar_image_url) > 4000 or ar_image_url.lower().startswith(("javascript:", "data:")):

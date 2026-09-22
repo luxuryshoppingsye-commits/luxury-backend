@@ -127,6 +127,17 @@ async def test_secure_file_storage_contract() -> None:
         assert product_body["url"].startswith("http://testserver/uploads/products/")
         file_id = product_body["file_id"]
 
+        replayed_product_upload = await client.post(
+            "/manage/product-image",
+            headers=admin_headers,
+            files={"file": ("product-retry.png", PNG_BYTES, "image/png")},
+        )
+        assert replayed_product_upload.status_code == 201, replayed_product_upload.text
+        replayed_product_body = replayed_product_upload.json()
+        assert replayed_product_body["file_id"] == file_id
+        assert replayed_product_body["url"] == product_body["url"]
+        assert replayed_product_body["reused"] is True
+
         async with SessionFactory() as session:
             asset = await session.get(FileAsset, uuid.UUID(file_id))
             assert asset is not None

@@ -26,6 +26,7 @@ from ..services.resource_policy import (
     validate_resource_operation,
 )
 from ..services.catalog_policy import public_product_clauses
+from ..services.audit_trail import add_audit_log, with_request_audit_metadata
 
 
 COMPATIBLE_COLUMN_ALIASES = {
@@ -828,14 +829,14 @@ def record_data_access(
             user_id=user_id,
             type="view",
             description=f"Viewed {safe_table}",
-            extra_data={
+            extra_data=with_request_audit_metadata({
                 "action_type": "view",
                 "table_name": safe_table,
                 "data_category": data_access_category(safe_table),
                 "record_count": data_access_record_count(result),
                 "search_query": data_access_search_query(request_payload),
                 "source": source,
-            },
+            }),
         )
     )
 
@@ -857,6 +858,24 @@ class ResourceRepository:
     @property
     def is_admin(self) -> bool:
         return bool(self.roles.intersection(ADMIN_ROLES))
+
+    def _record_mutation_audit(self, action: str, records: list[dict[str, Any]]) -> None:
+        if self.user_id is None or self.table in {"audit_logs", "data_access_logs"}:
+            return
+        for record in records:
+            record_id = str(record.get("id") or "") or None
+            add_audit_log(
+                self.session,
+                user_id=self.user_id,
+                action=f"{self.table}.{action}",
+                description=f"{action.title()} {self.table} record {record_id or ''}".strip(),
+                extra_data={
+                    "action": action,
+                    "table_name": self.table,
+                    "record_id": record_id,
+                    "source": "resource_api",
+                },
+            )
 
     def _staff_table_allowed(self, operation: str) -> bool:
         if self.is_admin:
@@ -1261,7 +1280,9 @@ class ResourceRepository:
         rows = payload.get("data")
         rows = rows if isinstance(rows, list) else [rows]
         if self.table == "categories":
-            return await self._insert_categories(rows, upsert=upsert, conflict_target=conflict_target)
+            created = await self._insert_categories(rows, upsert=upsert, conflict_target=conflict_target)
+            self._record_mutation_audit("upsert" if upsert else "create", created)
+            return created
         created = []
         for raw in rows:
             if not isinstance(raw, dict):
@@ -1308,6 +1329,7 @@ class ResourceRepository:
                         setattr(record, key, value)
             await self.session.flush()
             created.append(self._serialize_response(record))
+        self._record_mutation_audit("upsert" if upsert else "create", created)
         return created
 
     async def update(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1328,6 +1350,7 @@ class ResourceRepository:
                 if record is None:
                     continue
                 updated.append(await self._update_category_resource_record(record.id, data))
+            self._record_mutation_audit("update", updated)
             return updated
         data = self._prepare_data(payload.get("data") or {}, "update")
         await self._verify_parent_ownership(data)
@@ -1354,7 +1377,9 @@ class ResourceRepository:
             )
             updated.append(record)
         await self.session.flush()
-        return [self._serialize_response(record) for record in updated]
+        serialized = [self._serialize_response(record) for record in updated]
+        self._record_mutation_audit("update", serialized)
+        return serialized
 
     async def delete(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         self.ensure_access("delete")
@@ -1375,27 +1400,8 @@ class ResourceRepository:
                 record.deleted_at = datetime.now(timezone.utc)
             else:
                 await self.session.delete(record)
-            # Deletions must remain auditable even when the deleted resource is
-            # soft-deleted and disappears from normal resource queries.  The
-            # compatibility clients send the event fields in ``extra_data``;
-            # the report endpoint understands this shape as well as the
-            # canonical ``type``/``description`` shape.
-            if self.user_id is not None:
-                audit_model = MODEL_BY_TABLE["audit_logs"]
-                self.session.add(
-                    audit_model(
-                        user_id=self.user_id,
-                        type=f"{self.table}.deleted",
-                        description=f"Deleted {self.table} record {record_id}",
-                        extra_data={
-                            "action": "delete",
-                            "table_name": self.table,
-                            "record_id": record_id,
-                            "source": "resource_api",
-                        },
-                    )
-                )
         await self.session.flush()
+        self._record_mutation_audit("delete", deleted_rows)
         return deleted_rows
 
     async def _insert_categories(

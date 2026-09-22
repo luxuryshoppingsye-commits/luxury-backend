@@ -27,6 +27,7 @@ from ..services.catalog_policy import build_public_product_rows, public_product_
 from ..services.financial_calculator import advisory_xact_lock, local_request_total, money
 from ..services.notification_service import NotificationPayload, NotificationService
 from ..services.realtime import RealtimeEventService, realtime_hub
+from .audit_trail import add_audit_log
 
 
 AUTHORIZED_REPORT_ROLES = frozenset({"admin", "manager", "finance"})
@@ -1133,12 +1134,12 @@ class ReportGenerationService:
             raise HTTPException(status_code=503, detail="pdf_arabic_font_unavailable")
 
         logo_path = BACKEND_DIR / "assets" / "branding" / "luxury-shopping-logo.png"
-        if not logo_path.is_file():
-            raise HTTPException(status_code=503, detail="pdf_brand_logo_unavailable")
-        try:
-            brand_logo = ImageReader(str(logo_path))
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail="pdf_brand_logo_unavailable") from exc
+        brand_logo = None
+        if logo_path.is_file():
+            try:
+                brand_logo = ImageReader(str(logo_path))
+            except Exception:
+                brand_logo = None
 
         charcoal = HexColor("#1C1917")
         charcoal_soft = HexColor("#44403C")
@@ -1179,16 +1180,31 @@ class ReportGenerationService:
             doc.roundRect(margin, header_y, content_width, 84, 12, fill=1, stroke=0)
             doc.setFillColor(brand_gold)
             doc.roundRect(right - 7, header_y, 7, 84, 3, fill=1, stroke=0)
-            doc.drawImage(
-                brand_logo,
-                margin + 17,
-                header_y + 12,
-                width=60,
-                height=60,
-                preserveAspectRatio=True,
-                anchor="c",
-                mask="auto",
-            )
+            if brand_logo is not None:
+                try:
+                    doc.drawImage(
+                        brand_logo,
+                        margin + 17,
+                        header_y + 12,
+                        width=60,
+                        height=60,
+                        preserveAspectRatio=True,
+                        anchor="c",
+                        mask="auto",
+                    )
+                except Exception:
+                    brand_logo_fallback = True
+                else:
+                    brand_logo_fallback = False
+            else:
+                brand_logo_fallback = True
+            if brand_logo_fallback:
+                doc.setStrokeColor(brand_gold)
+                doc.setLineWidth(1)
+                doc.roundRect(margin + 17, header_y + 12, 60, 60, 10, fill=0, stroke=1)
+                doc.setFillColor(brand_gold)
+                doc.setFont(font_name, 8)
+                doc.drawCentredString(margin + 47, header_y + 39, rtl("رفاهية"))
             doc.setFillColor(HexColor("#E8C66A"))
             doc.setFont(font_name, 9)
             doc.drawRightString(right - 22, header_y + 62, rtl("رفاهية التسوق"))
@@ -1647,8 +1663,7 @@ class ReportGenerationService:
         return payload
 
     def _audit(self, user_id: uuid.UUID, action: str, description: str) -> None:
-        model = MODEL_BY_TABLE["audit_logs"]
-        self.session.add(model(user_id=user_id, type=action, description=description))
+        add_audit_log(self.session, user_id=user_id, action=action, description=description)
 
 
 class AdminCustomerAccessService:
@@ -2023,7 +2038,7 @@ class CampaignService:
 
     @staticmethod
     def _audit(session: AsyncSession, user_id: uuid.UUID, action: str, description: str) -> None:
-        session.add(MODEL_BY_TABLE["audit_logs"](user_id=user_id, type=action, description=description))
+        add_audit_log(session, user_id=user_id, action=action, description=description)
 
 
 class CourierLocationService:
@@ -2219,7 +2234,13 @@ class ThemeAdminService:
             },
         )
         session.add(history)
-        session.add(MODEL_BY_TABLE["audit_logs"](user_id=actor.id, type="theme.publish" if publish else "theme.draft", description=f"Updated theme {setting_key}"))
+        add_audit_log(
+            session,
+            user_id=actor.id,
+            action="theme.publish" if publish else "theme.draft",
+            description=f"Updated theme {setting_key}",
+            extra_data={"action": "publish" if publish else "update", "table_name": "theme_settings", "source": "theme_admin"},
+        )
         if commit:
             await session.commit()
         else:
@@ -2485,17 +2506,57 @@ class SupportWorkflowService:
         await session.commit()
         return serialize_record(ticket)
 
-    async def delete(self, session: AsyncSession, *, ticket_id: uuid.UUID, user: User, roles: set[str]) -> dict[str, Any]:
+    async def delete_many(
+        self,
+        session: AsyncSession,
+        *,
+        ticket_ids: list[uuid.UUID],
+        user: User,
+        roles: set[str],
+    ) -> dict[str, Any]:
         if not roles.intersection({"admin", "manager"}):
             raise HTTPException(status_code=403, detail="support_delete_permission_denied")
-        ticket = await self.get(session, ticket_id=ticket_id, user=user, roles=roles)
-        ticket.deleted_at = _now()
-        extra = dict(ticket.extra_data or {})
-        workflow = list(extra.get("workflow") or [])
-        workflow.append({"status": "deleted", "at": _now().isoformat(), "by": str(user.id)})
-        ticket.extra_data = {**extra, "workflow": workflow}
+        unique_ids = list(dict.fromkeys(ticket_ids))
+        if not unique_ids:
+            raise HTTPException(status_code=422, detail="support_ticket_ids_required")
+        if len(unique_ids) > 100:
+            raise HTTPException(status_code=422, detail="support_ticket_bulk_limit_exceeded")
+
+        tickets = [
+            await self.get(session, ticket_id=ticket_id, user=user, roles=roles)
+            for ticket_id in unique_ids
+        ]
+        deleted_at = _now()
+        for ticket in tickets:
+            ticket.deleted_at = deleted_at
+            extra = dict(ticket.extra_data or {})
+            workflow = list(extra.get("workflow") or [])
+            workflow.append({"status": "deleted", "at": deleted_at.isoformat(), "by": str(user.id)})
+            ticket.extra_data = {**extra, "workflow": workflow}
+        add_audit_log(
+            session,
+            user_id=user.id,
+            action="support_tickets.bulk_delete",
+            description=f"Deleted {len(tickets)} support ticket(s)",
+            extra_data={
+                "action": "delete",
+                "table_name": "support_tickets",
+                "record_ids": [str(ticket.id) for ticket in tickets],
+                "deleted_count": len(tickets),
+                "source": "support_ticket_bulk_delete",
+            },
+        )
         await session.commit()
-        return {"ok": True, "id": str(ticket.id)}
+        return {"ok": True, "deleted_count": len(tickets), "ids": [str(ticket.id) for ticket in tickets]}
+
+    async def delete(self, session: AsyncSession, *, ticket_id: uuid.UUID, user: User, roles: set[str]) -> dict[str, Any]:
+        result = await self.delete_many(
+            session,
+            ticket_ids=[ticket_id],
+            user=user,
+            roles=roles,
+        )
+        return {"ok": True, "id": result["ids"][0]}
 
 
 class OperationalDayService:

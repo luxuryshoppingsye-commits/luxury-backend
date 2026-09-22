@@ -6,7 +6,7 @@ from decimal import Decimal
 from backend.app.models import MODEL_BY_TABLE
 from backend.app.models.domain import Product, ProductVariant
 from backend.app.api.routes.commerce import _product_values
-from backend.app.services.catalog_policy import public_product_response
+from backend.app.services.catalog_policy import normalize_product_mutation_values, public_product_response
 from backend.app.services.api_protection import policy_for_route
 
 
@@ -39,6 +39,39 @@ def test_public_product_response_exposes_variant_options() -> None:
 
     assert payload["has_variant_options"] is True
     assert payload["variants"][0]["size"] == "M"
+
+
+def test_product_images_are_deduplicated_for_mutation_and_public_gallery() -> None:
+    values = normalize_product_mutation_values(
+        {
+            "name": "منتج صور مكررة",
+            "price": 10,
+            "images": [
+                "/uploads/products/look.webp",
+                "/uploads/products/look.webp",
+                {"url": "/uploads/products/detail.webp"},
+                {"url": "/uploads/products/detail.webp"},
+            ],
+        },
+        partial=False,
+    )
+    product = Product(
+        id=uuid.uuid4(),
+        name="منتج صور مكررة",
+        price=Decimal("10"),
+        images=values["images"],
+    )
+
+    payload = public_product_response(product)
+
+    assert values["images"] == [
+        "/uploads/products/look.webp",
+        {"url": "/uploads/products/detail.webp"},
+    ]
+    assert payload["images"] == [
+        "/uploads/products/look.webp",
+        "/uploads/products/detail.webp",
+    ]
 
 
 def test_product_ar_image_is_persisted_and_exposed_to_clients() -> None:

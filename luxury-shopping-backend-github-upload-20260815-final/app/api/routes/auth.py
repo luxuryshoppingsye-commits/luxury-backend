@@ -640,11 +640,10 @@ async def web_firebase_auth(
 @router.post("/api/auth/login")
 async def web_login(body: LoginRequest, request: Request, response: Response, session: AsyncSession = Depends(get_session)):
     payload = await login(body, request, session)
-    # Web authentication is a durable session by contract. Keep the legacy
-    # remember_me field accepted for older clients, but do not let an
-    # unchecked client flag turn a successful login into a logout on the next
-    # browser restart.
-    _set_refresh_cookie(response, payload, persistent=True)
+    # The remembered-session control is opt-in and defaults to checked in the
+    # web client. When it is selected, the cookie-backed session can survive
+    # browser restarts for up to the configured one-year limit.
+    _set_refresh_cookie(response, payload, persistent=body.remember_me)
     return _web_auth_payload(payload)
 
 

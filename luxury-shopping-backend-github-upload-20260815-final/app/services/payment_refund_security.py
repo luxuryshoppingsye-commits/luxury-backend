@@ -30,6 +30,7 @@ from .financial_calculator import (
 from .image_pipeline import prepare_image_upload
 from .notification_service import create_payment_status_notification
 from .partner_subscription import activate_subscription_from_payment
+from .audit_trail import add_audit_log
 
 
 FINANCE_REVIEW_ROLES = frozenset({"admin", "manager", "finance"})
@@ -92,14 +93,12 @@ def _add_audit_log(
     description: str,
     extra_data: dict[str, Any] | None = None,
 ) -> None:
-    model = MODEL_BY_TABLE["audit_logs"]
-    session.add(
-        model(
-            user_id=user_id,
-            type=action,
-            description=description,
-            extra_data=_jsonable(extra_data or {}),
-        )
+    add_audit_log(
+        session,
+        user_id=user_id,
+        action=action,
+        description=description,
+        extra_data=_jsonable(extra_data or {}),
     )
 
 

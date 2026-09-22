@@ -47,6 +47,29 @@ def test_pdf_reports_use_arabic_font_and_brand_identity(report_type: str) -> Non
     assert b"/Title" in pdf
 
 
+def test_pdf_export_completes_when_brand_logo_is_unavailable(monkeypatch, tmp_path) -> None:
+    packaged_font = ras.BACKEND_DIR / "assets" / "fonts" / "Tajawal-Regular.ttf"
+    metadata = {
+        "date_basis": "orders.created_at plus successful payment/refund status",
+        "order_count": "1",
+        "eligible_order_count": "1",
+        "gross_revenue": "100.00",
+        "paid_amount": "100.00",
+        "refund_amount": "0.00",
+        "net_revenue": "100.00",
+        "currency_code": "YER",
+        "partner_scope": None,
+    }
+    monkeypatch.setattr(ras, "BACKEND_DIR", tmp_path)
+    monkeypatch.setattr(ras, "_pdf_arabic_font_candidates", lambda: (packaged_font,))
+
+    pdf = ras.ReportGenerationService._render_pdf("summary", [], ("metric", "value"), metadata)
+
+    assert pdf.startswith(b"%PDF")
+    assert len(pdf) > 5_000
+    assert b"/Title" in pdf
+
+
 @pytest.mark.asyncio
 async def test_order_activity_summary_includes_pending_and_supplemental_orders(monkeypatch) -> None:
     pending_order = SimpleNamespace(total="125.00", currency_code="YER")

@@ -35,6 +35,7 @@ from .services.api_protection import (
     sanitize_request_id,
     set_current_request_id,
 )
+from .services.audit_trail import reset_audit_request_context, set_audit_request_context
 from .services.public_read_cache import public_read_cache
 from .storage import FileStorage
 
@@ -600,6 +601,15 @@ def _error_content(request: Request, status_code: int, detail, *, code: str | No
         "request_id": request_id,
         "http_status": status_code,
     }
+
+
+@app.middleware("http")
+async def audit_request_context(request: Request, call_next):
+    context_token = set_audit_request_context(request)
+    try:
+        return await call_next(request)
+    finally:
+        reset_audit_request_context(context_token)
 
 
 @app.middleware("http")
