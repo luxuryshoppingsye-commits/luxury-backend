@@ -2834,7 +2834,7 @@ async def execute_function(
             await AIQuotaService(session).complete(ai_ledger_id, actual_tokens=0)
         return {"matches": [serialize_record(item) for item in products], "configured": True, "request_id": current_request_id()}
     product_assistant_action = _text(body, "action").lower()
-    if function_name == "ai-product-assistant" and product_assistant_action in {"analyze_image", "deep_analyze"}:
+    if function_name == "ai-product-assistant" and product_assistant_action in {"analyze_image", "deep_analyze", "search_similar"}:
         ai_ledger_id = await _reserve_ai_usage(
             function_name=function_name,
             body=body,
@@ -2848,10 +2848,27 @@ async def execute_function(
             await AIQuotaService(session).fail(ai_ledger_id, error_code_safe="product_image_url_required")
             raise HTTPException(400, "product_image_url_required")
 
-        from .image_search import deep_analyze_product_image
+        from .image_search import deep_analyze_product_image, search_catalog_image_url
 
         try:
-            structured_result = await deep_analyze_product_image(image_url)
+            if product_assistant_action == "search_similar":
+                search_result = await search_catalog_image_url(image_url, session)
+                matching_products = search_result.get("products")
+                matching_products = matching_products if isinstance(matching_products, list) else []
+                if matching_products:
+                    result_lines = [f"تم العثور على {len(matching_products)} منتج مشابه:"]
+                    for index, product in enumerate(matching_products[:8], start=1):
+                        if not isinstance(product, dict):
+                            continue
+                        product_name = _text(product, "name", "name_ar", "display_name", default="منتج")
+                        price = product.get("price")
+                        price_label = f" — {price} ر.ي" if price not in {None, ""} else ""
+                        result_lines.append(f"{index}. {product_name}{price_label}")
+                    result = "\n".join(result_lines)
+                else:
+                    result = "لم يتم العثور على منتجات مشابهة لهذه الصورة في الكتالوج حالياً."
+            else:
+                structured_result = await deep_analyze_product_image(image_url)
         except HTTPException as exc:
             detail = exc.detail
             error_code = detail.get("code") if isinstance(detail, dict) else str(detail)
@@ -2884,7 +2901,7 @@ async def execute_function(
                 if isinstance(values, list) and values:
                     analysis_lines.append(f"{label}: {', '.join(values)}")
             result: str | dict = "\n".join(analysis_lines)
-        else:
+        elif product_assistant_action == "deep_analyze":
             result = structured_result
 
         actual_tokens = max(1, (

@@ -783,13 +783,13 @@ def normalize_product_mutation_values(values: dict[str, Any], *, partial: bool =
             raise HTTPException(status_code=422, detail={"code": "invalid_sku", "message": "SKU is invalid"})
         else:
             normalized["sku"] = sku
-    for key in ("price", "original_price"):
+    for key in ("price", "original_price", "cost_price"):
         if key in normalized and normalized[key] is not None:
             try:
                 amount = Decimal(str(normalized[key]))
             except Exception:
                 raise HTTPException(status_code=422, detail={"code": f"invalid_{key}", "message": "Product price is invalid"})
-            if amount < 0 or amount > Decimal("999999999999.99"):
+            if amount < 0 or amount > Decimal("999999999999.99") or (key == "cost_price" and amount == 0):
                 raise HTTPException(status_code=422, detail={"code": f"invalid_{key}", "message": "Product price is invalid"})
             normalized[key] = amount.quantize(Decimal("0.01"))
     if "price" not in normalized and not partial:
@@ -797,6 +797,9 @@ def normalize_product_mutation_values(values: dict[str, Any], *, partial: bool =
     if "price" in normalized and "original_price" in normalized and normalized.get("original_price") is not None:
         if normalized["original_price"] < normalized.get("price", Decimal("0")):
             raise HTTPException(status_code=422, detail={"code": "invalid_original_price", "message": "Original price cannot be lower than price"})
+    if "price" in normalized and normalized.get("cost_price") is not None:
+        if normalized["cost_price"] >= normalized["price"]:
+            raise HTTPException(status_code=422, detail={"code": "invalid_cost_price", "message": "Purchase cost must be lower than sale price"})
     for key in ("stock_quantity", "min_stock_quantity"):
         if key in normalized and normalized[key] is not None:
             try:

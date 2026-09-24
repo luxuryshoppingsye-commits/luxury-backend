@@ -300,10 +300,12 @@ async def _gemini_image_json(encoded: str, prompt: str, *, error_code: str) -> d
             for model in models:
                 generation_config = {
                     "responseMimeType": "application/json",
-                    "maxOutputTokens": 1024,
+                    "maxOutputTokens": 2048,
                     "temperature": 0,
                 }
-                if isinstance(model, str) and model.startswith("gemini-2.5"):
+                if isinstance(model, str) and model.startswith("gemini-3"):
+                    generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
+                elif isinstance(model, str) and model.startswith("gemini-2.5"):
                     generation_config["thinkingConfig"] = {"thinkingBudget": 0}
                 try:
                     response = await client.post(
@@ -694,8 +696,7 @@ async def _rank_by_visual_similarity(
     return matches
 
 
-async def search_catalog_image(body: dict, session) -> dict:
-    encoded = _image_data(body)
+async def _search_catalog_encoded(encoded: str, session) -> dict:
     # Compare the uploaded image with catalog images before asking a vision
     # model to describe it. A model may return no words for a clean product
     # photo without visible text, but that must never prevent image matching.
@@ -768,3 +769,14 @@ async def search_catalog_image(body: dict, session) -> dict:
             "searchTerms": types,
         },
     }
+
+
+async def search_catalog_image(body: dict, session) -> dict:
+    """Search the catalogue with a browser-uploaded base64 image."""
+    return await _search_catalog_encoded(_image_data(body), session)
+
+
+async def search_catalog_image_url(image_url: str, session) -> dict:
+    """Search the catalogue with an already-uploaded public product image."""
+    encoded = await _image_data_from_public_url(image_url)
+    return await _search_catalog_encoded(encoded, session)

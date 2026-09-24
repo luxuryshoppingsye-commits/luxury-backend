@@ -254,6 +254,7 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
     rich_description: Mapped[str | None] = mapped_column(Text)
     price: Mapped[Decimal] = mapped_column(MONEY, nullable=False, server_default="0")
     original_price: Mapped[Decimal | None] = mapped_column(MONEY)
+    cost_price: Mapped[Decimal | None] = mapped_column(MONEY)
     currency_code: Mapped[str] = mapped_column(String(8), server_default="YER")
     stock_quantity: Mapped[int] = mapped_column(Integer, server_default="0", index=True)
     min_stock_quantity: Mapped[int] = mapped_column(Integer, server_default="0")
@@ -285,6 +286,14 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
         CheckConstraint("stock_quantity >= 0", name="ck_products_stock_nonnegative"),
         Index("ix_products_catalog", "is_active", "approval_status", "category_id"),
     )
+
+
+class PartnerProductDraft(Base, TimestampMixin):
+    __tablename__ = "partner_product_drafts"
+    partner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
 
 
 _PRODUCT_SHORT_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"

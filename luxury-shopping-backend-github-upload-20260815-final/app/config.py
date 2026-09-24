@@ -154,7 +154,7 @@ class Settings(BaseSettings):
     ai_api_key: str = Field("", alias="AI_API_KEY")
     gemini_api_key: str = Field("", alias="GEMINI_API_KEY")
     google_api_key: str = Field("", alias="GOOGLE_API_KEY")
-    ai_provider_name: str = Field("configured_ai_provider", alias="AI_PROVIDER_NAME")
+    ai_provider_name: str = Field("gemini", alias="AI_PROVIDER_NAME")
     ai_default_model: str = Field("default", alias="AI_DEFAULT_MODEL")
     ai_model_allowlist: str = Field("default", alias="AI_MODEL_ALLOWLIST")
     image_ai_enhancement_enabled: bool = Field(True, alias="IMAGE_AI_ENHANCEMENT_ENABLED")

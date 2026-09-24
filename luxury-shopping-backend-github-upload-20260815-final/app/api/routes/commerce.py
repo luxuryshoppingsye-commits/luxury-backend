@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...database import get_session
@@ -29,6 +30,7 @@ from ...models.domain import (
     Order,
     OrderItem,
     Profile,
+    PartnerProductDraft,
     Product,
     ProductVariant,
     User,
@@ -2091,6 +2093,33 @@ async def _load_catalog_image_variant(
     return data, media_type, f'"{hashlib.sha256(data).hexdigest()}"'
 
 
+async def _load_catalog_image_fingerprint(relative: str) -> tuple[str, str | None]:
+    """Read immutable image metadata without downloading the image body."""
+    upstream_host = "luxuryshoppings.com" if relative.lower().startswith("assets/") else "images.luxuryshoppings.com"
+    source = f"https://{upstream_host}/{relative}"
+    try:
+        client = start_catalog_image_proxy()
+        upstream = await client.head(source)
+        if upstream.status_code != 200:
+            raise HTTPException(status_code=404, detail="image_not_found")
+        declared_size = int(upstream.headers.get("content-length") or 0)
+        if declared_size > MAX_CATALOG_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="image_too_large")
+        media_type = str(upstream.headers.get("content-type") or "image/webp").split(";", 1)[0].strip()
+        if not media_type.lower().startswith("image/"):
+            raise HTTPException(status_code=502, detail="image_invalid")
+        checksum = str(
+            upstream.headers.get("x-amz-meta-sha256")
+            or upstream.headers.get("etag")
+            or ""
+        ).strip()
+        return media_type, checksum or None
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, OSError, ValueError) as error:
+        raise HTTPException(status_code=502, detail="image_upstream_unavailable") from error
+
+
 def _catalog_image_mime(data: bytes) -> str | None:
     if data.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
@@ -2207,6 +2236,23 @@ async def catalog_brand_logo(file_id: uuid.UUID, session: AsyncSession = Depends
     if not target.is_file():
         raise HTTPException(status_code=404, detail="brand_logo_not_found")
     return Response(target.read_bytes(), media_type=asset.content_type, headers=response_headers)
+
+
+@router.head("/catalog/image-proxy/{image_path:path}")
+async def catalog_image_proxy_head(image_path: str):
+    """Expose the immutable object fingerprint for gallery de-duplication."""
+    relative = str(image_path or "").replace("\\", "/").lstrip("/")
+    if not relative or ".." in Path(relative).parts:
+        raise HTTPException(status_code=404, detail="image_not_found")
+    media_type, etag = await _load_catalog_image_fingerprint(relative)
+    headers = {
+        "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+        "X-Image-Cache": "METADATA",
+    }
+    if etag:
+        headers["ETag"] = etag
+    return Response(status_code=200, media_type=media_type, headers=headers)
 
 
 @router.get("/catalog/image-proxy/{image_path:path}")
@@ -3075,7 +3121,10 @@ async def api_delete_partner_request(
         raise HTTPException(status_code=404, detail="partner_request_not_found")
     if row.deleted_at is not None or str(row.status or "").lower() == "deleted":
         return {"ok": True, "already_deleted": True}
-    if str(row.status or "pending").lower() not in _PARTNER_REQUEST_EDITABLE_STATUSES:
+    status = str(row.status or "pending").lower()
+    if _partner_request_payload(row)["request_type"] == "restock" and status != "pending":
+        raise HTTPException(status_code=409, detail="partner_request_locked")
+    if status not in _PARTNER_REQUEST_EDITABLE_STATUSES:
         raise HTTPException(status_code=409, detail="partner_request_locked")
     row.deleted_at = datetime.now(timezone.utc)
     row.status = "deleted"
@@ -4454,6 +4503,87 @@ async def manage_products(
     products = list(result.scalars())
     return await _serialize_manage_products(session, products)
 
+
+def _partner_draft_payload(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict) or set(body) != {"formData", "productImages", "arImageUrl"}:
+        raise HTTPException(status_code=422, detail="invalid_product_draft")
+    form = body["formData"]
+    images = body["productImages"]
+    ar_image = body["arImageUrl"]
+    allowed_fields = {
+        "name", "description", "price", "originalPrice", "costPrice", "sku", "stockQuantity",
+        "categoryId", "brandId", "tags", "metaTitle", "metaDescription",
+        "promotionalTitle", "richDescription",
+    }
+    if not isinstance(form, dict) or set(form) - allowed_fields:
+        raise HTTPException(status_code=422, detail="invalid_product_draft")
+    for key, value in form.items():
+        if key == "tags":
+            if not isinstance(value, list) or len(value) > 30 or any(not isinstance(tag, str) or len(tag) > 100 for tag in value):
+                raise HTTPException(status_code=422, detail="invalid_product_draft")
+        elif not isinstance(value, str) or len(value) > 20000:
+            raise HTTPException(status_code=422, detail="invalid_product_draft")
+    if not isinstance(images, list) or len(images) > 10 or any(not isinstance(image, str) or len(image) > 2048 for image in images):
+        raise HTTPException(status_code=422, detail="invalid_product_draft")
+    if not isinstance(ar_image, str) or len(ar_image) > 2048:
+        raise HTTPException(status_code=422, detail="invalid_product_draft")
+    if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) > 131072:
+        raise HTTPException(status_code=413, detail="product_draft_too_large")
+    return body
+
+
+@router.get("/api/partner/product-schema")
+async def partner_product_schema(roles: set[str] = Depends(user_roles)):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_access_required")
+    return {"data": {"cost_price": True}}
+
+
+@router.get("/api/partner/product-draft")
+async def partner_product_draft(
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_access_required")
+    draft = await session.get(PartnerProductDraft, user.id)
+    return {"data": {**draft.payload, "updatedAt": draft.updated_at.isoformat()} if draft else None}
+
+
+@router.put("/api/partner/product-draft")
+async def save_partner_product_draft(
+    request: Request,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_access_required")
+    payload = _partner_draft_payload(await request.json())
+    statement = insert(PartnerProductDraft).values(partner_id=user.id, payload=payload)
+    statement = statement.on_conflict_do_update(
+        index_elements=[PartnerProductDraft.partner_id],
+        set_={"payload": payload, "updated_at": func.now()},
+    )
+    await session.execute(statement)
+    await session.commit()
+    draft = await session.get(PartnerProductDraft, user.id)
+    return {"data": {**draft.payload, "updatedAt": draft.updated_at.isoformat()}}
+
+
+@router.delete("/api/partner/product-draft")
+async def remove_partner_product_draft(
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_access_required")
+    await session.execute(delete(PartnerProductDraft).where(PartnerProductDraft.partner_id == user.id))
+    await session.commit()
+    return {"ok": True}
+
 @router.get("/manage/brands")
 async def manage_brands(
     limit: int = Query(500, ge=1, le=1000),
@@ -4589,7 +4719,7 @@ async def catalog_admin_products(
 def _product_values(body: dict[str, Any], user: User, roles: set[str], *, partial: bool) -> dict[str, Any]:
     mapping = {
         "name": "name", "nameEn": "name_en", "sku": "sku", "description": "description",
-        "richDescription": "rich_description", "price": "price", "originalPrice": "original_price",
+        "richDescription": "rich_description", "price": "price", "originalPrice": "original_price", "costPrice": "cost_price",
         "currencyCode": "currency_code", "stockQuantity": "stock_quantity", "minStockQuantity": "min_stock_quantity",
         "trackInventory": "track_inventory", "isActive": "is_active", "isFeatured": "is_featured",
         "approvalStatus": "approval_status", "approvalNotes": "approval_notes", "categoryId": "category_id",
@@ -4598,7 +4728,7 @@ def _product_values(body: dict[str, Any], user: User, roles: set[str], *, partia
         "metaDescription": "meta_description", "promotionalTitle": "promotional_title",
         # The React admin client uses the database-style snake_case names.
         # Keep both contracts valid so create/update behave identically.
-        "name_en": "name_en", "rich_description": "rich_description", "original_price": "original_price",
+        "name_en": "name_en", "rich_description": "rich_description", "original_price": "original_price", "cost_price": "cost_price",
         "currency_code": "currency_code", "stock_quantity": "stock_quantity", "min_stock_quantity": "min_stock_quantity",
         "track_inventory": "track_inventory", "is_active": "is_active", "is_featured": "is_featured",
         "approval_status": "approval_status", "approval_notes": "approval_notes", "category_id": "category_id",

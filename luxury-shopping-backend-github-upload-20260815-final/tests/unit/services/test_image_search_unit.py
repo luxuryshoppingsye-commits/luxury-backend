@@ -254,6 +254,30 @@ async def test_provider_receives_actual_image_bytes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gemini_three_image_analysis_uses_low_thinking_and_enough_output(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(
+        gemini_api_key="test-key", google_api_key="", ai_api_key="",
+        ai_api_url="", ai_default_model="gemini-3.8-flash",
+        ai_model_allowlist="gemini-3.8-flash", ai_request_timeout_seconds=10))
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, headers, json):
+            config = json["generationConfig"]
+            assert config["thinkingConfig"] == {"thinkingLevel": "low"}
+            assert config["maxOutputTokens"] == 2048
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+                "candidates": [{"content": {"parts": [{"text": '{"typeTerms": ["dress"], "attributes": []}'}]}}]})
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", Client)
+    result = await service._describe_image(service._image_data(image_body()))
+
+    assert result["typeTerms"] == ["dress"]
+
+
+@pytest.mark.asyncio
 async def test_provider_falls_back_to_available_model_and_fenced_json(monkeypatch):
     monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(
         gemini_api_key="test-key", google_api_key="", ai_api_key="",
@@ -423,3 +447,60 @@ async def test_product_assistant_analyze_image_returns_displayable_summary(monke
     assert "الألوان: بني" in result
     assert "المميزات: تصميم عملي" in result
     analyzer.assert_awaited_once_with("https://images.example.test/product.jpg")
+
+
+@pytest.mark.asyncio
+async def test_product_assistant_search_similar_uses_uploaded_image_url(monkeypatch):
+    from backend.app.services import function_service
+
+    searcher = AsyncMock(return_value={
+        "products": [
+            {"name": "حقيبة مشابهة", "price": 12500},
+            {"name": "حقيبة يومية", "price": 9800},
+        ],
+    })
+    monkeypatch.setattr(service, "search_catalog_image_url", searcher)
+    monkeypatch.setattr(function_service, "roles_for", AsyncMock(return_value=["admin"]))
+    monkeypatch.setattr(function_service, "_reserve_ai_usage", AsyncMock(return_value="ledger"))
+
+    class Quota:
+        def __init__(self, session): pass
+        async def complete(self, ledger_id, *, actual_tokens):
+            assert ledger_id == "ledger"
+            assert actual_tokens > 0
+        async def fail(self, ledger_id, *, error_code_safe): raise AssertionError(error_code_safe)
+
+    monkeypatch.setattr(function_service, "AIQuotaService", Quota)
+    session = SimpleNamespace()
+    result = await function_service.execute_function(
+        "ai-product-assistant",
+        {"action": "search_similar", "imageUrl": "https://images.example.test/product.jpg"},
+        SimpleNamespace(id="user-id"),
+        session,
+        SimpleNamespace(),
+    )
+
+    assert "حقيبة مشابهة" in result
+    assert "12,500 ر.ي" not in result
+    assert "12500 ر.ي" in result
+    searcher.assert_awaited_once_with(
+        "https://images.example.test/product.jpg",
+        session,
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_url_search_downloads_then_reuses_catalog_search(monkeypatch):
+    encoded = service._image_data(image_body())
+    monkeypatch.setattr(service, "_image_data_from_public_url", AsyncMock(return_value=encoded))
+    catalog_search = AsyncMock(return_value={"success": True, "products": []})
+    monkeypatch.setattr(service, "_search_catalog_encoded", catalog_search)
+    session = SimpleNamespace()
+
+    result = await service.search_catalog_image_url(
+        "https://images.example.test/product.jpg",
+        session,
+    )
+
+    assert result == {"success": True, "products": []}
+    catalog_search.assert_awaited_once_with(encoded, session)
