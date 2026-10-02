@@ -1856,8 +1856,6 @@ class CampaignService:
             **(row.extra_data or {}),
         }
         normalized = self._normalize_body({**existing, **body})
-        if row.status in {"completed", "cancelled"}:
-            raise HTTPException(status_code=409, detail="campaign_not_editable")
         row.title = normalized["title"]
         row.message = normalized["message"]
         row.status = str(body.get("status") or ("scheduled" if normalized["scheduled_at"] else "queued"))

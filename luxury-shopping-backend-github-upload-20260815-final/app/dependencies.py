@@ -52,6 +52,16 @@ async def current_user(user: User | None = Depends(optional_user)) -> User:
     return user
 
 
+async def current_bearer_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    session: AsyncSession = Depends(get_session),
+) -> User:
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication_required")
+    user = await optional_user(credentials=credentials, session=session)
+    return await current_user(user)
+
+
 async def user_roles(
     user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),

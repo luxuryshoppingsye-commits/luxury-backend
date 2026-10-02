@@ -334,5 +334,11 @@ class PhoneOtpSendRequest(BaseModel):
         return normalized
 
 
+class AccountDeletionRequestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, strict=True)
+
+
 class PhoneOtpVerifyRequest(PhoneOtpSendRequest):
     otp: str = Field(min_length=4, max_length=12)

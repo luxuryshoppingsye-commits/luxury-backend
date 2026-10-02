@@ -8,19 +8,19 @@ import uuid
 from collections import OrderedDict
 from io import BytesIO
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, literal, or_, select, text, union_all
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...database import get_session
-from ...dependencies import current_user, optional_user, require_staff, user_roles
+from ...dependencies import current_bearer_user, current_user, optional_user, require_staff, user_roles
 from ...config import get_settings
 from ...models import MODEL_BY_TABLE
 from ...models.domain import (
@@ -1628,6 +1628,8 @@ async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dic
     rows = [serialize_record(row) for row in result.scalars()]
     if rows:
         return {"data": rows}
+    if (await session.execute(select(model.__table__.c.id).limit(1))).first() is not None:
+        return {"data": []}
     # Keep the customer currency selector usable on a fresh deployment before
     # the administrator has populated the currency table. These defaults match
     # the project's built-in currency configuration.
@@ -2767,6 +2769,107 @@ async def _serialize_orders_with_financials(session: AsyncSession, orders: list[
         payload.setdefault("shipping_cost", payload.get("shipping_total", "0"))
     await _attach_courier_assignments(session, orders, payloads)
     return payloads
+
+
+@router.get("/orders/counts")
+@router.get("/api/orders/counts")
+async def customer_order_counts(
+    user: User = Depends(current_bearer_user),
+    session: AsyncSession = Depends(get_session),
+):
+    # Match the mobile profile: merge the three sources, then count the latest
+    # 20 customer orders. Keep ownership in each branch, even for staff users.
+    sources = []
+    for source, model in (
+        ("store", Order),
+        ("local", MODEL_BY_TABLE["local_shopping_requests"]),
+        ("international", MODEL_BY_TABLE["international_orders"]),
+    ):
+        sources.append(select(
+            model.id, model.status, model.created_at, model.extra_data,
+            (model.payment_status if source == "store" else literal(None)).label("payment_status"),
+            (model.total if source == "store" else model.amount).label("total"),
+            literal(source).label("source"),
+        ).where(model.user_id == user.id, model.deleted_at.is_(None)))
+    merged = union_all(*sources).subquery()
+    rows = (await session.execute(
+        select(merged).order_by(merged.c.created_at.desc().nulls_last(), merged.c.id).limit(20)
+    )).mappings().all()
+
+    # /orders derives confirmed payments from both existing ledgers. Only
+    # load payment totals for the small, visible store-order subset.
+    store_ids = [row["id"] for row in rows if row["source"] == "store"]
+    paid_by_order: dict[uuid.UUID, Decimal] = {}
+    if store_ids:
+        for table_name in ("order_payments", "payments"):
+            payment_model = MODEL_BY_TABLE[table_name]
+            paid_rows = (await session.execute(
+                select(payment_model.order_id, func.coalesce(func.sum(payment_model.amount), 0))
+                .where(
+                    payment_model.order_id.in_(store_ids),
+                    payment_model.deleted_at.is_(None),
+                    func.lower(payment_model.status).in_(("confirmed", "approved", "paid", "completed")),
+                ).group_by(payment_model.order_id)
+            )).all()
+            for order_id, paid in paid_rows:
+                paid_by_order[order_id] = paid_by_order.get(order_id, Decimal("0")) + _dashboard_number(paid)
+
+    counts = dict.fromkeys(("unpaid", "processing", "shipped", "review", "returns"), 0)
+    for row in rows:
+        status = str(row["status"] or ("" if row["source"] == "store" else "pending")).strip().lower()
+        if not status and row["source"] != "store":
+            status = "pending"
+        payment = _dashboard_payment_status(row, paid_by_order)
+        counts["unpaid"] += payment in {"", "unpaid", "pending_payment", "waiting_customer_payment"}
+        counts["processing"] += status in {"new", "pending", "processing", "processed"}
+        counts["shipped"] += status in {"shipping", "shipped", "in_transit", "delivering", "delivered", "completed"}
+        counts["review"] += status in {"delivered", "completed"}
+        counts["returns"] += status in {"returning", "returned", "refunded"}
+    return {"data": counts}
+
+
+def _dashboard_number(value: Any) -> Decimal:
+    try:
+        number = Decimal(str(value))
+        return number if number.is_finite() else Decimal("0")
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _dashboard_payment_status(row: Any, paid_by_order: dict[uuid.UUID, Decimal]) -> str:
+    """Use the same source-specific normalization as mobile AppOrder factories."""
+    extra = row["extra_data"] if isinstance(row["extra_data"], dict) else {}
+    if row["source"] == "store":
+        payment = str(row["payment_status"] or "").strip().lower()
+        paid = max(paid_by_order.get(row["id"], Decimal("0")), _dashboard_number(extra.get("paid_amount")))
+        if paid > 0 and payment not in {"refunded", "partial_refund", "partially_refunded"}:
+            total = _dashboard_number(row["total"])
+            return "paid" if total > 0 and paid >= total else "partial"
+        return payment
+
+    raw = extra.get("payment_status")
+    if raw is None:
+        raw = extra.get("paymentStatus")
+    if row["source"] == "international":
+        return str(raw or "unpaid").strip().lower() or "unpaid"
+
+    if raw is None:
+        raw = extra.get("payment")
+    payment = str(raw or "").strip().lower()
+    totals = (extra.get("final_price"), extra.get("finalPrice"), row["total"], extra.get("total"),
+              extra.get("estimated_price"), extra.get("estimatedAmount"))
+    total = next((number for value in totals if (number := _dashboard_number(value)) > 0), Decimal("0"))
+    raw_paid = next((extra[key] for key in ("paid_amount", "paidAmount", "paid") if extra.get(key) is not None), None)
+    paid = _dashboard_number(raw_paid)
+    if (paid > 0 and total > 0 and paid >= total) or payment in {"paid", "payment_approved", "approved", "completed"}:
+        return "paid"
+    if paid > 0 or payment in {"partial", "partially_paid"}:
+        return "partial"
+    if payment in {"pending", "under_review", "manual_review"}:
+        return "pending"
+    if payment in {"rejected", "refunded", "partial_refund", "partially_refunded"}:
+        return payment
+    return "unpaid"
 
 
 @router.get("/orders")
@@ -4217,6 +4320,9 @@ async def change_order_status(
 ):
     if not roles.intersection({"admin", "manager", "logistics", "staff", "employee", "courier", "delivery"}):
         raise HTTPException(status_code=403, detail="insufficient_permissions")
+    courier_actor = bool(roles.intersection({"courier", "delivery"}) and not roles.intersection({"admin", "manager", "logistics", "staff", "employee"}))
+    if not courier_actor:
+        await require_staff_permission(session, user.id, roles, "orders.update")
     body = await request.json()
     next_status = str(body.get("nextStatus") or body.get("status") or "").strip()
     if not next_status:
@@ -4225,7 +4331,6 @@ async def change_order_status(
     order = result.scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="order_not_found")
-    courier_actor = bool(roles.intersection({"courier", "delivery"}) and not roles.intersection({"admin", "manager", "logistics", "staff", "employee"}))
     if courier_actor:
         assignment_model = MODEL_BY_TABLE["courier_assignments"]
         courier_assignments = list(
@@ -4317,6 +4422,7 @@ async def rollback_order_status(
     """Revert only the latest status event through an audited admin action."""
     if not roles.intersection({"admin", "manager"}):
         raise HTTPException(status_code=403, detail="admin_rollback_required")
+    await require_staff_permission(session, user.id, roles, "orders.update")
     order = (
         await session.execute(select(Order).where(Order.id == order_id).with_for_update())
     ).scalar_one_or_none()
@@ -4803,6 +4909,19 @@ async def create_product(request: Request, user: User = Depends(current_user), r
         )
     await session.commit()
     return serialize_record(product)
+
+
+@router.post("/api/partner/products", status_code=201)
+async def create_partner_product(
+    request: Request,
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_access_required")
+    # This route is explicitly a merchant submission, even for a user who also has an admin role.
+    return await create_product(request, user, {"partner"}, session)
 
 
 @router.patch("/manage/products/bulk-active")

@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.api.routes import auth as auth_routes
+from app.api.routes import operations as operations_routes
 from app.config import get_settings
 from app.database import SessionFactory
 from app.main import app
@@ -833,7 +834,7 @@ async def test_concurrent_duplicate_customer_registration_creates_one_user_and_r
             assert int(count.scalar_one()) == 1
 
 
-async def test_merchant_registration_stays_pending_until_admin_review() -> None:
+async def test_merchant_registration_stays_pending_until_admin_review(monkeypatch: pytest.MonkeyPatch) -> None:
     _assert_safe_database()
     run_id = f"merchant-{uuid.uuid4().hex[:8]}"
     admin, admin_password = await _seed_user(run_id, role="admin")
@@ -854,6 +855,7 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
             json={
                 "ownerName": "Merchant Owner",
                 "storeName": "Pending Store",
+                "storeCategories": ["fashion"],
             },
         )
         assert pending.status_code == 201, pending.text
@@ -890,7 +892,7 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
         duplicate_pending = await client.post(
             "/auth/register-merchant",
             headers={"Authorization": merchant_headers},
-            json={"storeName": "Second Pending Store"},
+            json={"storeName": "Second Pending Store", "storeCategories": ["fashion"]},
         )
         assert duplicate_pending.status_code == 409, duplicate_pending.text
         assert duplicate_pending.json()["detail"] == "merchant_application_exists"
@@ -908,6 +910,59 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
         assert "customer" in merchant_login.json()["roles"]
         assert "partner" in merchant_login.json()["roles"]
 
+        async def fail_post_review_delivery(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("simulated post-review delivery failure")
+
+        with monkeypatch.context() as delivery_failure:
+            delivery_failure.setattr(
+                operations_routes.NotificationService,
+                "create_notification",
+                fail_post_review_delivery,
+            )
+            changed_to_rejected = await client.post(
+                f"/admin/partner-applications/{application_id}/review",
+                headers={"Authorization": admin_tokens["header"]},
+                json={"status": "rejected", "reason": "بيانات المتجر تحتاج إلى تحديث"},
+            )
+        assert changed_to_rejected.status_code == 200, changed_to_rejected.text
+        assert changed_to_rejected.json()["application"]["status"] == "rejected"
+        rejected_merchant_login = await client.post(
+            "/auth/login",
+            json={"email": merchant_email, "password": "ValidPass123"},
+        )
+        assert rejected_merchant_login.status_code == 403, rejected_merchant_login.text
+        assert rejected_merchant_login.json()["detail"] == "merchant_rejected"
+
+        async with SessionFactory() as session:
+            storefront_model = MODEL_BY_TABLE["partner_storefronts"]
+            session.add(
+                storefront_model(
+                    user_id=merchant.id,
+                    partner_id=merchant.id,
+                    name="بوتيك الأزياء - فرع صنعاء",
+                    email=merchant_email,
+                    phone="777123457",
+                    status="inactive",
+                    is_active=False,
+                )
+            )
+            await session.commit()
+
+        changed_back_to_approved = await client.post(
+            f"/admin/partner-applications/{application_id}/review",
+            headers={"Authorization": admin_tokens["header"]},
+            json={"status": "approved"},
+        )
+        assert changed_back_to_approved.status_code == 200, changed_back_to_approved.text
+        assert changed_back_to_approved.json()["application"]["status"] == "approved"
+        reapproved_merchant_login = await client.post(
+            "/auth/login",
+            json={"email": merchant_email, "password": "ValidPass123"},
+        )
+        assert reapproved_merchant_login.status_code == 200, reapproved_merchant_login.text
+        assert "customer" in reapproved_merchant_login.json()["roles"]
+        assert "partner" in reapproved_merchant_login.json()["roles"]
+
         rejected, rejected_password = await _seed_user(f"{run_id}-reject", role="customer")
         async with SessionFactory() as session:
             rejected_profile = await session.get(Profile, rejected.id)
@@ -922,6 +977,7 @@ async def test_merchant_registration_stays_pending_until_admin_review() -> None:
             json={
                 "ownerName": "Rejected Owner",
                 "storeName": "Rejected Store",
+                "storeCategories": ["fashion"],
             },
         )
         assert rejected.status_code == 201

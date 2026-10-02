@@ -11,8 +11,8 @@ import shutil
 import subprocess
 import uuid
 import zipfile
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...config import BACKEND_DIR, get_settings
 from ...database import SessionFactory, get_session
-from ...dependencies import bearer, current_user, optional_user, require_admin, require_courier, require_marketer, require_partner, require_staff, user_roles
+from ...dependencies import bearer, current_bearer_user, current_user, optional_user, require_admin, require_courier, require_marketer, require_partner, require_staff, user_roles
 from ...models import MODEL_BY_TABLE, RESOURCE_TABLES
 from ...models.domain import FileAsset, Order, OrderItem, Product, ProductVariant, Profile, User, UserRole
 from ...repositories.resources import (
@@ -144,6 +144,7 @@ from ...services.report_admin_services import (
     BootstrapVisibilityService,
     CampaignService,
     COURIER_ACTIVE_STATUSES,
+    EXCLUDED_ORDER_STATUSES,
     CourierLocationService,
     FormSettingsPersistenceService,
     LoyaltyTierService,
@@ -2598,6 +2599,64 @@ async def list_partner_coupons(
     return {"data": [serialize_record(row) for row in rows]}
 
 
+@router.get("/coupons")
+@router.get("/api/coupons")
+async def customer_coupons(
+    user: User = Depends(current_bearer_user),
+    session: AsyncSession = Depends(get_session),
+):
+    now = datetime.now(timezone.utc)
+    model = MODEL_BY_TABLE["coupons"]
+    scope = model.extra_data["scope"].astext
+    owner_id = func.coalesce(
+        model.extra_data["user_id"].astext,
+        model.extra_data["exclusive_user_id"].astext,
+    )
+    rows = (
+        await session.execute(
+            select(model)
+            .where(
+                model.is_active.is_(True),
+                model.deleted_at.is_(None),
+                or_(model.expires_at.is_(None), model.expires_at >= now),
+                or_(scope == "public", and_(scope == "user", owner_id == str(user.id))),
+            )
+            .order_by(model.created_at.desc())
+        )
+    ).scalars().all()
+    data = []
+    for row in rows:
+        extra = dict(row.extra_data or {})
+        try:
+            valid_from = _coupon_datetime(extra.get("valid_from"), "valid_from")
+            valid_until = (
+                _coupon_datetime(extra.get("valid_until"), "valid_until")
+                or _coupon_datetime(row.expires_at, "valid_until")
+            )
+        except HTTPException:
+            continue
+        if (valid_from and valid_from > now) or (valid_until and valid_until < now):
+            continue
+        data.append({
+            "id": str(row.id),
+            "code": row.code,
+            "title": extra.get("title") or row.title,
+            "description": extra.get("description"),
+            "discount_type": extra.get("discount_type") or "fixed",
+            "discount_value": extra.get("discount_value", float(row.amount or 0)),
+            "min_order_amount": extra.get("min_order_amount", extra.get("minimum_order_amount", 0)),
+            "max_discount": extra.get("max_discount", extra.get("maximum_discount")),
+            "valid_from": valid_from.isoformat() if valid_from else None,
+            "valid_until": valid_until.isoformat() if valid_until else None,
+            "is_active": True,
+            "scope": extra["scope"],
+            "user_id": (extra.get("user_id") or extra.get("exclusive_user_id")) if extra["scope"] == "user" else None,
+            "usage_limit": extra.get("usage_limit", extra.get("max_uses")),
+            "used_count": extra.get("used_count", extra.get("current_uses", 0)),
+        })
+    return {"data": data}
+
+
 @router.get("/api/catalog/products/{product_id}/coupons")
 async def public_product_coupons(
     product_id: str,
@@ -2935,7 +2994,19 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
         if role is None:
             session.add(UserRole(user_id=application.user_id, role="partner"))
         storefront_model = MODEL_BY_TABLE["partner_storefronts"]
-        storefront_result = await session.execute(select(storefront_model).where(storefront_model.partner_id == application.user_id))
+        storefront_result = await session.execute(
+            select(storefront_model)
+            .where(
+                or_(
+                    storefront_model.user_id == application.user_id,
+                    storefront_model.partner_id == application.user_id,
+                ),
+                storefront_model.deleted_at.is_(None),
+            )
+            .order_by(storefront_model.updated_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
         storefront = storefront_result.scalar_one_or_none()
         if storefront is None:
             storefront = storefront_model(
@@ -3007,51 +3078,82 @@ async def review_partner_application(application_id: uuid.UUID, request: Request
                 rejected_user.is_active = False
                 account_state.account_status = "merchant_rejected"
                 account_state.disabled_at = application.reviewed_at
-                await revoke_all_refresh_tokens(session, rejected_user.id, now=application.reviewed_at)
             if "partner" in current_roles:
                 role = await session.get(UserRole, {"user_id": rejected_user.id, "role": "partner"})
                 if role is not None:
                     await session.delete(role)
             await bump_security_version(session, rejected_user, reason="merchant_rejected", request=request)
-    if application.user_id:
+    # Persist the account, role, storefront and contract transition first. Push
+    # delivery and legacy session cleanup are supporting work and must not make
+    # the administrator see a failed review after the state change succeeded.
+    await session.commit()
+    reviewed_application_id = application.id
+    reviewed_user_id = application.user_id
+    reviewed_at = application.reviewed_at
+    application_payload = serialize_record(application)
+    if reviewed_user_id:
         title = "تمت الموافقة على طلب متجرك" if status == "approved" else "نعتذر عن عدم الموافقة على طلب متجرك"
         message = (
             "تمت الموافقة على طلب متجرك. افتح التطبيق واقبل اتفاقية التاجر لبدء تجهيز متجرك."
             if status == "approved"
             else f"نعتذر، تعذرت الموافقة على طلب متجرك. السبب: {reason}"
         )
-        await NotificationService(session).create_notification(
-            NotificationPayload(
-                user_id=application.user_id,
-                title=title,
-                body=message,
-                notification_type=f"partner_application_{status}",
-                category="partner",
-                priority="high",
-                entity_type="partner_applications",
-                entity_id=str(application.id),
-                payload=(
-                    {
-                        "title_en": "Your merchant application was approved",
-                        "body_en": "Your merchant account is ready. Review and accept the merchant agreement to continue.",
-                        "deep_link": "/partner/agreement?required=1",
-                    }
-                    if status == "approved"
-                    else {
-                        "title_en": "Your merchant application was rejected",
-                        "body_en": "Your merchant application was not approved. Review the reason and submit a new request when it is resolved.",
-                        "deep_link": "/join",
-                        "rejectionReason": reason,
-                    }
-                ),
-                created_by=admin.id,
-                deduplication_key=f"partner-application-review:{application.id}:{status}",
-                delivery_channels=("in_app", "mobile_push", "web_push"),
+        try:
+            if status == "rejected":
+                await revoke_all_refresh_tokens(session, reviewed_user_id, now=reviewed_at)
+            await NotificationService(session).create_notification(
+                NotificationPayload(
+                    user_id=reviewed_user_id,
+                    title=title,
+                    body=message,
+                    notification_type=f"partner_application_{status}",
+                    category="partner",
+                    priority="high",
+                    entity_type="partner_applications",
+                    entity_id=str(reviewed_application_id),
+                    payload=(
+                        {
+                            "title_en": "Your merchant application was approved",
+                            "body_en": "Your merchant account is ready. Review and accept the merchant agreement to continue.",
+                            "deep_link": "/partner/agreement?required=1",
+                        }
+                        if status == "approved"
+                        else {
+                            "title_en": "Your merchant application was rejected",
+                            "body_en": "Your merchant application was not approved. Review the reason and submit a new request when it is resolved.",
+                            "deep_link": "/join",
+                            "rejectionReason": reason,
+                        }
+                    ),
+                    created_by=admin.id,
+                    deduplication_key=(
+                        f"partner-application-review:{reviewed_application_id}:{status}:"
+                        f"{reviewed_at.isoformat()}"
+                    ),
+                    delivery_channels=("in_app", "mobile_push", "web_push"),
+                )
             )
-        )
-    await session.commit()
-    approved_user = await session.get(User, application.user_id) if application.user_id else None
-    return {"application": serialize_record(application), "auth": await auth_payload(session, approved_user, issue_tokens=False) if approved_user else None}
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "Partner application %s changed to %s, but post-review delivery failed",
+                reviewed_application_id,
+                status,
+            )
+    approved_user = await session.get(User, reviewed_user_id) if reviewed_user_id else None
+    auth = None
+    if approved_user is not None:
+        try:
+            auth = await auth_payload(session, approved_user, issue_tokens=False)
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "Partner application %s changed to %s, but the response auth snapshot failed",
+                reviewed_application_id,
+                status,
+            )
+    return {"application": application_payload, "auth": auth}
 
 
 @router.get("/admin/customers")
@@ -3064,7 +3166,7 @@ async def admin_customers(
     return await AdminCustomerAccessService.list_customers(session, roles=roles, limit=limit, full=True)
 
 
-@router.get("/api/admin/account-deletion-requests")
+@router.get("/api/admin/account-deletion-requests", dependencies=[Depends(current_bearer_user)])
 async def admin_account_deletion_requests(
     status: str = Query("pending"),
     limit: int = Query(200, ge=1, le=1000),
@@ -3096,6 +3198,7 @@ async def admin_account_deletion_requests(
         data.append(
             {
                 **serialize_record(deletion_request),
+                "user_email": user.email,
                 "user": {
                     "id": str(user.id),
                     "email": user.email,
@@ -3859,6 +3962,114 @@ async def api_admin_stats(staff: User = Depends(require_staff), session: AsyncSe
     return {"data": counts}
 
 
+_DASHBOARD_MONTHLY_TARGET_KEY = "admin_dashboard_monthly_target"
+
+
+async def _admin_currency_context(session: AsyncSession) -> tuple[dict[str, Decimal], dict[str, Any]]:
+    currency_rows = [serialize_record(row) for row in await _rows(session, "currencies", limit=500)]
+    active = {
+        str(row.get("code") or "").upper(): row
+        for row in currency_rows
+        if row.get("is_active") is True and row.get("deleted_at") is None
+    }
+    selected = next((row for row in active.values() if row.get("is_default") is True), None)
+    if selected is None:
+        raise HTTPException(status_code=503, detail="admin_default_currency_not_configured")
+    rates: dict[str, Decimal] = {}
+    for code, row in active.items():
+        try:
+            rate = Decimal(str(row.get("exchange_rate")))
+        except (ValueError, TypeError, ArithmeticError):
+            continue
+        if rate.is_finite() and rate > 0:
+            rates[code] = rate
+    if str(selected["code"]).upper() not in rates:
+        raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{selected['code']}")
+    return rates, selected
+
+
+def _admin_convert_amount(amount: Any, currency: Any, rates: dict[str, Decimal], target_code: str) -> Decimal:
+    code = str(currency or "YER").strip().upper() or "YER"
+    source_rate = rates.get(code)
+    if source_rate is None:
+        raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{code}")
+    return Decimal(str(amount or 0)) / source_rate * rates[target_code]
+
+
+async def _dashboard_monthly_target_yer(session: AsyncSession) -> Decimal | None:
+    model = MODEL_BY_TABLE["site_settings"]
+    row = (
+        await session.execute(
+            select(model).where(model.name == _DASHBOARD_MONTHLY_TARGET_KEY, model.deleted_at.is_(None)).limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    try:
+        target = Decimal(str((row.extra_data or {}).get("target_yer")))
+    except (ValueError, TypeError, ArithmeticError):
+        return None
+    return target if target.is_finite() and target > 0 else None
+
+
+async def _admin_order_period_counts(
+    session: AsyncSession, *, today: datetime, week: datetime, month: datetime
+) -> tuple[int, int, int]:
+    totals = [0, 0, 0]
+    for table in ("orders", "local_shopping_requests", "international_orders"):
+        model = MODEL_BY_TABLE[table]
+        statement = select(
+            func.count(model.id).filter(model.created_at >= today),
+            func.count(model.id).filter(model.created_at >= week),
+            func.count(model.id).filter(model.created_at >= month),
+        ).where(model.deleted_at.is_(None), ~func.lower(model.status).in_(tuple(EXCLUDED_ORDER_STATUSES)))
+        counts = (await session.execute(statement)).one()
+        for index, count in enumerate(counts):
+            totals[index] += int(count or 0)
+    return tuple(totals)
+
+
+@router.get("/api/admin/dashboard/target")
+async def api_admin_dashboard_target(admin: User = Depends(require_admin), session: AsyncSession = Depends(get_session)):
+    rates, selected = await _admin_currency_context(session)
+    target_yer = await _dashboard_monthly_target_yer(session)
+    code = str(selected["code"]).upper()
+    amount = _admin_convert_amount(target_yer, "YER", rates, code) if target_yer is not None else None
+    return {"data": {"amount": float(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if amount is not None else None,
+                     "currencyCode": code, "currencySymbol": selected.get("symbol") or code}}
+
+
+@router.patch("/api/admin/dashboard/target")
+async def api_update_admin_dashboard_target(
+    request: Request, admin: User = Depends(require_admin), session: AsyncSession = Depends(get_session)
+):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="dashboard_target_amount_required")
+    try:
+        amount = Decimal(str(body.get("amount")))
+    except (ValueError, TypeError, ArithmeticError) as error:
+        raise HTTPException(status_code=422, detail="dashboard_target_amount_invalid") from error
+    if not amount.is_finite() or amount <= 0 or amount > Decimal("1000000000000"):
+        raise HTTPException(status_code=422, detail="dashboard_target_amount_invalid")
+    rates, selected = await _admin_currency_context(session)
+    code = str(selected["code"]).upper()
+    target_yer = _admin_convert_amount(amount, code, rates, "YER")
+    model = MODEL_BY_TABLE["site_settings"]
+    row = (
+        await session.execute(
+            select(model).where(model.name == _DASHBOARD_MONTHLY_TARGET_KEY, model.deleted_at.is_(None)).limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = model(name=_DASHBOARD_MONTHLY_TARGET_KEY, status="active", is_active=True)
+        session.add(row)
+    row.extra_data = {"target_yer": str(target_yer.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))}
+    _add_audit_log(session, admin.id, "admin.dashboard.target.update", "Updated monthly revenue target")
+    await session.commit()
+    return await api_admin_dashboard_target(admin=admin, session=session)
+
+
 @router.get("/api/dashboard/live-kpis")
 async def api_dashboard_live_kpis(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     now = datetime.now(timezone.utc)
@@ -3866,20 +4077,33 @@ async def api_dashboard_live_kpis(staff: User = Depends(require_staff), session:
     yesterday = today - timedelta(days=1)
     week = today - timedelta(days=7)
     month = today.replace(day=1)
-    order_model = MODEL_BY_TABLE["orders"]
     user_model = MODEL_BY_TABLE["users"]
-    today_revenue = Decimal((await RevenueRecognitionService.summary(session, start=today))["net_revenue"])
-    yesterday_revenue = Decimal((await RevenueRecognitionService.summary(session, start=yesterday, end=today))["net_revenue"])
-    week_revenue = Decimal((await RevenueRecognitionService.summary(session, start=week))["net_revenue"])
-    month_revenue = Decimal((await RevenueRecognitionService.summary(session, start=month))["net_revenue"])
-    today_orders = await _count(session, "orders", order_model.created_at >= today)
-    week_orders = await _count(session, "orders", order_model.created_at >= week)
-    month_orders = await _count(session, "orders", order_model.created_at >= month)
+    rates, selected = await _admin_currency_context(session)
+    currency_code = str(selected["code"]).upper()
+    def period_revenue(rows: list[Any]) -> Decimal:
+        return sum(
+            (_admin_convert_amount(row.net_revenue, row.currency_code, rates, currency_code) for row in rows),
+            Decimal("0"),
+        )
+    today_rows = await RevenueRecognitionService.order_rows(session, start=today)
+    yesterday_rows = await RevenueRecognitionService.order_rows(session, start=yesterday, end=today - timedelta(microseconds=1))
+    week_rows = await RevenueRecognitionService.order_rows(session, start=week)
+    month_rows = await RevenueRecognitionService.order_rows(session, start=month)
+    today_revenue = period_revenue(today_rows)
+    yesterday_revenue = period_revenue(yesterday_rows)
+    week_revenue = period_revenue(week_rows)
+    month_revenue = period_revenue(month_rows)
+    today_orders, week_orders, month_orders = await _admin_order_period_counts(
+        session, today=today, week=week, month=month
+    )
     active_products = await _count(session, "products", MODEL_BY_TABLE["products"].is_active.is_(True))
-    new_customers = await _customer_count(session, user_model.created_at >= week)
-    month_order_count = max(month_orders, 1)
-    target = Decimal("50000000")
+    new_customers = await _customer_count(session, user_model.created_at >= now - timedelta(days=30))
+    month_paid_count = len(month_rows)
+    target_yer = await _dashboard_monthly_target_yer(session)
+    target = _admin_convert_amount(target_yer, "YER", rates, currency_code) if target_yer is not None else None
     return {"data": {
+        "currencyCode": currency_code,
+        "currencySymbol": selected.get("symbol") or currency_code,
         "todayRevenue": float(today_revenue),
         "yesterdayRevenue": float(yesterday_revenue),
         "weekRevenue": float(week_revenue),
@@ -3887,10 +4111,13 @@ async def api_dashboard_live_kpis(staff: User = Depends(require_staff), session:
         "todayOrders": today_orders,
         "weekOrders": week_orders,
         "monthOrders": month_orders,
-        "avgOrderValue": float(month_revenue / month_order_count),
+        "avgOrderValue": float(month_revenue / month_paid_count) if month_paid_count else 0,
+        "monthPaidOrders": month_paid_count,
         "newCustomers": new_customers,
+        "newCustomersDays": 30,
         "activeProducts": active_products,
-        "targetProgress": float(min((month_revenue / target) * 100, Decimal("100"))) if target else 0,
+        "targetAmount": float(target.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if target is not None else None,
+        "targetProgress": float(min((month_revenue / target) * 100, Decimal("100"))) if target else None,
         "pendingLocalRequests": await _count(session, "local_shopping_requests", MODEL_BY_TABLE["local_shopping_requests"].status.in_(("new", "pending", "reviewing"))),
         "pendingIntOrders": await _count(session, "international_orders", MODEL_BY_TABLE["international_orders"].status.in_(("new", "pending", "reviewing"))),
     }}
@@ -4018,11 +4245,71 @@ async def api_dashboard_recent_activity(staff: User = Depends(require_staff), se
 
 @router.get("/api/dashboard/financial-reconciliation")
 async def api_dashboard_financial_reconciliation(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    rates, selected = await _admin_currency_context(session)
+    target_code = str(selected["code"]).upper()
+
+    def converted(amount: Any, currency: Any) -> Decimal:
+        return _admin_convert_amount(amount, currency, rates, target_code)
+
+    async def resource_total(table: str, *, start: datetime | None = None, statuses: tuple[str, ...] = ()) -> Decimal:
+        model = MODEL_BY_TABLE[table]
+        currency = func.coalesce(
+            model.extra_data.op("->>")("currency_code"),
+            model.extra_data.op("->>")("currencyCode"),
+            "YER",
+        )
+        statement = select(currency, func.coalesce(func.sum(model.amount), 0)).where(model.deleted_at.is_(None))
+        if start is not None:
+            statement = statement.where(model.created_at >= start)
+        if statuses:
+            statement = statement.where(func.lower(model.status).in_(statuses))
+        statement = statement.group_by(currency)
+        return sum((converted(amount, code) for code, amount in (await session.execute(statement)).all()), Decimal("0"))
+
+    regular_orders = await RevenueRecognitionService.eligible_orders(session)
+    supplemental_orders = await RevenueRecognitionService._supplemental_orders(session)
+    booked = sum((converted(row.total, row.currency_code) for row in regular_orders), Decimal("0"))
+    booked += sum(
+        (
+            converted(
+                RevenueRecognitionService._supplemental_payload_total(payload),
+                payload.get("currency_code") or payload.get("currencyCode"),
+            )
+            for _, record in supplemental_orders
+            for payload in (serialize_record(record),)
+        ),
+        Decimal("0"),
+    )
+    recognized_rows = await RevenueRecognitionService.order_rows(session)
+    paid = sum((converted(row.payment_total, row.currency_code) for row in recognized_rows), Decimal("0"))
+    refunds = sum((converted(row.refund_total, row.currency_code) for row in recognized_rows), Decimal("0"))
+    month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    monthly_rows = await RevenueRecognitionService.order_rows(session, start=month_start)
+    monthly_income = sum((converted(row.net_revenue, row.currency_code) for row in monthly_rows), Decimal("0"))
+    expense_tables = ("general_expenses", "employee_payments", "partner_payments", "marketer_payments")
+    monthly_expenses = Decimal("0")
+    total_expenses = Decimal("0")
+    for table in expense_tables:
+        monthly_expenses += await resource_total(table, start=month_start)
+        total_expenses += await resource_total(table)
+    booked_after_refunds = booked - refunds
+    collected_after_refunds = paid - refunds
+    outstanding = booked - paid
+    rounded = lambda value: float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     return {"data": {
-        "ordersTotal": float(await _sum_amount(session, "orders", column="total")),
-        "paymentsTotal": float(await _sum_amount(session, "order_payments")),
-        "pendingReceipts": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))),
-        "mismatches": [],
+        "currencyCode": target_code,
+        "currencySymbol": selected.get("symbol") or target_code,
+        "totalRevenue": rounded(booked_after_refunds),
+        "totalCollected": rounded(collected_after_refunds),
+        "totalOutstanding": rounded(outstanding),
+        "collectionRate": round(float(collected_after_refunds / booked_after_refunds * 100), 2) if booked_after_refunds > 0 else 0,
+        "partnerPayables": rounded(await resource_total("partner_settlements", statuses=("pending", "unpaid"))),
+        "partnerPaid": rounded(await resource_total("partner_payments", statuses=("paid", "completed", "approved"))),
+        "marketerPayables": rounded(await resource_total("marketer_commissions", statuses=("pending", "earned", "approved", "unpaid"))),
+        "marketerPaid": rounded(await resource_total("marketer_payments", statuses=("paid", "completed", "approved"))),
+        "generalExpenses": rounded(total_expenses),
+        "monthlyRevenue": rounded(monthly_income),
+        "monthlyExpenses": rounded(monthly_expenses),
     }}
 
 
@@ -4153,7 +4440,88 @@ async def api_admin_customers_alias(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    return {"data": await AdminCustomerAccessService.list_customers(session, roles=roles, limit=500, full=bool(roles.intersection({"admin", "manager"})))}
+    customers = await AdminCustomerAccessService.list_customers(
+        session, roles=roles, limit=500, full=bool(roles.intersection({"admin", "manager"}))
+    )
+    if not customers:
+        return {"data": customers}
+    rates, selected = await _admin_currency_context(session)
+    code = str(selected["code"]).upper()
+    user_ids = {uuid.UUID(row["user_id"]) for row in customers}
+    order_owners = dict(
+        (
+            await session.execute(
+                select(Order.id, Order.user_id).where(Order.user_id.in_(user_ids), Order.deleted_at.is_(None))
+            )
+        ).all()
+    )
+    collected_by_user: dict[uuid.UUID, Decimal] = {}
+    for order in await RevenueRecognitionService._regular_order_rows(session):
+        user_id = order_owners.get(order.order_id)
+        if user_id is not None:
+            collected_by_user[user_id] = collected_by_user.get(user_id, Decimal("0")) + _admin_convert_amount(
+                order.net_revenue, order.currency_code, rates, code
+            )
+    for customer in customers:
+        collected = collected_by_user.get(uuid.UUID(customer["user_id"]), Decimal("0"))
+        customer["total_spent"] = format(collected.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+        customer["currency_code"] = code
+        customer["currency_symbol"] = selected.get("symbol") or code
+    return {"data": customers}
+
+
+@router.get("/api/admin/customers/stats")
+async def api_admin_customer_stats(
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if not roles.intersection({"admin", "manager", "finance"}):
+        raise HTTPException(status_code=403, detail="customer_access_denied")
+    customer_ids = select(UserRole.user_id).where(UserRole.role == "customer")
+    customer_clause = (User.deleted_at.is_(None), User.id.in_(customer_ids))
+    total = int((await session.execute(select(func.count(User.id)).where(*customer_clause))).scalar_one())
+    new_since = datetime.now(timezone.utc) - timedelta(days=30)
+    new_customers = int(
+        (await session.execute(select(func.count(User.id)).where(*customer_clause, User.created_at >= new_since))).scalar_one()
+    )
+    vip = int(
+        (
+            await session.execute(
+                select(func.count(User.id))
+                .join(Profile, Profile.user_id == User.id)
+                .where(*customer_clause, Profile.deleted_at.is_(None), func.lower(Profile.classification) == "vip")
+            )
+        ).scalar_one()
+    )
+    eligible_statuses = tuple(EXCLUDED_ORDER_STATUSES)
+    order_sources = (Order, MODEL_BY_TABLE["local_shopping_requests"], MODEL_BY_TABLE["international_orders"])
+    has_order = or_(
+        *(
+            select(model.id)
+            .where(model.user_id == User.id, model.deleted_at.is_(None), ~func.lower(model.status).in_(eligible_statuses))
+            .exists()
+            for model in order_sources
+        )
+    )
+    with_orders = int((await session.execute(select(func.count(User.id)).where(*customer_clause, has_order))).scalar_one())
+    rates, selected = await _admin_currency_context(session)
+    code = str(selected["code"]).upper()
+    recognized = await RevenueRecognitionService.order_rows(session)
+    collected = sum(
+        (_admin_convert_amount(row.net_revenue, row.currency_code, rates, code) for row in recognized),
+        Decimal("0"),
+    )
+    return {"data": {
+        "total": total,
+        "newCustomers": new_customers,
+        "newCustomersDays": 30,
+        "vip": vip,
+        "withOrders": with_orders,
+        "collectedRevenue": float(collected.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "currencyCode": code,
+        "currencySymbol": selected.get("symbol") or code,
+    }}
 
 
 @router.patch("/api/admin/customers/{user_id}/status")
@@ -4762,6 +5130,63 @@ async def api_admin_international_orders(staff: User = Depends(require_staff), s
         if isinstance(profile, dict) and profile.get("id")
     }
     return {"data": {"orders": orders, "profiles": list(profiles_by_id.values())}}
+
+
+@router.get("/api/admin-shopping/international-orders/{order_id}/attachments/{file_id}")
+async def api_admin_international_order_attachment(
+    order_id: uuid.UUID,
+    file_id: uuid.UUID,
+    staff: User = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+):
+    order = await session.get(MODEL_BY_TABLE["international_orders"], order_id)
+    asset = await session.get(FileAsset, file_id)
+    linked_to_order = any(
+        isinstance(item, dict)
+        and str(item.get("image_url") or "").strip().lower() == f"file:{file_id}"
+        for item in (order.items if order is not None and isinstance(order.items, list) else [])
+    )
+    if (
+        order is None
+        or order.deleted_at is not None
+        or asset is None
+        or asset.deleted_at is not None
+        or not linked_to_order
+        or asset.owner_user_id != order.user_id
+        or asset.policy_key != "customer_request_attachment"
+        or asset.status != "available"
+        or asset.scan_status not in {"clean", "not_required"}
+        or str(asset.content_type or "").lower() not in {"image/jpeg", "image/png", "image/webp"}
+    ):
+        raise HTTPException(status_code=404, detail="international_attachment_not_found")
+
+    headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+    if asset.storage_provider == "cloudflare_r2":
+        try:
+            object_response = storage._r2_client().get_object(
+                Bucket=str(storage.settings.r2_bucket), Key=str(asset.storage_key)
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="international_attachment_not_found") from exc
+        body = object_response.get("Body")
+        if body is None:
+            raise HTTPException(status_code=404, detail="international_attachment_not_found")
+
+        def stream_body():
+            try:
+                while chunk := body.read(1024 * 1024):
+                    yield chunk
+            finally:
+                body.close()
+
+        return StreamingResponse(stream_body(), media_type=asset.content_type, headers=headers)
+
+    if asset.storage_provider != "local_uploads":
+        raise HTTPException(status_code=404, detail="international_attachment_not_found")
+    target = storage._safe_join(asset.storage_key)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="international_attachment_not_found")
+    return FileResponse(target, media_type=asset.content_type, headers=headers)
 
 
 @router.get("/api/admin-shopping/purchases")
@@ -6929,9 +7354,121 @@ async def api_store_reviews_admin(staff: User = Depends(require_staff), session:
     return {"data": await fetch_admin_store_reviews(session)}
 
 
+def _build_sales_forecast_points(
+    daily_revenue: dict[date, Decimal],
+    daily_orders: dict[date, int],
+    *,
+    history_end: date,
+    forecast_start: date,
+    history_days: int = 30,
+    forecast_days: int = 14,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build a deterministic forecast from complete historical business days."""
+
+    history_start = history_end - timedelta(days=history_days - 1)
+    history_dates = [history_start + timedelta(days=offset) for offset in range(history_days)]
+    revenue_values = [Decimal(str(daily_revenue.get(day, 0))) for day in history_dates]
+    order_values = [int(daily_orders.get(day, 0)) for day in history_dates]
+    historical_revenue = sum(revenue_values, Decimal("0"))
+    historical_orders = sum(order_values)
+    active_days = sum(1 for orders in order_values if orders > 0)
+    average_daily_revenue = historical_revenue / Decimal(history_days)
+    average_daily_orders = Decimal(historical_orders) / Decimal(history_days)
+
+    recent_revenue = sum(revenue_values[-7:], Decimal("0"))
+    previous_revenue = sum(revenue_values[-14:-7], Decimal("0"))
+    recent_orders = sum(order_values[-7:])
+    previous_orders = sum(order_values[-14:-7])
+
+    def clamp(value: Decimal, minimum: Decimal, maximum: Decimal) -> Decimal:
+        return max(minimum, min(maximum, value))
+
+    revenue_trend = (
+        clamp(recent_revenue / previous_revenue, Decimal("0.80"), Decimal("1.20"))
+        if previous_revenue > 0 and recent_revenue > 0
+        else Decimal("1")
+    )
+    order_trend = (
+        clamp(Decimal(recent_orders) / Decimal(previous_orders), Decimal("0.80"), Decimal("1.20"))
+        if previous_orders > 0 and recent_orders > 0
+        else Decimal("1")
+    )
+
+    def weekday_factor(values: list[Decimal], baseline: Decimal, target_weekday: int) -> Decimal:
+        if baseline <= 0:
+            return Decimal("1")
+        samples = [value for day, value in zip(history_dates, values) if day.weekday() == target_weekday]
+        weekday_average = sum(samples, Decimal("0")) / Decimal(len(samples) or 1)
+        return clamp(weekday_average / baseline, Decimal("0.75"), Decimal("1.25"))
+
+    order_decimals = [Decimal(value) for value in order_values]
+    revenue_mean = float(average_daily_revenue)
+    if revenue_mean > 0:
+        variance = sum((float(value) - revenue_mean) ** 2 for value in revenue_values) / history_days
+        volatility = (variance**0.5) / revenue_mean
+    else:
+        volatility = 0.0
+    if historical_orders == 0:
+        confidence = 20
+    else:
+        volume_score = min(historical_orders / 30, 1) * 25
+        coverage_score = min(active_days / 20, 1) * 20
+        recent_score = min(recent_orders / 7, 1) * 10
+        volatility_penalty = min(volatility * 10, 25)
+        confidence = max(35, min(90, round(40 + volume_score + coverage_score + recent_score - volatility_penalty)))
+
+    points: list[dict[str, Any]] = []
+    for offset in range(forecast_days):
+        forecast_date = forecast_start + timedelta(days=offset)
+        trend_progress = Decimal(min(offset + 1, 7)) / Decimal("7")
+        revenue_trend_factor = Decimal("1") + ((revenue_trend - Decimal("1")) * trend_progress)
+        order_trend_factor = Decimal("1") + ((order_trend - Decimal("1")) * trend_progress)
+        revenue_weekday_factor = weekday_factor(revenue_values, average_daily_revenue, forecast_date.weekday())
+        order_weekday_factor = weekday_factor(order_decimals, average_daily_orders, forecast_date.weekday())
+        predicted_revenue = (
+            average_daily_revenue * revenue_weekday_factor * revenue_trend_factor
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        predicted_orders = int(
+            (average_daily_orders * order_weekday_factor * order_trend_factor).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        points.append(
+            {
+                "forecast_date": forecast_date,
+                "predicted_revenue": max(Decimal("0"), predicted_revenue),
+                "predicted_orders": max(0, predicted_orders),
+                "revenue_weekday_factor": float(revenue_weekday_factor),
+                "revenue_trend_factor": float(revenue_trend_factor),
+            }
+        )
+
+    metadata = {
+        "method": "30_day_baseline_weekday_recent_trend",
+        "historical_days": history_days,
+        "forecast_days": forecast_days,
+        "history_start": history_start.isoformat(),
+        "history_end": history_end.isoformat(),
+        "historical_revenue": float(historical_revenue),
+        "historical_orders": historical_orders,
+        "active_days": active_days,
+        "average_daily_revenue": float(average_daily_revenue),
+        "average_daily_orders": float(average_daily_orders),
+        "recent_7_day_revenue": float(recent_revenue),
+        "previous_7_day_revenue": float(previous_revenue),
+        "revenue_trend": float(revenue_trend),
+        "order_trend": float(order_trend),
+        "revenue_volatility": round(volatility, 4),
+        "confidence_basis": "volume_coverage_recency_volatility",
+        "confidence_score": confidence,
+    }
+    return points, metadata
+
+
 @router.get("/api/dashboard/sales-forecasts")
 async def api_sales_forecasts(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [serialize_record(row) for row in await _rows(session, "sales_forecasts", limit=500)]}
+    rows = [serialize_record(row) for row in await _rows(session, "sales_forecasts", limit=500)]
+    return {"data": sorted(rows, key=lambda row: str(row.get("forecast_date") or ""))}
 
 
 @router.post("/api/dashboard/sales-forecasts/generate")
@@ -6943,24 +7480,42 @@ async def api_generate_sales_forecasts(staff: User = Depends(require_staff), ses
     resource table definitions.
     """
     forecast_model = MODEL_BY_TABLE["sales_forecasts"]
-    since = datetime.now(timezone.utc) - timedelta(days=30)
-    excluded_statuses = ("cancelled", "canceled", "rejected", "refunded")
-    summary = await session.execute(
-        select(
-            func.coalesce(func.sum(Order.total), 0),
-            func.count(Order.id),
-        ).where(
-            Order.created_at >= since,
-            Order.status.notin_(excluded_statuses),
-            Order.deleted_at.is_(None),
-        )
+    business_timezone = timezone(timedelta(hours=3))
+    business_today = datetime.now(business_timezone).date()
+    history_end = business_today - timedelta(days=1)
+    history_start = history_end - timedelta(days=29)
+    history_start_dt = datetime(
+        history_start.year, history_start.month, history_start.day, tzinfo=business_timezone
+    ).astimezone(timezone.utc)
+    history_end_dt = (
+        datetime(
+            business_today.year, business_today.month, business_today.day, tzinfo=business_timezone
+        ).astimezone(timezone.utc)
+        - timedelta(microseconds=1)
     )
-    total_revenue, total_orders = summary.one()
-    historical_revenue = Decimal(str(total_revenue or 0))
-    historical_orders = int(total_orders or 0)
-    average_daily_revenue = historical_revenue / Decimal("30")
-    average_daily_orders = Decimal(historical_orders) / Decimal("30")
-    confidence = 40 if historical_orders == 0 else min(95, 50 + historical_orders * 2)
+    daily_revenue: dict[date, Decimal] = {}
+    daily_orders: dict[date, int] = {}
+    for order in await RevenueRecognitionService.eligible_orders(
+        session, start=history_start_dt, end=history_end_dt
+    ):
+        order_status = str(order.status or "").strip().lower()
+        payment_status = str(order.payment_status or "").strip().lower()
+        if order_status in {"refunded", "returned"} or payment_status in {"cancelled", "canceled", "refunded"}:
+            continue
+        created_at = order.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        order_date = created_at.astimezone(business_timezone).date()
+        daily_revenue[order_date] = daily_revenue.get(order_date, Decimal("0")) + money(order.total or 0)
+        daily_orders[order_date] = daily_orders.get(order_date, 0) + 1
+
+    points, metadata = _build_sales_forecast_points(
+        daily_revenue,
+        daily_orders,
+        history_end=history_end,
+        forecast_start=business_today + timedelta(days=1),
+    )
+    confidence = int(metadata["confidence_score"])
 
     # A regenerate action replaces only generated forecast rows. It does not
     # touch orders, payments, products, or any user-visible business data.
@@ -6972,26 +7527,24 @@ async def api_generate_sales_forecasts(staff: User = Depends(require_staff), ses
     )
 
     generated: list[Any] = []
-    start_date = datetime.now(timezone.utc).date()
-    for offset in range(1, 8):
-        forecast_date = start_date + timedelta(days=offset)
-        predicted_revenue = (average_daily_revenue * Decimal(str(offset))).quantize(Decimal("0.01"))
-        predicted_orders = int((average_daily_orders * Decimal(str(offset))).quantize(Decimal("1")))
+    for point in points:
+        predicted_revenue = point["predicted_revenue"]
+        predicted_orders = point["predicted_orders"]
         row = forecast_model(
             status="generated",
             type="sales_forecast",
             amount=predicted_revenue,
-            description="تنبؤ مبيعات مبني على آخر 30 يومًا",
+            description="توقع مبني على 30 يومًا مكتملًا ونمط أيام الأسبوع والاتجاه الحديث",
             extra_data={
-                "forecast_date": forecast_date.isoformat(),
+                "forecast_date": point["forecast_date"].isoformat(),
                 "predicted_revenue": float(predicted_revenue),
                 "predicted_orders": predicted_orders,
                 "confidence_score": confidence,
-                "model_version": "rolling-average-v1",
+                "model_version": "seasonal-trend-v2",
                 "metadata": {
-                    "historical_days": 30,
-                    "historical_revenue": float(historical_revenue),
-                    "historical_orders": historical_orders,
+                    **metadata,
+                    "revenue_weekday_factor": point["revenue_weekday_factor"],
+                    "revenue_trend_factor": point["revenue_trend_factor"],
                 },
             },
         )
@@ -9873,6 +10426,7 @@ async def api_create_international_payment(order_id: uuid.UUID, request: Request
         raise HTTPException(status_code=404, detail="international_order_not_found")
     body = await request.json()
     _validate_payment_record_body(body)
+    _validate_international_payment_details(body)
     payload = {
         **body,
         "order_id": order_id,
@@ -10746,6 +11300,41 @@ def _validate_payment_record_body(body: dict[str, Any], *, allow_status: bool = 
             raise HTTPException(status_code=422, detail=f"untrusted_financial_field:{untrusted}")
 
 
+def _validate_international_payment_details(body: dict[str, Any]) -> None:
+    method = str(body.get("payment_method") or body.get("paymentMethod") or "").strip().lower()
+    if method not in {"bank_transfer", "wallet", "wallet_transfer"}:
+        return
+
+    provider_name = str(
+        body.get("payment_provider_name")
+        or body.get("bank_name")
+        or body.get("wallet_name")
+        or ""
+    ).strip()
+    transfer_reference = str(
+        body.get("transfer_reference")
+        or body.get("reference_number")
+        or ""
+    ).strip()
+    if not provider_name:
+        raise HTTPException(
+            status_code=422,
+            detail="bank_name_required" if method == "bank_transfer" else "wallet_name_required",
+        )
+    if not transfer_reference:
+        raise HTTPException(status_code=422, detail="transfer_reference_required")
+    if len(provider_name) > 120 or len(transfer_reference) > 80:
+        raise HTTPException(status_code=422, detail="payment_transfer_details_too_long")
+
+    body["payment_method"] = "wallet" if method == "wallet_transfer" else method
+    body["payment_provider_name"] = provider_name
+    body["transfer_reference"] = transfer_reference
+    if method == "bank_transfer":
+        body["bank_name"] = provider_name
+    else:
+        body["wallet_name"] = provider_name
+
+
 @router.post("/api/catalog/admin/currencies", status_code=201)
 async def api_admin_create_currency(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     row = await _api_create(session, "currencies", await request.json(), staff)
@@ -11363,6 +11952,40 @@ async def api_content_create_theme_template(
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
     }
+
+
+@router.delete("/api/content/theme/templates/{template_id}")
+async def api_content_delete_theme_template(
+    template_id: uuid.UUID,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    """Soft-delete only a saved template; leave built-ins and live theme untouched."""
+    ThemeAdminService.require_access(roles)
+    model = MODEL_BY_TABLE["theme_settings"]
+    template = await session.get(model, template_id)
+    if (
+        template is None
+        or template.deleted_at is not None
+        or (template.status != "template" and not str(template.name or "").startswith("template:"))
+    ):
+        raise HTTPException(status_code=404, detail="template_not_found")
+    template.deleted_at = datetime.now(timezone.utc)
+    add_audit_log(
+        session,
+        user_id=staff.id,
+        action="theme.template.delete",
+        description=f"Deleted theme template {str((template.extra_data or {}).get('name') or template.id)}",
+        extra_data={
+            "action": "delete",
+            "table_name": "theme_templates",
+            "record_id": str(template.id),
+            "source": "theme_admin",
+        },
+    )
+    await session.commit()
+    return {"ok": True}
 
 
 @router.post("/api/content/theme/templates/{template_id}/apply")

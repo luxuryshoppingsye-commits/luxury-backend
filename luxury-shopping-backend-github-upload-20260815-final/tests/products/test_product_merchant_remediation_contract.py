@@ -300,6 +300,33 @@ async def test_merchant_product_create_update_is_pending_and_cannot_feature_or_a
         assert activate_attempt.status_code == 403
 
 
+async def test_partner_submission_stays_pending_for_user_with_admin_role() -> None:
+    get_settings().require_test_fixtures_enabled("product merchant remediation tests")
+    merchant_email = f"merchant-admin-{uuid.uuid4().hex[:8]}@gmail.com"
+    merchant_id, merchant_password = await _seed_user(merchant_email, "partner")
+    async with SessionFactory() as session:
+        session.add(UserRole(user_id=merchant_id, role="admin"))
+        await session.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        headers = await _login(client, merchant_email, merchant_password)
+        created = await client.post(
+            "/api/partner/products",
+            headers=headers,
+            json={"name": "فستان صنعاني", "price": 2000, "cost_price": 1800, "stock_quantity": 30},
+        )
+        assert created.status_code == 201, created.text
+        product = created.json()
+        assert product["partner_id"] == str(merchant_id)
+        assert product["approval_status"] == "pending"
+        assert product["is_active"] is False
+
+        listed = await client.get("/manage/products?partnerOnly=true", headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert any(row["id"] == product["id"] for row in listed.json())
+
+
 async def test_variant_upsert_requires_variant_to_belong_to_url_product() -> None:
     get_settings().require_test_fixtures_enabled("product merchant remediation tests")
     suffix = uuid.uuid4().hex[:8]

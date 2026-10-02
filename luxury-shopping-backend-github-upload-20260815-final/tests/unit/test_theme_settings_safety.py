@@ -125,6 +125,59 @@ class _JsonRequest:
         return self.payload
 
 
+@pytest.mark.parametrize("status,name_prefix", [("template", "template:"), ("active", "template:"), ("template", "legacy:")])
+@pytest.mark.asyncio
+async def test_delete_saved_template_soft_deletes_only_the_selected_row(monkeypatch: pytest.MonkeyPatch, status: str, name_prefix: str) -> None:
+    template_id = uuid.uuid4()
+    template = SimpleNamespace(
+        id=template_id,
+        name=f"{name_prefix}{template_id}",
+        status=status,
+        deleted_at=None,
+        extra_data={"name": "ألوان الخريف"},
+    )
+    session = _ThemeSession(template, SimpleNamespace())
+    audits: list[dict[str, object]] = []
+    monkeypatch.setattr(operations, "add_audit_log", lambda *args, **kwargs: audits.append(kwargs))
+
+    result = await operations.api_content_delete_theme_template(
+        template_id,
+        staff=SimpleNamespace(id=uuid.uuid4()),
+        roles={"admin"},
+        session=session,
+    )
+
+    assert result == {"ok": True}
+    assert template.deleted_at is not None
+    assert session.commit_count == 1
+    assert audits[0]["action"] == "theme.template.delete"
+
+
+@pytest.mark.asyncio
+async def test_delete_template_rejects_non_template_theme_row() -> None:
+    template_id = uuid.uuid4()
+    active_theme = SimpleNamespace(
+        id=template_id,
+        name="colors",
+        status="active",
+        deleted_at=None,
+        extra_data={},
+    )
+    session = _ThemeSession(active_theme, SimpleNamespace())
+
+    with pytest.raises(HTTPException) as caught:
+        await operations.api_content_delete_theme_template(
+            template_id,
+            staff=SimpleNamespace(id=uuid.uuid4()),
+            roles={"admin"},
+            session=session,
+        )
+
+    assert caught.value.status_code == 404
+    assert active_theme.deleted_at is None
+    assert session.commit_count == 0
+
+
 @pytest.mark.asyncio
 async def test_apply_template_splits_legacy_components_and_commits_once(monkeypatch: pytest.MonkeyPatch) -> None:
     template_id = uuid.uuid4()

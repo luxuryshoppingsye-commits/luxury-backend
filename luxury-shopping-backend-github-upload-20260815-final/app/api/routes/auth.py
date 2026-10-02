@@ -17,13 +17,14 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...database import get_session
-from ...dependencies import current_user, require_admin, user_roles
+from ...dependencies import current_bearer_user, current_user, require_admin, user_roles
 from ...models import MODEL_BY_TABLE
 from ...config import get_settings
 from ...models.domain import AuthSession, LoginAttempt, PasswordResetToken, PasswordResetTokenState, PhoneOtpToken, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole, VerificationToken
 from ...models.domain import StaffPermissionSet
 from ...repositories.resources import serialize_record
 from ...schemas.auth import (
+    AccountDeletionRequestCreate,
     EmailVerificationConfirm,
     EmailVerificationRequest,
     FirebaseAuthRequest,
@@ -2205,6 +2206,21 @@ async def password_reset_confirm(
     await revoke_all_refresh_tokens(session, user.id, now=now)
     await session.commit()
     return {"ok": True}
+
+
+@router.post("/account-deletion-requests", status_code=201)
+@router.post("/api/account-deletion-requests", status_code=201)
+async def create_account_deletion_request(
+    body: AccountDeletionRequestCreate,
+    user: User = Depends(current_bearer_user),
+    session: AsyncSession = Depends(get_session),
+):
+    row = AccountDeletionRequest(user_id=user.id, reason=body.reason, status="pending")
+    session.add(row)
+    await session.flush()
+    payload = serialize_record(row)
+    await session.commit()
+    return {"data": {key: payload[key] for key in ("id", "user_id", "reason", "status", "created_at")}}
 
 
 @router.post("/me/account-deletion-request")

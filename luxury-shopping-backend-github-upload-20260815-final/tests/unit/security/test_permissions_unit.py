@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 
 from backend.app import dependencies
 from backend.app.api.routes import commerce, operations
+from backend.app.services import staff_permissions
 
 
 @pytest.mark.asyncio
@@ -203,6 +204,49 @@ async def test_admin_order_list_requires_orders_view_permission(monkeypatch: pyt
 
     assert calls == [(session, user.id, {"employee"}, "orders.view")]
     assert response == {"data": []}
+
+
+@pytest.mark.asyncio
+async def test_order_status_update_requires_orders_update_but_pure_courier_keeps_own_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    user = SimpleNamespace(id=uuid4())
+    session = object()
+    calls: list[tuple[object, object, set[str], str]] = []
+
+    async def require_permission(received_session, user_id, roles, permission):
+        calls.append((received_session, user_id, roles, permission))
+        raise HTTPException(status_code=403, detail="staff_permission_denied")
+
+    class Request:
+        async def json(self):
+            raise RuntimeError("request_body_reached")
+
+    monkeypatch.setattr(commerce, "require_staff_permission", require_permission)
+
+    with pytest.raises(HTTPException) as denied:
+        await commerce.change_order_status(uuid4(), Request(), user, {"employee"}, session)
+    assert denied.value.status_code == 403
+    assert calls == [(session, user.id, {"employee"}, "orders.update")]
+
+    with pytest.raises(RuntimeError, match="request_body_reached"):
+        await commerce.change_order_status(uuid4(), Request(), user, {"courier"}, session)
+    assert len(calls) == 1
+
+    with pytest.raises(HTTPException) as rollback_denied:
+        await commerce.rollback_order_status(uuid4(), user, {"manager"}, session)
+    assert rollback_denied.value.status_code == 403
+    assert calls[-1] == (session, user.id, {"manager"}, "orders.update")
+
+
+@pytest.mark.asyncio
+async def test_orders_view_alone_cannot_update_order_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def only_view(_session, _user_id, _roles):
+        return {"orders.view"}
+
+    monkeypatch.setattr(staff_permissions, "effective_permissions", only_view)
+    with pytest.raises(HTTPException) as denied:
+        await staff_permissions.require_staff_permission(object(), uuid4(), {"employee"}, "orders.update")
+    assert denied.value.status_code == 403
+    assert denied.value.detail == {"code": "staff_permission_denied", "permission": "orders.update"}
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import io
 import uuid
 from decimal import Decimal
@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from backend.app.config import BACKEND_DIR, get_settings
 from backend.app.database import SessionFactory
 from backend.app.main import app
+from backend.app.api.routes.operations import _build_sales_forecast_points
 from backend.app.models import MODEL_BY_TABLE
 from backend.app.models.domain import AccountSecurity, Order, OrderItem, Product, Profile, User, UserRole
 from backend.app.security.passwords import hash_password
@@ -21,6 +22,35 @@ from backend.app.services.report_admin_services import ReportGenerationService
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_sales_forecast_uses_complete_history_weekdays_and_non_cumulative_daily_values() -> None:
+    history_end = date(2026, 9, 26)
+    forecast_start = date(2026, 9, 28)
+    history_start = history_end.replace(day=1) - timedelta(days=4)
+    daily_revenue: dict[date, Decimal] = {}
+    daily_orders: dict[date, int] = {}
+    for offset in range(30):
+        day = history_start + timedelta(days=offset)
+        daily_revenue[day] = Decimal("200") if day.weekday() == 0 else Decimal("100")
+        daily_orders[day] = 2 if day.weekday() == 0 else 1
+
+    points, metadata = _build_sales_forecast_points(
+        daily_revenue,
+        daily_orders,
+        history_end=history_end,
+        forecast_start=forecast_start,
+    )
+
+    assert len(points) == 14
+    assert points[0]["forecast_date"] == forecast_start
+    assert points[-1]["forecast_date"] == forecast_start + timedelta(days=13)
+    assert points[0]["predicted_revenue"] > points[1]["predicted_revenue"]
+    assert max(point["predicted_revenue"] for point in points) < Decimal("300")
+    assert all(point["predicted_orders"] in {1, 2} for point in points)
+    assert metadata["method"] == "30_day_baseline_weekday_recent_trend"
+    assert metadata["historical_orders"] == 34
+    assert 35 <= metadata["confidence_score"] <= 90
 
 
 async def test_financial_report_pdf_is_localized_instead_of_a_technical_dump() -> None:
@@ -175,12 +205,28 @@ async def test_campaign_scheduler_worker_metrics_and_active_endpoint() -> None:
         headers = await _login(client, admin, admin_password)
         created = await client.post("/api/marketing/campaigns", headers=headers, json={"title": f"{run_id} campaign", "message": "Campaign body", "channels": ["in_app"], "campaign_type": "promo_notification"})
         processed = await client.post("/api/marketing/campaigns/process-due", headers=headers)
+        now = datetime.now(timezone.utc)
+        updated = await client.patch(
+            f"/api/marketing/campaigns/{created.json()['data']['id']}",
+            headers=headers,
+            json={
+                "title": f"{run_id} campaign updated",
+                "message": "Campaign body updated",
+                "status": "completed",
+                "is_active": True,
+                "starts_at": (now - timedelta(minutes=1)).isoformat(),
+                "ends_at": (now + timedelta(days=1)).isoformat(),
+            },
+        )
         active = await client.get("/api/marketing/campaigns/active?type=promo_notification")
 
     assert created.status_code == 201, created.text
     assert created.json()["data"]["status"] == "queued"
     assert processed.status_code == 200
     assert processed.json()["data"]["processed"] >= 1
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["data"]["status"] == "completed"
+    assert updated.json()["data"]["title"] == f"{run_id} campaign updated"
     async with SessionFactory() as session:
         deliveries = int((await session.execute(select(func.count()).select_from(event_model).where(event_model.type == "campaign_delivery", event_model.description == created.json()["data"]["id"]))).scalar_one())
     assert deliveries >= 1
