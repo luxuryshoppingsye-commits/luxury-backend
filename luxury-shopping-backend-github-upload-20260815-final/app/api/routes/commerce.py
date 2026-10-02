@@ -1619,7 +1619,10 @@ async def _catalog_currencies_uncached(limit: int, session: AsyncSession) -> dic
     if "is_active" in model.__table__.c:
         statement = statement.where(model.__table__.c.is_active.is_(True))
     if "status" in model.__table__.c:
-        statement = statement.where(model.__table__.c.status.notin_(["disabled", "inactive", "deleted"]))
+        statement = statement.where(or_(
+            model.__table__.c.status.is_(None),
+            model.__table__.c.status.notin_(["disabled", "inactive", "deleted"]),
+        ))
     if "sort_order" in model.__table__.c:
         statement = statement.order_by(model.__table__.c.sort_order)
     elif "code" in model.__table__.c:

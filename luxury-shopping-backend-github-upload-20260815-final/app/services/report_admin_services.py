@@ -438,6 +438,42 @@ class RecognizedOrderRevenue:
 
 class RevenueRecognitionService:
     @staticmethod
+    async def currency_context(session: AsyncSession) -> tuple[dict[str, Decimal], str]:
+        """Load the active database rates; never total unlike currencies raw."""
+
+        model = MODEL_BY_TABLE["currencies"]
+        result = await session.execute(
+            select(model).where(model.deleted_at.is_(None), model.is_active.is_(True))
+        )
+        currencies = [serialize_record(row) for row in result.scalars()]
+        default = next((row for row in currencies if row.get("is_default") is True), None)
+        if default is None:
+            raise HTTPException(status_code=503, detail="admin_default_currency_not_configured")
+        target = str(default.get("code") or "").strip().upper()
+        rates: dict[str, Decimal] = {}
+        for row in currencies:
+            code = str(row.get("code") or "").strip().upper()
+            try:
+                rate = Decimal(str(row.get("exchange_rate")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if code and rate.is_finite() and rate > 0:
+                rates[code] = rate
+        if target not in rates:
+            raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{target}")
+        return rates, target
+
+    @staticmethod
+    def converted_amount(
+        amount: Any, currency_code: Any, rates: dict[str, Decimal], target: str
+    ) -> Decimal:
+        code = str(currency_code or "YER").strip().upper() or "YER"
+        rate = rates.get(code)
+        if rate is None:
+            raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{code}")
+        return Decimal(str(amount or 0)) / rate * rates[target]
+
+    @staticmethod
     async def eligible_orders(
         session: AsyncSession,
         *,
@@ -740,6 +776,7 @@ class RevenueRecognitionService:
         *,
         start: Any = None,
         end: Any = None,
+        currency_context: tuple[dict[str, Decimal], str] | None = None,
     ) -> dict[str, Any]:
         """Return the value and count of every eligible order, paid or not.
 
@@ -751,23 +788,19 @@ class RevenueRecognitionService:
 
         orders = await cls.eligible_orders(session, start=start, end=end)
         supplemental = await cls._supplemental_orders(session, start=start, end=end)
-        order_value = money(sum((money(order.total or 0) for order in orders), Decimal("0.00")))
-        currency_code = next(
-            (
-                str(getattr(order, "currency_code", "") or "").strip() or "YER"
-                for order in orders
-            ),
-            "YER",
+        rates, currency_code = currency_context or await cls.currency_context(session)
+        order_value = sum(
+            (cls.converted_amount(order.total, order.currency_code, rates, currency_code) for order in orders),
+            Decimal("0"),
         )
         for _, record in supplemental:
             payload = serialize_record(record)
-            order_value += cls._supplemental_payload_total(payload)
-            if currency_code == "YER":
-                currency_code = str(
-                    payload.get("currency_code")
-                    or payload.get("currencyCode")
-                    or "YER"
-                ).strip() or "YER"
+            order_value += cls.converted_amount(
+                cls._supplemental_payload_total(payload),
+                payload.get("currency_code") or payload.get("currencyCode"),
+                rates,
+                currency_code,
+            )
         return {
             "order_count": len(orders) + len(supplemental),
             "order_value": money(order_value),
@@ -784,6 +817,7 @@ class RevenueRecognitionService:
     ) -> Decimal:
         """Return outstanding order balances plus unreviewed payment receipts."""
 
+        rates, target = await cls.currency_context(session)
         paid_by_order: dict[str, Decimal] = {}
         for row in await cls.order_rows(session, start=start, end=end):
             key = str(row.order_id)
@@ -792,12 +826,22 @@ class RevenueRecognitionService:
         outstanding = Decimal("0.00")
         for order in await cls.eligible_orders(session, start=start, end=end):
             total = money(order.total or 0)
-            outstanding += max(total - paid_by_order.get(str(order.id), Decimal("0.00")), Decimal("0.00"))
+            outstanding += cls.converted_amount(
+                max(total - paid_by_order.get(str(order.id), Decimal("0.00")), Decimal("0.00")),
+                order.currency_code,
+                rates,
+                target,
+            )
 
         for _, record in await cls._supplemental_orders(session, start=start, end=end):
             payload = serialize_record(record)
             total = cls._supplemental_payload_total(payload)
-            outstanding += max(total - paid_by_order.get(str(record.id), Decimal("0.00")), Decimal("0.00"))
+            outstanding += cls.converted_amount(
+                max(total - paid_by_order.get(str(record.id), Decimal("0.00")), Decimal("0.00")),
+                payload.get("currency_code") or payload.get("currencyCode"),
+                rates,
+                target,
+            )
 
         start_dt, end_dt = _date_range(start, end)
         receipt_model = MODEL_BY_TABLE["payment_receipts"]
@@ -813,19 +857,35 @@ class RevenueRecognitionService:
             receipt_clauses.append(receipt_model.created_at >= start_dt)
         if end_dt is not None:
             receipt_clauses.append(receipt_model.created_at <= end_dt)
-        receipt_total = await session.execute(
-            select(func.coalesce(func.sum(receipt_model.amount), 0)).where(*receipt_clauses)
-        )
-        return money(outstanding + money(receipt_total.scalar_one() or 0))
+        receipt_result = await session.execute(select(receipt_model).where(*receipt_clauses))
+        for receipt in receipt_result.scalars():
+            payload = serialize_record(receipt)
+            outstanding += cls.converted_amount(
+                receipt.amount,
+                payload.get("currency_code") or payload.get("currencyCode"),
+                rates,
+                target,
+            )
+        return money(outstanding)
 
     @classmethod
     async def summary(cls, session: AsyncSession, *, start: Any = None, end: Any = None, partner_id: uuid.UUID | None = None) -> dict[str, Any]:
+        rates, target = await cls.currency_context(session)
         rows = await cls.order_rows(session, start=start, end=end, partner_id=partner_id)
-        activity = await cls.order_activity_summary(session, start=start, end=end)
-        gross = money(sum((row.partner_share_gross for row in rows), Decimal("0.00")))
-        refunds = money(sum((row.refund_total for row in rows), Decimal("0.00")))
-        net = money(sum((row.net_revenue for row in rows), Decimal("0.00")))
-        paid = money(sum((row.payment_total for row in rows), Decimal("0.00")))
+        activity = await cls.order_activity_summary(
+            session, start=start, end=end, currency_context=(rates, target)
+        )
+
+        def total(field: str) -> Decimal:
+            return money(sum(
+                (cls.converted_amount(getattr(row, field), row.currency_code, rates, target) for row in rows),
+                Decimal("0"),
+            ))
+
+        gross = total("partner_share_gross")
+        refunds = total("refund_total")
+        net = total("net_revenue")
+        paid = total("payment_total")
         return {
             "date_basis": "order records created_at plus successful payment/refund status",
             "order_count": len(rows),
@@ -834,7 +894,7 @@ class RevenueRecognitionService:
             "paid_amount": format(paid, "f"),
             "refund_amount": format(refunds, "f"),
             "net_revenue": format(net, "f"),
-            "currency_code": rows[0].currency_code if rows else "YER",
+            "currency_code": target,
             "partner_scope": str(partner_id) if partner_id else None,
             "order_activity_count": activity["order_count"],
             "order_activity_value": format(activity["order_value"], "f"),

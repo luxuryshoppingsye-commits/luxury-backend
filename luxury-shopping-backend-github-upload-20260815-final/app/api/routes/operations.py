@@ -20,7 +20,7 @@ from urllib.parse import quote, urlparse
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, literal_column, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1054,6 +1054,32 @@ async def _sum_amount(session: AsyncSession, table: str, *clauses: Any, column: 
     if clauses:
         statement = statement.where(*clauses)
     return Decimal(str((await session.execute(statement)).scalar_one() or 0))
+
+
+async def _sum_amount_converted(
+    session: AsyncSession,
+    table: str,
+    rates: dict[str, Decimal],
+    target_code: str,
+    *clauses: Any,
+) -> Decimal:
+    """Sum a finance table in one currency, grouping before conversion."""
+
+    model = MODEL_BY_TABLE[table]
+    currency_column = getattr(model, "currency_code", None)
+    currency = currency_column if currency_column is not None else func.coalesce(
+        model.extra_data.op("->>")(literal_column("'currency_code'")),
+        model.extra_data.op("->>")(literal_column("'currencyCode'")),
+        literal_column("'YER'"),
+    )
+    statement = select(currency, func.coalesce(func.sum(model.amount), 0)).where(
+        model.deleted_at.is_(None), *clauses
+    ).group_by(currency)
+    groups = (await session.execute(statement)).all()
+    return money(sum(
+        (_admin_convert_amount(amount, code, rates, target_code) for code, amount in groups),
+        Decimal("0"),
+    ))
 
 
 async def _status_counts(session: AsyncSession, table: str, column: str = "status") -> dict[str, int]:
@@ -4029,6 +4055,17 @@ async def _admin_order_period_counts(
     return tuple(totals)
 
 
+def _admin_kpi_period_bounds(now: datetime) -> tuple[datetime, datetime, datetime, datetime]:
+    business_now = now.astimezone(timezone(timedelta(hours=3)))
+    local_today = business_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (
+        local_today.astimezone(timezone.utc),
+        (local_today - timedelta(days=1)).astimezone(timezone.utc),
+        now - timedelta(days=7),
+        local_today.replace(day=1).astimezone(timezone.utc),
+    )
+
+
 @router.get("/api/admin/dashboard/target")
 async def api_admin_dashboard_target(admin: User = Depends(require_admin), session: AsyncSession = Depends(get_session)):
     rates, selected = await _admin_currency_context(session)
@@ -4073,10 +4110,7 @@ async def api_update_admin_dashboard_target(
 @router.get("/api/dashboard/live-kpis")
 async def api_dashboard_live_kpis(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     now = datetime.now(timezone.utc)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday = today - timedelta(days=1)
-    week = today - timedelta(days=7)
-    month = today.replace(day=1)
+    today, yesterday, week, month = _admin_kpi_period_bounds(now)
     user_model = MODEL_BY_TABLE["users"]
     rates, selected = await _admin_currency_context(session)
     currency_code = str(selected["code"]).upper()
@@ -4111,6 +4145,8 @@ async def api_dashboard_live_kpis(staff: User = Depends(require_staff), session:
         "todayOrders": today_orders,
         "weekOrders": week_orders,
         "monthOrders": month_orders,
+        "todayPaidOrders": len(today_rows),
+        "weekPaidOrders": len(week_rows),
         "avgOrderValue": float(month_revenue / month_paid_count) if month_paid_count else 0,
         "monthPaidOrders": month_paid_count,
         "newCustomers": new_customers,
@@ -6921,6 +6957,7 @@ async def api_finance_summary(
     session: AsyncSession = Depends(get_session),
 ):
     revenue = await RevenueRecognitionService.summary(session, start=date_from, end=date_to)
+    rates, target_code = await RevenueRecognitionService.currency_context(session)
     activity = await RevenueRecognitionService.order_activity_summary(
         session,
         start=date_from,
@@ -6942,16 +6979,20 @@ async def api_finance_summary(
 
     total_expenses = Decimal("0")
     for table in expense_tables:
-        total_expenses += await _sum_amount(session, table, *expense_date_clauses(table))
+        total_expenses += await _sum_amount_converted(
+            session, table, rates, target_code, *expense_date_clauses(table)
+        )
     month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     monthly_income = Decimal(
         (await RevenueRecognitionService.summary(session, start=month_start))["net_revenue"]
     )
     monthly_expenses = Decimal("0")
     for table in expense_tables:
-        monthly_expenses += await _sum_amount(
+        monthly_expenses += await _sum_amount_converted(
             session,
             table,
+            rates,
+            target_code,
             MODEL_BY_TABLE[table].created_at >= month_start,
         )
     # The accounting card must reflect outstanding order balances and receipt
