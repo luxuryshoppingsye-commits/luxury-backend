@@ -1,7 +1,10 @@
+from decimal import Decimal
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -86,6 +89,11 @@ async def test_order_activity_summary_includes_pending_and_supplemental_orders(m
         AsyncMock(return_value=[("local_shopping_requests", local_request)]),
     )
     monkeypatch.setattr(ras, "serialize_record", lambda record: record)
+    monkeypatch.setattr(
+        ras.RevenueRecognitionService,
+        "currency_context",
+        AsyncMock(return_value=({"YER": Decimal("1")}, "YER")),
+    )
 
     result = await ras.RevenueRecognitionService.order_activity_summary(object())
 
@@ -94,3 +102,75 @@ async def test_order_activity_summary_includes_pending_and_supplemental_orders(m
         "order_value": ras.money("200.00"),
         "currency_code": "YER",
     }
+
+
+@pytest.mark.asyncio
+async def test_recognized_order_reads_confirmed_checkout_payment_ledger(monkeypatch) -> None:
+    order_id = uuid4()
+    order = SimpleNamespace(
+        id=order_id, order_number="ORD-20261001-F73A5E65", total=Decimal("2500"),
+        currency_code="YER", status="delivered", payment_status="paid",
+    )
+    payment = SimpleNamespace(order_id=order_id, amount=Decimal("2500"))
+
+    class Result:
+        def __init__(self, values):
+            self.values = values
+
+        def scalars(self):
+            return iter(self.values)
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[
+        Result([]), Result([]), Result([]), Result([payment]),
+    ]))
+    monkeypatch.setattr(
+        ras.RevenueRecognitionService, "eligible_orders", AsyncMock(return_value=[order])
+    )
+
+    rows = await ras.RevenueRecognitionService._regular_order_rows(session)
+
+    assert len(rows) == 1
+    assert rows[0].payment_total == Decimal("2500.00")
+    assert rows[0].net_revenue == Decimal("2500.00")
+
+
+@pytest.mark.asyncio
+async def test_revenue_summary_converts_each_currency_before_adding(monkeypatch) -> None:
+    rates = {"YER": Decimal("1"), "USD": Decimal("1") / Decimal("535")}
+    paid_rows = [
+        SimpleNamespace(partner_share_gross=Decimal("2000"), refund_total=Decimal("0"),
+                        net_revenue=Decimal("2000"), payment_total=Decimal("2000"), currency_code="YER"),
+        SimpleNamespace(partner_share_gross=Decimal("1"), refund_total=Decimal("0"),
+                        net_revenue=Decimal("1"), payment_total=Decimal("1"), currency_code="USD"),
+    ]
+    monkeypatch.setattr(
+        ras.RevenueRecognitionService, "currency_context", AsyncMock(return_value=(rates, "YER"))
+    )
+    monkeypatch.setattr(
+        ras.RevenueRecognitionService, "order_rows", AsyncMock(return_value=paid_rows)
+    )
+    monkeypatch.setattr(
+        ras.RevenueRecognitionService, "eligible_orders", AsyncMock(return_value=[
+            SimpleNamespace(total=Decimal("2000"), currency_code="YER"),
+            SimpleNamespace(total=Decimal("1"), currency_code="USD"),
+        ])
+    )
+    monkeypatch.setattr(
+        ras.RevenueRecognitionService, "_supplemental_orders", AsyncMock(return_value=[])
+    )
+
+    result = await ras.RevenueRecognitionService.summary(object())
+
+    assert result["currency_code"] == "YER"
+    assert result["net_revenue"] == "2535.00"
+    assert result["paid_amount"] == "2535.00"
+    assert result["order_activity_value"] == "2535.00"
+
+
+def test_revenue_conversion_rejects_missing_rate() -> None:
+    with pytest.raises(HTTPException) as error:
+        ras.RevenueRecognitionService.converted_amount(
+            "1", "USD", {"YER": Decimal("1")}, "YER"
+        )
+    assert error.value.status_code == 503
+    assert error.value.detail == "admin_exchange_rate_missing:USD"

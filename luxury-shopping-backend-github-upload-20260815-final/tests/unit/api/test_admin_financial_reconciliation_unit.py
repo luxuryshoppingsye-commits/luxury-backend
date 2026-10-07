@@ -1,5 +1,5 @@
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import uuid
@@ -57,6 +57,22 @@ async def test_reconciliation_refuses_missing_default_exchange_rate(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_finance_expense_sum_converts_grouped_currencies() -> None:
+    result = MagicMock()
+    result.all.return_value = [("YER", Decimal("2000")), ("USD", Decimal("1"))]
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=result)
+
+    total = await operations._sum_amount_converted(
+        session, "general_expenses",
+        {"YER": Decimal("1"), "USD": Decimal("1") / Decimal("535")}, "YER",
+    )
+
+    assert total == Decimal("2535.00")
+    assert "GROUP BY" in str(session.execute.await_args.args[0])
+
+
+@pytest.mark.asyncio
 async def test_live_kpis_use_saved_currency_and_no_invented_monthly_target(monkeypatch) -> None:
     monkeypatch.setattr(
         operations,
@@ -79,10 +95,23 @@ async def test_live_kpis_use_saved_currency_and_no_invented_monthly_target(monke
     assert result["data"]["currencyCode"] == "USD"
     assert result["data"]["todayRevenue"] == 1.0
     assert result["data"]["todayOrders"] == 3
+    assert result["data"]["todayPaidOrders"] == 1
+    assert result["data"]["weekPaidOrders"] == 1
     assert result["data"]["monthPaidOrders"] == 1
     assert result["data"]["avgOrderValue"] == 1.0
     assert result["data"]["targetAmount"] is None
     assert result["data"]["targetProgress"] is None
+
+
+def test_live_kpi_periods_match_local_order_dates_across_month_boundary() -> None:
+    local_now = datetime(2026, 10, 1, 0, 30, tzinfo=timezone(timedelta(hours=3)))
+
+    today, yesterday, week, month = operations._admin_kpi_period_bounds(local_now)
+
+    assert today == datetime(2026, 9, 30, 21, tzinfo=timezone.utc)
+    assert yesterday == datetime(2026, 9, 29, 21, tzinfo=timezone.utc)
+    assert month == today
+    assert week == local_now.astimezone(timezone.utc) - timedelta(days=7)
 
 
 @pytest.mark.asyncio

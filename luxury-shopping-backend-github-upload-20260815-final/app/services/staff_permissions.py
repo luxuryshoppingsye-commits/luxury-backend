@@ -279,7 +279,10 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "products.view", "products.create", "products.update", "products.delete",
         "products.activate", "products.feature", "dashboard.view",
         "brands.create",
+        "brands.update",
+        "brands.delete",
         "product_options.create",
+        "product_options.update",
         "product_options.delete",
     }),
 }

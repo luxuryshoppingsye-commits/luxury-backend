@@ -94,6 +94,7 @@ from ...services.financial_calculator import (
     serialize_local_shopping_requests,
     sync_order_payment_status,
     _coupon_discount,
+    _shipping_total,
 )
 from ...services.outbox_service import process_email_outbox, process_whatsapp_outbox
 from ...services.notification_service import (
@@ -167,6 +168,7 @@ from .commerce import (
     _delete_product_file_assets,
     _serialize_orders_with_financials,
     _validated_cart_lines,
+    _checkout_buy_now_item,
 )
 
 
@@ -2611,6 +2613,23 @@ async def delete_partner_product_option(
     return {"ok": True}
 
 
+@router.get("/partner/coupons/count")
+async def count_partner_coupons(
+    user: User = Depends(require_partner),
+    session: AsyncSession = Depends(get_session),
+):
+    model = MODEL_BY_TABLE["partner_coupons"]
+    count = (
+        await session.execute(
+            select(func.count()).select_from(model).where(
+                model.partner_id == user.id,
+                model.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    return {"data": {"count": int(count)}}
+
+
 @router.get("/partner/coupons")
 async def list_partner_coupons(
     user: User = Depends(require_partner),
@@ -2911,13 +2930,13 @@ async def update_partner_coupon(
                 "partner_id": str(user.id),
                 "source": "partner_coupon",
             }
-    else:
+    if customer_coupon is None:
         customer_coupon = customer_model(
             code=values["code"],
             title=values["title"],
             amount=values["amount"],
-            status="active",
-            is_active=True,
+            status="active" if is_active else "inactive",
+            is_active=is_active,
             expires_at=values["expires_at"],
             extra_data={
                 **campaign,
@@ -14768,8 +14787,25 @@ async def shipping_quote(request: Request, session: AsyncSession = Depends(get_s
                 selected = row
                 break
     if selected is None:
-        raise HTTPException(status_code=404, detail="shipping_zone_not_found")
-    fee = str(money(selected.fee or 0))
+        if zone_id or destination:
+            raise HTTPException(status_code=404, detail="shipping_zone_not_found")
+        fee, _source, policy = await _shipping_total(
+            session, {}, subtotal=money(body.get("subtotal", 0))
+        )
+        return {
+            "fee": str(fee),
+            "shippingCost": str(fee),
+            "currencyCode": "YER",
+            "label": "شحن مجاني" if policy["free_shipping"] else "رسوم الشحن",
+            "freeShippingThreshold": policy["free_shipping_threshold"],
+            "isEstimated": True,
+        }
+    fee, _source, policy = await _shipping_total(
+        session,
+        {"shippingZoneId": str(selected.id)},
+        subtotal=money(body.get("subtotal", 0)),
+    )
+    fee = str(fee)
     zone = serialize_record(selected)
     label = zone.get("name") or zone.get("city") or zone.get("governorate") or "shipping"
     return {
@@ -14779,7 +14815,8 @@ async def shipping_quote(request: Request, session: AsyncSession = Depends(get_s
         "zoneId": str(selected.id),
         "shippingZoneId": str(selected.id),
         "matchedZone": label,
-        "label": f"الشحن إلى {label}",
+        "label": f"شحن مجاني إلى {label}" if policy["free_shipping"] else f"الشحن إلى {label}",
+        "freeShippingThreshold": policy["free_shipping_threshold"],
         "isEstimated": False,
         "zone": zone,
     }
@@ -14791,7 +14828,9 @@ async def validate_coupon(request: Request, user: User = Depends(current_user), 
     code = str(body.get("code") or "").upper().strip()
     if not code:
         raise HTTPException(status_code=404, detail="coupon_invalid")
-    lines, subtotal, product_discount = await _validated_cart_lines(session, user.id)
+    lines, subtotal, product_discount = await _validated_cart_lines(
+        session, user.id, buy_now_item=_checkout_buy_now_item(body)
+    )
     merchandise_total = money(subtotal - product_discount)
     discount, coupon_id, metadata = await _coupon_discount(
         session,

@@ -160,6 +160,22 @@ async def _items_by_order(
     return rows
 
 
+async def merchant_order_count(
+    session: AsyncSession,
+    *,
+    partner_id: uuid.UUID,
+) -> int:
+    statement = (
+        select(func.count(func.distinct(Order.id)))
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(
+            Order.deleted_at.is_(None),
+            OrderItem.partner_id == partner_id,
+        )
+    )
+    return int((await session.execute(statement)).scalar_one() or 0)
+
+
 async def merchant_order_list(
     session: AsyncSession,
     *,

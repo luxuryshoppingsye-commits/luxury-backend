@@ -66,7 +66,7 @@ from ...services.financial_calculator import (
     serialize_local_shopping_requests,
     unit_price,
 )
-from ...services.merchant_order_scope import merchant_order_detail, merchant_order_list
+from ...services.merchant_order_scope import merchant_order_count, merchant_order_detail, merchant_order_list
 from ...services.public_read_cache import cache_key, public_read_cache
 from ...services.product_identifier import decode_compact_uuid
 from ...services.commerce_rules import (
@@ -2896,6 +2896,17 @@ async def orders(
     return {"data": rows} if request.url.path.startswith("/api/") else rows
 
 
+@router.get("/api/partner/orders/count")
+async def api_partner_order_count(
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    if "partner" not in roles:
+        raise HTTPException(status_code=403, detail="partner_required")
+    return {"data": {"count": await merchant_order_count(session, partner_id=user.id)}}
+
+
 @router.get("/api/partner/orders")
 async def api_partner_orders(
     limit: int = Query(50, ge=1, le=1000),
@@ -3324,11 +3335,23 @@ async def _record_financial_side_effects(
 async def _validated_cart_lines(
     session: AsyncSession,
     user_id: uuid.UUID,
+    *,
+    buy_now_item: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[UserCart, Product, ProductVariant | None, Decimal]], Decimal, Decimal]:
-    cart_result = await session.execute(
-        select(UserCart).where(UserCart.user_id == user_id).with_for_update()
-    )
-    cart_items = list(cart_result.scalars())
+    if buy_now_item is None:
+        cart_result = await session.execute(
+            select(UserCart).where(UserCart.user_id == user_id).with_for_update()
+        )
+        cart_items = list(cart_result.scalars())
+    else:
+        raw_variant_id = buy_now_item.get("variantId")
+        cart_items = [UserCart(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            product_id=_uuid(buy_now_item.get("productId"), "productId"),
+            variant_id=_uuid(raw_variant_id, "variantId") if raw_variant_id else None,
+            quantity=parse_strict_quantity(buy_now_item.get("quantity", 1)),
+        )]
     if not cart_items:
         raise HTTPException(status_code=400, detail="cart_empty")
     subtotal = Decimal("0.00")
@@ -3358,6 +3381,15 @@ async def _validated_cart_lines(
     return lines, money(subtotal), money(product_discount)
 
 
+def _checkout_buy_now_item(body: dict[str, Any]) -> dict[str, Any] | None:
+    if "buyNowItem" not in body:
+        return None
+    item = body["buyNowItem"]
+    if not isinstance(item, dict) or not item.get("productId"):
+        raise HTTPException(status_code=400, detail="invalid_buy_now_item")
+    return item
+
+
 @router.post("/checkout/preview")
 @router.post("/api/checkout/preview")
 async def checkout_preview(
@@ -3376,16 +3408,21 @@ async def checkout_preview(
         body.get("shippingAddress") or body.get("shipping_address")
     )
     body = {**body, "shippingAddress": shipping_address}
-    lines, subtotal, product_discount = await _validated_cart_lines(session, user.id)
+    lines, subtotal, product_discount = await _validated_cart_lines(
+        session, user.id, buy_now_item=_checkout_buy_now_item(body)
+    )
     financials = await calculate_checkout_financials(
         session,
         user_id=user.id,
         subtotal=subtotal,
         product_discount=product_discount,
         coupon_lines=[(product, item.quantity, unit) for item, product, _variant, unit in lines],
+        apply_free_shipping=True,
+        apply_membership_discount=True,
         body=body,
     )
     return {
+        "checkoutMode": "buy_now" if "buyNowItem" in body else "cart",
         "items": [
             {
                 "cart_item_id": str(item.id),
@@ -3402,6 +3439,7 @@ async def checkout_preview(
         "product_discount": str(financials.product_discount),
         "coupon_discount": str(financials.coupon_discount),
         "loyalty_discount": str(financials.loyalty_discount),
+        "membership_discount": str(financials.membership_discount),
         "shipping_cost": str(financials.shipping_total),
         "total": str(financials.total),
         "currency": "YER",
@@ -3446,13 +3484,17 @@ async def checkout(
                 request_hash=request_hash,
             )
     async with session.begin_nested():
-        lines, subtotal, product_discount = await _validated_cart_lines(session, user.id)
+        lines, subtotal, product_discount = await _validated_cart_lines(
+            session, user.id, buy_now_item=_checkout_buy_now_item(body)
+        )
         financials = await calculate_checkout_financials(
             session,
             user_id=user.id,
             subtotal=subtotal,
             product_discount=product_discount,
             coupon_lines=[(product, item.quantity, unit) for item, product, _variant, unit in lines],
+            apply_free_shipping=True,
+            apply_membership_discount=True,
             body=body,
         )
         order = Order(
@@ -3525,7 +3567,8 @@ async def checkout(
             body=f"وصل طلب جديد {order.order_number}", message=f"وصل طلب جديد {order.order_number}",
             type="new_order", status="new", is_read=False, extra_data={"order_id": str(order.id)},
         )
-        await session.execute(delete(UserCart).where(UserCart.user_id == user.id))
+        if "buyNowItem" not in body:
+            await session.execute(delete(UserCart).where(UserCart.user_id == user.id))
     await session.commit()
     response.status_code = 201
     return _serialize_order(order, idempotency_replayed=False if key else None)

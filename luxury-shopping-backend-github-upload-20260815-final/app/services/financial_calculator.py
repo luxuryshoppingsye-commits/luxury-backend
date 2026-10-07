@@ -535,10 +535,11 @@ class CheckoutFinancials:
     coupon_id: str | None
     shipping_source: str
     breakdown: dict[str, Any]
+    membership_discount: Decimal = Decimal("0.00")
 
     @property
     def discount_total(self) -> Decimal:
-        return money(self.product_discount + self.coupon_discount + self.loyalty_discount)
+        return money(self.product_discount + self.coupon_discount + self.loyalty_discount + self.membership_discount)
 
 
 def unit_price(product: Product, variant: ProductVariant | None = None) -> Decimal:
@@ -752,7 +753,86 @@ async def _loyalty_discount(
     }
 
 
-async def _shipping_total(session: AsyncSession, body: dict[str, Any]) -> tuple[Decimal, str, dict[str, Any]]:
+async def _membership_discount(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    merchandise_total: Decimal,
+    remaining_amount: Decimal,
+) -> tuple[Decimal, dict[str, Any]]:
+    settings = await loyalty_program_settings(session)
+    if not settings.is_active:
+        return Decimal("0.00"), {"source": "none"}
+    loyalty_model = MODEL_BY_TABLE["user_loyalty"]
+    loyalty = (
+        await session.execute(
+            select(loyalty_model).where(loyalty_model.user_id == user_id).with_for_update().limit(1)
+        )
+    ).scalar_one_or_none()
+    balance = int(money_or_zero(loyalty.balance if loyalty is not None else 0))
+    transactions_model = MODEL_BY_TABLE["points_transactions"]
+    transactions = (
+        await session.execute(
+            select(transactions_model)
+            .where(transactions_model.user_id == user_id, transactions_model.deleted_at.is_(None))
+            .order_by(transactions_model.created_at.desc())
+            .limit(100)
+        )
+    ).scalars()
+    credited_types = {"earned", "opening_balance", "adjustment", "refund_reversal"}
+    credited_points = sum(
+        (max(Decimal("0"), Decimal(str(item.amount or 0)))
+         for item in transactions if str(item.type or "").strip().lower() in credited_types),
+        Decimal("0"),
+    )
+    total_points = max(balance, int(credited_points))
+    tier = loyalty_tier_for_points(await loyalty_tier_catalog(session), total_points)
+    percentage = min(money_or_zero(tier.get("discount_percentage")), Decimal("100.00"))
+    discount = min(money(merchandise_total * percentage / Decimal("100")), remaining_amount)
+    return money(discount), {
+        "source": "loyalty_tier",
+        "tier_id": tier.get("id") or None,
+        "tier_name": tier["name"],
+        "discount_percentage": str(percentage),
+        "total_points": total_points,
+        "eligible_subtotal": str(merchandise_total),
+    }
+
+
+async def _shipping_configuration(session: AsyncSession) -> dict[str, Any]:
+    settings_model = MODEL_BY_TABLE.get("site_settings")
+    if settings_model is None:
+        return {}
+    result = await session.execute(
+        select(settings_model)
+        .where(settings_model.name == "shipping_config", settings_model.deleted_at.is_(None))
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    extra = dict(getattr(row, "extra_data", {}) or {}) if row is not None else {}
+    value = extra.get("setting_value")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            value = None
+    return {**extra, **value} if isinstance(value, dict) else extra
+
+
+async def _shipping_total(
+    session: AsyncSession,
+    body: dict[str, Any],
+    *,
+    subtotal: Decimal | None = None,
+) -> tuple[Decimal, str, dict[str, Any]]:
+    config = await _shipping_configuration(session)
+    threshold = money(config.get("free_shipping_threshold", 50000))
+    enabled = config.get("enabled", config.get("free_shipping_enabled", True)) is not False
+    qualifies = enabled and threshold > 0 and subtotal is not None and subtotal >= threshold
+    policy = {
+        "free_shipping_threshold": str(threshold) if enabled and threshold > 0 else None,
+        "free_shipping": qualifies,
+    }
     zones_model = MODEL_BY_TABLE["shipping_zones"]
     zone_id = body.get("shippingZoneId") or body.get("shipping_zone_id")
     if not zone_id and isinstance(body.get("shippingAddress"), dict):
@@ -769,30 +849,15 @@ async def _shipping_total(session: AsyncSession, body: dict[str, Any]) -> tuple[
         row = await session.get(zones_model, parsed_zone_id)
         if row is None or not row.is_active or row.deleted_at is not None:
             raise HTTPException(status_code=404, detail="shipping_zone_not_found")
-        return money(row.fee or 0), "shipping_zone", {"shipping_zone_id": str(row.id)}
+        fee = Decimal("0.00") if qualifies else money(row.fee or 0)
+        return fee, "shipping_zone", {"shipping_zone_id": str(row.id), **policy}
     # A customer must still be able to complete an order when the catalogue
     # has no governorate-specific zone yet. The web client displays the same
     # configured default fee in this case; keep the authoritative calculation
     # on the backend and record the source for later auditability.
-    default_fee = Decimal("5000.00")
-    settings_model = MODEL_BY_TABLE.get("site_settings")
-    if settings_model is not None:
-        settings_result = await session.execute(
-            select(settings_model)
-            .where(
-                settings_model.name == "shipping_config",
-                settings_model.deleted_at.is_(None),
-            )
-            .limit(1)
-        )
-        settings_row = settings_result.scalar_one_or_none()
-        settings_extra = dict(getattr(settings_row, "extra_data", {}) or {}) if settings_row is not None else {}
-        configured = settings_extra.get("default_fee")
-        if configured is None and isinstance(settings_extra.get("setting_value"), dict):
-            configured = settings_extra["setting_value"].get("default_fee")
-        if configured is not None:
-            default_fee = money(configured)
-    return default_fee, "default_config", {"shipping_zone_id": None}
+    configured_fee = config.get("default_fee")
+    default_fee = Decimal("0.00") if qualifies else money(5000 if configured_fee is None else configured_fee)
+    return default_fee, "default_config", {"shipping_zone_id": None, **policy}
 
 
 async def calculate_checkout_financials(
@@ -803,6 +868,8 @@ async def calculate_checkout_financials(
     body: dict[str, Any],
     product_discount: Decimal = Decimal("0.00"),
     coupon_lines: list[tuple[Product, int, Decimal]] | None = None,
+    apply_free_shipping: bool = False,
+    apply_membership_discount: bool = False,
 ) -> CheckoutFinancials:
     subtotal = money(subtotal)
     product_discount = min(money(product_discount), subtotal)
@@ -826,11 +893,19 @@ async def calculate_checkout_financials(
         ),
         eligible_amount=after_coupon,
     )
-    shipping_total, shipping_source, shipping_meta = await _shipping_total(session, body)
+    membership_discount, membership_meta = Decimal("0.00"), {"source": "none"}
+    if apply_membership_discount:
+        membership_discount, membership_meta = await _membership_discount(
+            session, user_id=user_id, merchandise_total=merchandise_total,
+            remaining_amount=max(after_coupon - loyalty_discount, Decimal("0.00")),
+        )
+    shipping_total, shipping_source, shipping_meta = await _shipping_total(
+        session, body, subtotal=merchandise_total if apply_free_shipping else None
+    )
     if coupon_meta.get("free_shipping"):
         shipping_total = Decimal("0.00")
         shipping_meta = {**shipping_meta, "free_shipping_coupon": True}
-    total = money(max(after_coupon - loyalty_discount, Decimal("0.00")) + shipping_total)
+    total = money(max(after_coupon - loyalty_discount - membership_discount, Decimal("0.00")) + shipping_total)
     breakdown = {
         "policy": "backend_decimal_half_up_2dp",
         "subtotal": str(subtotal),
@@ -838,14 +913,16 @@ async def calculate_checkout_financials(
         "merchandise_total": str(merchandise_total),
         "coupon_discount": str(coupon_discount),
         "loyalty_discount": str(loyalty_discount),
+        "membership_discount": str(membership_discount),
         "shipping_total": str(shipping_total),
         "total": str(total),
         "coupon": coupon_meta,
         "loyalty": loyalty_meta,
+        "membership": membership_meta,
         "shipping": shipping_meta,
         "ignored_client_fields": [
             key
-            for key in ("subtotal", "discount", "couponDiscount", "loyaltyDiscount", "total", "grand_total", "shippingCost")
+            for key in ("subtotal", "discount", "couponDiscount", "loyaltyDiscount", "membershipDiscount", "tierDiscountPercentage", "total", "grand_total", "shippingCost")
             if key in body
         ],
     }
@@ -854,6 +931,7 @@ async def calculate_checkout_financials(
         product_discount=product_discount,
         coupon_discount=coupon_discount,
         loyalty_discount=loyalty_discount,
+        membership_discount=membership_discount,
         shipping_total=shipping_total,
         total=total,
         coupon_id=coupon_id,
