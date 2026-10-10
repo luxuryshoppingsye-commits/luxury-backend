@@ -14,6 +14,7 @@ import zipfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from io import BytesIO
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -23,6 +24,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import and_, delete, func, literal_column, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from starlette.datastructures import Headers
+from ...services.product_preview import product_preview_image
 
 from ...config import BACKEND_DIR, get_settings
 from ...database import SessionFactory, get_session
@@ -129,6 +133,7 @@ from ...services.partner_subscription import (
     update_partner_subscription,
 )
 from ...services.public_read_cache import cache_key, public_read_cache
+from ...services.remote_image import download_product_image
 from ...services.product_identifier import decode_compact_uuid
 from ...services.realtime import (
     REALTIME_PROTOCOL,
@@ -419,19 +424,20 @@ async def _secure_upload_from_request(
     entity_type: str | None = None,
     entity_id: uuid.UUID | None = None,
     commit: bool = True,
+    uploaded_file: UploadFile | None = None,
 ) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "").lower()
-    if not content_type.startswith("multipart/form-data"):
+    if uploaded_file is None and not content_type.startswith("multipart/form-data"):
         if "application/json" in content_type:
             body = await request.json()
             if isinstance(body, dict) and UPLOAD_FORBIDDEN_CLIENT_FIELDS.intersection(body.keys()):
                 raise HTTPException(status_code=422, detail="multipart_file_required")
         raise HTTPException(status_code=422, detail="multipart_file_required")
-    form = await request.form()
+    form = await request.form() if uploaded_file is None else {}
     forbidden = UPLOAD_FORBIDDEN_CLIENT_FIELDS.intersection(form.keys())
     if forbidden:
         raise HTTPException(status_code=422, detail="client_storage_fields_forbidden")
-    uploaded = form.get("file")
+    uploaded = uploaded_file if uploaded_file is not None else form.get("file")
     if not isinstance(uploaded, UploadFile) and not (hasattr(uploaded, "filename") and hasattr(uploaded, "read")):
         raise HTTPException(status_code=422, detail="missing_file")
     policy_key = forced_policy or str(form.get("purpose") or form.get("category") or "").strip()
@@ -5187,6 +5193,19 @@ async def api_admin_international_orders(staff: User = Depends(require_staff), s
     return {"data": {"orders": orders, "profiles": list(profiles_by_id.values())}}
 
 
+@router.get("/api/admin-shopping/international-orders/{order_id}/items/{item_index}/preview-image")
+async def api_admin_international_preview_image(order_id: uuid.UUID, item_index: int, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "international.view")
+    order = await session.get(MODEL_BY_TABLE["international_orders"], order_id)
+    items = (order.extra_data or {}).get("items", []) if order is not None else []
+    if not isinstance(items, list):
+        items = []
+    if order is None or order.deleted_at is not None or item_index < 0 or item_index >= len(items) or not isinstance(items[item_index], dict):
+        raise HTTPException(404, "international_order_item_not_found")
+    data, mime = await product_preview_image(items[item_index].get("url") or "")
+    return Response(data, media_type=mime, headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
+
 @router.get("/api/admin-shopping/international-orders/{order_id}/attachments/{file_id}")
 async def api_admin_international_order_attachment(
     order_id: uuid.UUID,
@@ -5196,10 +5215,11 @@ async def api_admin_international_order_attachment(
 ):
     order = await session.get(MODEL_BY_TABLE["international_orders"], order_id)
     asset = await session.get(FileAsset, file_id)
+    items = (order.extra_data or {}).get("items", []) if order is not None else []
     linked_to_order = any(
         isinstance(item, dict)
         and str(item.get("image_url") or "").strip().lower() == f"file:{file_id}"
-        for item in (order.items if order is not None and isinstance(order.items, list) else [])
+        for item in (items if isinstance(items, list) else [])
     )
     if (
         order is None
@@ -5217,24 +5237,35 @@ async def api_admin_international_order_attachment(
 
     headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
     if asset.storage_provider == "cloudflare_r2":
-        try:
+        def read_image():
             object_response = storage._r2_client().get_object(
-                Bucket=str(storage.settings.r2_bucket), Key=str(asset.storage_key)
+                Bucket=str(asset.storage_bucket or storage.settings.r2_bucket), Key=str(asset.storage_key)
             )
-        except Exception as exc:
-            raise HTTPException(status_code=404, detail="international_attachment_not_found") from exc
-        body = object_response.get("Body")
-        if body is None:
-            raise HTTPException(status_code=404, detail="international_attachment_not_found")
-
-        def stream_body():
+            body = object_response.get("Body")
+            if body is None:
+                raise HTTPException(404, "international_attachment_not_found")
             try:
-                while chunk := body.read(1024 * 1024):
-                    yield chunk
+                data = body.read(10 * 1024 * 1024 + 1)
+                if not data:
+                    raise HTTPException(404, "international_attachment_not_found")
+                if len(data) > 10 * 1024 * 1024:
+                    raise HTTPException(413, "international_attachment_too_large")
+                return data
             finally:
                 body.close()
 
-        return StreamingResponse(stream_body(), media_type=asset.content_type, headers=headers)
+        try:
+            async with asyncio.timeout(20):
+                data = await asyncio.to_thread(read_image)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            error = getattr(exc, "response", {}) or {}
+            code = str(error.get("Error", {}).get("Code") or "") if isinstance(error, dict) else ""
+            if code in {"NoSuchKey", "NoSuchBucket", "404"}:
+                raise HTTPException(404, "international_attachment_not_found") from None
+            raise HTTPException(503, "international_attachment_storage_unavailable") from None
+        return Response(data, media_type=asset.content_type, headers=headers)
 
     if asset.storage_provider != "local_uploads":
         raise HTTPException(status_code=404, detail="international_attachment_not_found")
@@ -6133,6 +6164,59 @@ async def api_list_coupons(staff: User = Depends(require_staff), session: AsyncS
     return {"data": [serialize_record(row) for row in await _rows(session, "coupons", limit=500)]}
 
 
+async def _record_content_interaction(session: AsyncSession, *, target: str, event: str, session_id: uuid.UUID, user_id: uuid.UUID | None = None, notification: bool = False) -> bool:
+    day = "notification" if notification else datetime.now(timezone.utc).date().isoformat()
+    record_id = uuid.uuid5(uuid.NAMESPACE_URL, f"luxury:{target}:{event}:{session_id}:{day}")
+    model = MODEL_BY_TABLE["analytics_events"]
+    statement = pg_insert(model).values(
+        id=record_id, user_id=user_id, type=event, description=target,
+        extra_data={"source": "notification" if notification else "website", "target_id": target},
+    ).on_conflict_do_nothing(index_elements=[model.id]).returning(model.id)
+    return (await session.execute(statement)).scalar_one_or_none() is not None
+
+
+@router.post("/api/marketing/campaigns/{record_id}/interaction")
+async def api_public_campaign_interaction(record_id: uuid.UUID, request: Request, session: AsyncSession = Depends(get_session)):
+    body = await request.json()
+    if not isinstance(body, dict) or body.get("event") not in {"opened", "clicked"}:
+        raise HTTPException(422, "unsupported_campaign_event")
+    session_id = _uuid(body.get("session_id"), "session_id")
+    row = await session.get(MODEL_BY_TABLE["marketing_campaigns"], record_id)
+    extra = dict(getattr(row, "extra_data", None) or {})
+    now = datetime.now(timezone.utc)
+    def within_schedule(value: Any, *, ending: bool) -> bool:
+        if not value:
+            return True
+        try:
+            instant = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if instant.tzinfo is None:
+                instant = instant.replace(tzinfo=timezone.utc)
+            return instant > now if ending else instant <= now
+        except ValueError:
+            return False
+    if row is None or row.deleted_at is not None or row.status not in {"active", "published", "completed"} or extra.get("is_active") is False or not within_schedule(extra.get("starts_at") or extra.get("scheduled_at"), ending=False) or not within_schedule(extra.get("ends_at"), ending=True):
+        raise HTTPException(404, "campaign_not_found")
+    counted = await _record_content_interaction(session, target=str(record_id), event=f"campaign_{body['event']}", session_id=session_id)
+    await session.commit()
+    return {"counted": counted}
+
+
+@router.post("/api/content/blog/{slug}/view")
+async def api_blog_view(slug: str, request: Request, session: AsyncSession = Depends(get_session)):
+    body = await request.json()
+    session_id = _uuid(body.get("session_id") if isinstance(body, dict) else None, "session_id")
+    row = next((item for item in await _blog_source_rows(session) if _blog_article_payload(item)["slug"] == slug and _blog_article_payload(item)["is_published"]), None)
+    if row is None:
+        raise HTTPException(404, "article_not_found")
+    counted = await _record_content_interaction(session, target=str(row.id), event="blog_view", session_id=session_id)
+    if counted:
+        await session.refresh(row, with_for_update=True)
+        row.extra_data = {**(row.extra_data or {}), "views_count": _blog_article_payload(row)["views_count"] + 1}
+    views = _blog_article_payload(row)["views_count"]
+    await session.commit()
+    return {"counted": counted, "views_count": views}
+
+
 @router.get("/api/marketing/campaigns/active")
 async def api_public_active_campaigns(type: str | None = None, session: AsyncSession = Depends(get_session)):
     return await public_read_cache.get_or_set(
@@ -6154,6 +6238,8 @@ async def _api_public_active_campaigns_uncached(type: str | None, session: Async
     rows = []
     for row in result.scalars():
         extra = dict(row.extra_data or {})
+        if extra.get("is_active") is False:
+            continue
         starts_at = extra.get("starts_at") or extra.get("scheduled_at")
         ends_at = extra.get("ends_at")
         if starts_at and str(starts_at) > now_text:
@@ -6161,6 +6247,7 @@ async def _api_public_active_campaigns_uncached(type: str | None, session: Async
         if ends_at and str(ends_at) < now_text:
             continue
         rows.append({
+            **{key: extra[key] for key in ("title_en", "subtitle", "subtitle_en", "content_en", "coupon_code", "coupon_description", "coupon_description_en", "image_url", "link_url", "link_text", "link_text_en", "display_frequency", "display_duration", "priority", "bg_color", "text_color", "accent_color") if key in extra},
             "id": str(row.id),
             "campaign_type": extra.get("campaign_type") or extra.get("type") or "promo_notification",
             "title": row.title,
@@ -12536,10 +12623,42 @@ async def create_campaign(
 
 
 @router.post("/api/marketing/coupons", status_code=201)
-async def api_create_coupon(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+async def api_create_coupon(request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, roles, "coupons.create")
     body = await request.json()
-    if body.get("discount_type") == "percentage" and float(body.get("discount_value") or body.get("amount") or 0) > 100:
-        raise HTTPException(status_code=400, detail="invalid_coupon_percentage")
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid_coupon_payload")
+    code = str(body.get("code") or "").strip().upper()
+    if not code or len(code) > 100:
+        raise HTTPException(422, "invalid_coupon_code")
+    body = {**body, "code": code}
+    discount_type = body.get("discount_type")
+    try:
+        amount = Decimal(str(body.get("discount_value", body.get("amount", 0))))
+        if not amount.is_finite() or (discount_type != "free_shipping" and amount <= 0) or (discount_type == "percentage" and amount > 100):
+            raise ValueError()
+    except (ValueError, ArithmeticError):
+        raise HTTPException(422, "invalid_coupon_discount") from None
+    if discount_type not in {"percentage", "fixed", "free_shipping"}:
+        raise HTTPException(422, "invalid_coupon_discount_type")
+    for field in ("max_uses", "uses_per_user"):
+        value = body.get(field)
+        if value is not None:
+            try:
+                if isinstance(value, bool) or int(value) <= 0 or Decimal(str(value)) != int(value):
+                    raise ValueError()
+            except (ValueError, TypeError, ArithmeticError):
+                raise HTTPException(422, f"invalid_coupon_{field}") from None
+    await _assert_coupon_code_available(session, code)
+    if body.get("valid_until"):
+        try:
+            end = datetime.fromisoformat(str(body["valid_until"]).replace("Z", "+00:00"))
+            start = datetime.fromisoformat(str(body.get("valid_from") or datetime.now(timezone.utc).isoformat()).replace("Z", "+00:00"))
+            if (end.replace(tzinfo=end.tzinfo or timezone.utc) <= start.replace(tzinfo=start.tzinfo or timezone.utc)):
+                raise ValueError()
+        except ValueError:
+            raise HTTPException(422, "invalid_coupon_dates") from None
+        body["expires_at"] = end
     row = await _api_create(session, "coupons", body, staff)
     await session.commit()
     return {"data": row}
@@ -13796,6 +13915,27 @@ async def read_notification(notification_id: uuid.UUID, user: User = Depends(cur
         raise HTTPException(status_code=404, detail="notification_not_found")
     await session.commit()
     return serialize_record(row)
+
+
+@router.post("/api/notifications/{notification_id}/interaction")
+async def notification_interaction(notification_id: uuid.UUID, request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    body = await request.json()
+    if not isinstance(body, dict) or body.get("event") not in {"opened", "clicked"}:
+        raise HTTPException(422, "unsupported_campaign_event")
+    model = MODEL_BY_TABLE["notifications"]
+    row = (await session.execute(select(model).where(model.id == notification_id, _notification_visible_clause(model, user.id)).limit(1))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "notification_not_found")
+    payload = dict(row.payload or {})
+    campaign_id = payload.get("campaign_id") or (row.extra_data or {}).get("campaign_id")
+    if not campaign_id:
+        return {"counted": False}
+    campaign = await session.get(MODEL_BY_TABLE["marketing_campaigns"], _uuid(campaign_id, "campaign_id"))
+    if campaign is None or campaign.deleted_at is not None:
+        return {"counted": False}
+    counted = await _record_content_interaction(session, target=str(campaign.id), event=f"campaign_{body['event']}", session_id=uuid.uuid5(notification_id, str(user.id)), user_id=user.id, notification=True)
+    await session.commit()
+    return {"counted": counted}
 
 
 @router.patch("/notifications/read-all")
@@ -15106,6 +15246,19 @@ async def save_theme(
 @router.get("/storage/policies")
 async def storage_policies(staff: User = Depends(require_staff)):
     return StoragePolicyRegistry.as_dict()
+
+
+@router.post("/storage/import-product-image", status_code=201)
+async def import_product_image(request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, roles, "products.import")
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"url"}:
+        raise HTTPException(422, "image_url_required")
+    policy = StoragePolicyRegistry.resolve("product_image")
+    data, mime = await download_product_image(body["url"], min(policy.max_bytes, get_settings().max_upload_bytes))
+    extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}[mime]
+    uploaded = UploadFile(filename=f"product-import.{extension}", file=BytesIO(data), headers=Headers({"content-type": mime}))
+    return await _secure_upload_from_request(request, user=staff, roles=roles, session=session, forced_policy="product_image", uploaded_file=uploaded)
 
 
 @router.post("/storage/upload", status_code=201)

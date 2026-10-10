@@ -221,6 +221,8 @@ SEARCH_PREFIXES = (
     "/api/catalog/brands",
 )
 UPLOAD_PREFIXES = (
+    "/storage/import-product-image",
+    "/api/storage/import-product-image",
     "/storage/upload",
     # The /api-prefixed routes are compatibility aliases registered from the
     # same router. They must receive the upload policy too; otherwise the
@@ -476,6 +478,8 @@ def policy_for_route(method: str, path: str) -> ApiProtectionPolicy:
         return _policy("e2e_verification", auth=False, rate="internal_diagnostics", sensitive=True, audit=method != "GET")
     if method == "POST" and normalized == "/api/analytics/events":
         return _policy("public_write", auth=False, rate="public_read", public=True, audit=False)
+    if method == "POST" and (re.fullmatch(r"/api/content/blog/[^/]+/view", normalized) or re.fullmatch(r"/api/marketing/campaigns/[0-9a-f-]{36}/interaction", normalized)):
+        return _policy("public_write", auth=False, rate="customer_write", public=True, audit=False, maximum_request_bytes=1024)
     if method == "POST" and normalized == "/api/partnership/apply":
         return _policy("public_write", auth=False, rate="support_write", public=True, sensitive=True, audit=True)
     if method == "POST" and normalized == "/api/communication/contact":

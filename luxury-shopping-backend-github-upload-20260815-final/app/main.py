@@ -410,6 +410,8 @@ def _should_invalidate_public_cache(request: Request) -> bool:
 
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return False
+    if request.method == "POST" and (re.fullmatch(r"/api/content/blog/[^/]+/view", request.url.path) or re.fullmatch(r"/api/marketing/campaigns/[0-9a-f-]{36}/interaction", request.url.path)):
+        return False
     return _matches_prefix(request.url.path, PUBLIC_CACHE_INVALIDATION_PREFIXES)
 
 

@@ -180,7 +180,6 @@ def public_product_base_clauses(model: type[Product] = Product) -> list[Any]:
         or_(model.is_active.is_(True), model.is_active.is_(None)),
         public_approval_clause(model),
         public_product_safe_text_clause(model),
-        public_product_image_clause(model),
         public_partner_product_clause(model),
     ]
 

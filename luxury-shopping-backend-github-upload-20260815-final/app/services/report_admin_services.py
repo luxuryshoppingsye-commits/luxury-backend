@@ -2092,6 +2092,8 @@ class CampaignService:
     async def response(self, session: AsyncSession, row: Any) -> dict[str, Any]:
         payload = serialize_record(row)
         payload["metrics"] = await self.metrics(session, row.id)
+        payload["view_count"] = int(payload.get("view_count") or 0) + payload["metrics"]["opened"]
+        payload["click_count"] = int(payload.get("click_count") or 0) + payload["metrics"]["clicked"]
         return payload
 
     @staticmethod
