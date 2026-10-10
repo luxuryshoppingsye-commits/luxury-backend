@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
+
 from alembic import op
+import sqlalchemy as sa
 
 
 revision = "20260720_03"
@@ -24,15 +27,31 @@ def upgrade() -> None:
         "cash_transactions",
         "vouchers",
     ):
-        op.execute(
-            f"""
-            ALTER TABLE {table}
-            ADD CONSTRAINT ck_financial_{table}_amount_nonnegative
-            CHECK (amount IS NULL OR amount >= 0)
-            NOT VALID
-            """
-        )
-        op.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT ck_financial_{table}_amount_nonnegative")
+        name = f"ck_financial_{table}_amount_nonnegative"
+        existing = op.get_bind().execute(
+            sa.text("""
+                SELECT contype::text AS contype, convalidated, pg_get_expr(conbin, conrelid) AS expression
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(:table) AND conname = :name
+            """),
+            {"table": table, "name": name},
+        ).mappings().one_or_none()
+        if existing is None:
+            op.execute(
+                f"ALTER TABLE {table} ADD CONSTRAINT {name} "
+                "CHECK (amount IS NULL OR amount >= 0) NOT VALID"
+            )
+        else:
+            expression = str(existing["expression"] or "").lower()
+            expression = re.sub(r"::(?:numeric|integer|bigint|smallint|real|double precision)", "", expression)
+            expression = re.sub(r"[\s()\"']", "", expression)
+            expression = re.sub(r"\b0\.0+\b", "0", expression)
+            if existing["contype"] != "c" or expression not in {
+                "amountisnulloramount>=0", "amount>=0oramountisnull",
+            }:
+                raise RuntimeError(f"Existing constraint {name} does not match the nonnegative amount guard")
+        if existing is None or not existing["convalidated"]:
+            op.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}")
 
     op.execute(
         """
