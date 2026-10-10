@@ -90,6 +90,7 @@ from ...services.financial_calculator import (
     loyalty_tier_catalog,
     loyalty_tier_for_points,
     LOCAL_PAYMENT_SUCCESS_STATUSES,
+    local_request_total,
     money,
     reconcile_loyalty_for_user,
     receipt_amount_for_order,
@@ -249,7 +250,7 @@ async def _queue_email_push_mirror(
             created_by=created_by,
             source="operations_email_mirror",
             deduplication_key=deduplication_key,
-            delivery_channels=("in_app", "mobile_push"),
+            delivery_channels=("in_app", "mobile_push", "web_push"),
         )
     )
 SEED_UPLOADS_SAMPLE = "products/0039c8877ec3f5759d10cb9b.webp"
@@ -941,7 +942,7 @@ async def _notify_coupon_customers(
             created_by=actor.id,
             source="partner_coupon_campaign",
             deduplication_key=f"coupon-campaign:{coupon.id}:{notification_revision}:{customer_id}",
-            delivery_channels=("in_app", "mobile_push"),
+            delivery_channels=("in_app", "mobile_push", "web_push"),
         )
         for customer_id in customer_ids
         if opted_in.get(customer_id, True) is not False
@@ -4954,7 +4955,7 @@ async def _create_local_request_notification(
             },
             created_by=created_by,
             source="local_shopping",
-            delivery_channels=("in_app", "mobile_push"),
+            delivery_channels=("in_app", "mobile_push", "web_push"),
             deduplication_key=f"local-request-created:{request_id}" if created else f"local-request-status:{request_id}:{status_key}",
         )
     )
@@ -5004,11 +5005,22 @@ async def api_local_shopping_attachment(
     local_request = await session.get(MODEL_BY_TABLE["local_shopping_requests"], request_id)
     asset = await session.get(FileAsset, file_id)
     staff_access = bool(roles.intersection({"admin", "manager", "staff", "finance"}))
+    payload = serialize_record(local_request) if local_request is not None else {}
+    refs = list(payload.get("image_urls") or [])
+    for item in payload.get("items") or []:
+        if isinstance(item, dict):
+            refs.extend(item.get("image_urls") or [])
+            refs.append(item.get("product_image_url") or item.get("image_url") or "")
+    linked = any(str(ref).strip().lower() == f"file:{file_id}" or str(ref).endswith(f"/attachments/{file_id}") for ref in refs)
+
     if (
         local_request is None
         or local_request.deleted_at is not None
         or asset is None
         or asset.deleted_at is not None
+        or not linked
+        or asset.owner_user_id != local_request.user_id
+        or str(asset.content_type or "").lower() not in {"image/jpeg", "image/png", "image/webp"}
         or asset.policy_key != "customer_request_attachment"
         or asset.status != "available"
         or asset.scan_status not in {"clean", "not_required"}
@@ -5016,49 +5028,44 @@ async def api_local_shopping_attachment(
         or (not staff_access and asset.owner_user_id not in {None, local_request.user_id})
     ):
         raise HTTPException(status_code=404, detail="local_attachment_not_found")
-    response_headers = {
-        "Cache-Control": "private, max-age=0, no-store",
-        "X-Content-Type-Options": "nosniff",
-    }
+    headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
     if asset.storage_provider == "cloudflare_r2":
-        try:
-            r2_response = storage._r2_client().get_object(
-                Bucket=str(storage.settings.r2_bucket),
-                Key=str(asset.storage_key),
+        def read_image():
+            object_response = storage._r2_client().get_object(
+                Bucket=str(asset.storage_bucket or storage.settings.r2_bucket), Key=str(asset.storage_key)
             )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=404, detail="local_attachment_not_found") from exc
-        body = r2_response.get("Body")
-        if body is None:
-            raise HTTPException(status_code=404, detail="local_attachment_not_found")
-        content_length = r2_response.get("ContentLength")
-        if content_length is not None:
-            response_headers["Content-Length"] = str(content_length)
-
-        def stream_r2_body():
+            body = object_response.get("Body")
+            if body is None:
+                raise HTTPException(404, "local_attachment_not_found")
             try:
-                while True:
-                    chunk = body.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
+                data = body.read(10 * 1024 * 1024 + 1)
+                if not data:
+                    raise HTTPException(404, "local_attachment_not_found")
+                if len(data) > 10 * 1024 * 1024:
+                    raise HTTPException(413, "local_attachment_too_large")
+                return data
             finally:
                 body.close()
 
-        return StreamingResponse(
-            stream_r2_body(),
-            media_type=asset.content_type,
-            headers=response_headers,
-        )
+        try:
+            async with asyncio.timeout(20):
+                data = await asyncio.to_thread(read_image)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            error = getattr(exc, "response", {}) or {}
+            code = str(error.get("Error", {}).get("Code") or "") if isinstance(error, dict) else ""
+            if code in {"NoSuchKey", "NoSuchBucket", "404"}:
+                raise HTTPException(404, "local_attachment_not_found") from None
+            raise HTTPException(503, "local_attachment_storage_unavailable") from None
+        return Response(data, media_type=asset.content_type, headers=headers)
 
     if asset.storage_provider != "local_uploads":
-        raise HTTPException(status_code=503, detail="local_attachment_storage_unavailable")
+        raise HTTPException(status_code=404, detail="local_attachment_not_found")
     target = storage._safe_join(asset.storage_key)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="local_attachment_not_found")
-    return FileResponse(target, media_type=asset.content_type, headers=response_headers)
+    return FileResponse(target, media_type=asset.content_type, headers=headers)
 
 
 @router.post("/api/shopping/local/requests", status_code=201)
@@ -9991,7 +9998,7 @@ async def _create_international_order_status_notification(
             },
             created_by=created_by,
             source="international_order_status",
-            delivery_channels=("in_app", "mobile_push"),
+            delivery_channels=("in_app", "mobile_push", "web_push"),
             deduplication_key=f"international-order-status:{order.id}:{previous_status}:{next_status}",
         )
     )
@@ -12813,10 +12820,20 @@ async def api_create_manual_order(request: Request, staff: User = Depends(requir
 @router.patch("/api/admin/orders/{order_id}/assignee")
 async def api_assign_order(order_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     row = await session.get(Order, order_id)
-    if row is None:
+    if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="order_not_found")
     body = await request.json()
-    row.extra_data = {**(row.extra_data or {}), "assignee_id": body.get("user_id")}
+    raw_id = body.get("user_id")
+    assigned_id = _uuid(raw_id, "user_id") if raw_id else None
+    if assigned_id is not None:
+        eligible = (await session.execute(select(User.id).join(UserRole, UserRole.user_id == User.id).where(
+            User.id == assigned_id, User.is_active.is_(True), User.deleted_at.is_(None),
+            UserRole.role.in_(("admin", "manager", "staff", "employee", "finance", "logistics")),
+        ).limit(1))).scalar_one_or_none()
+        if eligible is None:
+            raise HTTPException(status_code=422, detail="active_staff_required")
+    assigned = str(assigned_id) if assigned_id else None
+    row.extra_data = {**(row.extra_data or {}), "assigned_to": assigned, "assignee_id": assigned}
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -13351,6 +13368,17 @@ async def api_reply_contact_message(
     return {"queued": True, "data": outbox}
 
 
+@router.get("/api/admin/contact-messages/{record_id}/reply-delivery")
+async def contact_reply_delivery(record_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    contact = await session.get(MODEL_BY_TABLE["contact_messages"], record_id)
+    if contact is None or contact.deleted_at is not None:
+        raise HTTPException(404, "message_not_found")
+    model = MODEL_BY_TABLE["email_outbox"]
+    row = (await session.execute(select(model).where(model.deleted_at.is_(None), model.extra_data["contact_message_id"].astext == str(record_id))
+        .order_by(model.created_at.desc()).limit(1))).scalar_one_or_none()
+    return {"data": {"status": row.status, "error_code": (row.extra_data or {}).get("last_error_code")} if row else None}
+
+
 @router.get("/api/support/tickets")
 async def api_support_tickets(
     user: User = Depends(current_user),
@@ -13684,11 +13712,88 @@ async def api_download_backup(backup_id: uuid.UUID, staff: User = Depends(requir
     return await BackupCoordinator().download(session, backup_id)
 
 
+async def _local_courier_rows(session: AsyncSession, request_id: uuid.UUID, *, lock: bool = False):
+    model = MODEL_BY_TABLE["courier_assignments"]
+    query = select(model).where(model.deleted_at.is_(None), model.extra_data["local_request_id"].astext == str(request_id)).order_by(model.created_at.desc())
+    if lock:
+        query = query.with_for_update()
+    return list((await session.execute(query)).scalars())
+
+
+@router.get("/api/admin/local-requests/{request_id}/courier-assignment")
+async def local_courier_assignment(request_id: uuid.UUID, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    request = await session.get(MODEL_BY_TABLE["local_shopping_requests"], request_id)
+    if request is None or request.deleted_at is not None:
+        raise HTTPException(404, "local_shopping_request_not_found")
+    current = next((row for row in await _local_courier_rows(session, request_id) if _assignment_is_current(row)), None)
+    return {"data": serialize_record(current) if current else None}
+
+
+@router.patch("/api/admin/local-requests/{request_id}/courier-assignment")
+async def set_local_courier_assignment(request_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    row = await session.get(MODEL_BY_TABLE["local_shopping_requests"], request_id, with_for_update=True)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(404, "local_shopping_request_not_found")
+    if str(row.status or "").lower() in {"delivered", "cancelled", "rejected"}:
+        raise HTTPException(409, "local_request_delivery_closed")
+    body = await request.json()
+    raw_id = body.get("courier_id")
+    requested_id = _uuid(raw_id, "courier_id") if raw_id else None
+    courier = None
+    if requested_id:
+        courier = await session.get(MODEL_BY_TABLE["couriers"], requested_id)
+        if courier is None or courier.deleted_at is not None or (courier.extra_data or {}).get("is_active") is False or str(courier.status or "active").lower() in {"inactive", "disabled"}:
+            raise HTTPException(422, "active_courier_required")
+        eligible = (await session.execute(select(User.id).join(UserRole, UserRole.user_id == User.id).where(
+            User.id == courier.user_id, User.is_active.is_(True), User.deleted_at.is_(None), UserRole.role.in_(("courier", "delivery")),
+        ).limit(1))).scalar_one_or_none()
+        if eligible is None:
+            raise HTTPException(422, "courier_account_link_required")
+    current_rows = await _local_courier_rows(session, request_id, lock=True)
+    for previous in current_rows:
+        if not _assignment_is_current(previous):
+            continue
+        if courier and previous.courier_id == courier.id and previous.status in COURIER_ACTIVE_STATUSES:
+            return {"data": serialize_record(previous)}
+        previous.extra_data = {**(previous.extra_data or {}), "is_current": False, "unassigned_by": str(staff.id)}
+        if previous.status in COURIER_ACTIVE_STATUSES:
+            previous.status = "cancelled"
+    assignment = None
+    if courier:
+        assignment = MODEL_BY_TABLE["courier_assignments"](courier_id=courier.id, user_id=courier.user_id, status="assigned",
+            extra_data={"is_current": True, "local_request_id": str(request_id), "assigned_by": str(staff.id), "source": "local_request_workflow"})
+        session.add(assignment)
+        await session.flush()
+    row.extra_data = {**(row.extra_data or {}), "courier_assignment_id": str(assignment.id) if assignment else None}
+    await session.commit()
+    return {"data": serialize_record(assignment) if assignment else None}
+
+
 @router.get("/delivery/assignments")
 async def delivery_assignments(user: User = Depends(require_courier), session: AsyncSession = Depends(get_session)):
     model = MODEL_BY_TABLE["courier_assignments"]
-    result = await session.execute(select(model).where(or_(model.user_id == user.id, model.courier_id == user.id)).order_by(model.created_at.desc()))
-    return [serialize_record(row) for row in result.scalars()]
+    result = await session.execute(select(model).where(model.deleted_at.is_(None), or_(model.user_id == user.id, model.courier_id == user.id)).order_by(model.created_at.desc()).limit(200))
+    payloads = []
+    for assignment in result.scalars():
+        if not _assignment_is_current(assignment):
+            continue
+        data = serialize_record(assignment)
+        local_id = (assignment.extra_data or {}).get("local_request_id")
+        target = await session.get(MODEL_BY_TABLE["local_shopping_requests"], _uuid(local_id, "local_request_id")) if local_id else await session.get(Order, assignment.order_id) if assignment.order_id else None
+        if target is None or target.deleted_at is not None:
+            continue
+        payload = serialize_record(target)
+        profile = (await session.execute(select(Profile).where(Profile.user_id == target.user_id).limit(1))).scalar_one_or_none()
+        customer = serialize_record(profile) if profile else {}
+        data["orders"] = {"order_number": payload.get("order_number") or f"LS-{str(target.id)[:8].upper()}", "status": target.status,
+            "total": str(local_request_total(payload)) if local_id else str(target.total), "currency_code": payload.get("currency_code") or "YER",
+            "created_at": payload.get("created_at"), "shipping_address": payload.get("shipping_address") or {key: customer.get(key) for key in ("city", "governorate", "street", "address")}, "notes": payload.get("notes")}
+        data.update(order_type="local" if local_id else "order", order_number=payload.get("order_number") or f"LS-{str(target.id)[:8].upper()}",
+            description=payload.get("product_description") or payload.get("description") or "طلب توصيل",
+            customer_name=customer.get("full_name"), customer_phone=customer.get("phone"),
+            delivery_address=payload.get("shipping_address") or {key: customer.get(key) for key in ("city", "governorate", "street", "address")})
+        payloads.append(data)
+    return payloads
 
 
 @router.patch("/delivery/assignments/{assignment_id}/status")
@@ -14294,6 +14399,13 @@ async def register_web_push_subscription(request: Request, user: User = Depends(
     settings = get_settings()
     await session.commit()
     return {"ok": True, "subscription": result, "vapidConfigured": bool(settings.vapid_public_key and settings.vapid_private_key)}
+
+
+@router.get("/api/notifications/push-config")
+async def notification_push_config(user: User = Depends(current_user)):
+    settings = get_settings()
+    configured = bool(settings.vapid_public_key and settings.vapid_private_key and settings.vapid_subject)
+    return {"configured": configured, "publicKey": settings.vapid_public_key if configured else None}
 
 
 @router.get("/notifications/preferences")

@@ -568,13 +568,18 @@ async def deliver_email_now(session: AsyncSession, row: Any) -> dict[str, Any]:
     }
 
 
-async def _claim_rows(session: AsyncSession, table: str, limit: int) -> list[Any]:
+async def _claim_rows(session: AsyncSession, table: str, limit: int, *, resume_contact_replies: bool = False) -> list[Any]:
     model = MODEL_BY_TABLE[table]
+    eligible = model.status.in_(CLAIMABLE_STATUSES)
+    if resume_contact_replies:
+        eligible = eligible | ((model.status == "blocked_configuration") &
+            model.extra_data["contact_message_id"].astext.is_not(None) &
+            (model.created_at >= _now() - timedelta(days=7)))
     rows = list(
         (
             await session.execute(
                 select(model)
-                .where(model.status.in_(CLAIMABLE_STATUSES), model.deleted_at.is_(None))
+                .where(eligible, model.deleted_at.is_(None))
                 .order_by(model.created_at)
                 .with_for_update(skip_locked=True)
                 .limit(limit)
@@ -650,7 +655,7 @@ async def process_email_outbox(session: AsyncSession, limit: int | None = None) 
     settings = get_settings()
     limit = limit or settings.message_batch_size
     configured = email_delivery_configured(settings)
-    rows = await _claim_rows(session, "email_outbox", limit)
+    rows = await _claim_rows(session, "email_outbox", limit, resume_contact_replies=configured)
     counts = {"configured": configured, "claimed": len(rows), "provider_accepted": 0, "in_app_mirrored": 0, "retry_scheduled": 0, "failed_permanent": 0, "dead_letter": 0, "blocked_configuration": 0, "suppressed": 0}
     for row in rows:
         extra = _extra(row)

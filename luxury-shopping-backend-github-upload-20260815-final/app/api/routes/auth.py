@@ -1626,24 +1626,28 @@ async def admin_staff_members(
 ):
     rows = (
         await session.execute(
-            select(User, Profile)
+            select(User, Profile, UserRole.role)
             .join(Profile, Profile.user_id == User.id, isouter=True)
             .join(UserRole, UserRole.user_id == User.id)
-            .where(UserRole.role.in_(STAFF_ROLE_KEYS))
+            .where(UserRole.role.in_(STAFF_ROLE_KEYS), User.deleted_at.is_(None), User.is_active.is_(True))
             .order_by(User.created_at.desc())
         )
     ).all()
-    return {"data": [
-        {
+    members: dict[str, dict] = {}
+    for user, profile, role in rows:
+        key = str(user.id)
+        if key not in members:
+            members[key] = {
             "id": str(user.id),
             "user_id": str(user.id),
             "email": user.email,
             "full_name": profile.full_name if profile else "",
             "roles": [],
+            "role": role,
             "is_active": user.is_active,
         }
-        for user, profile in rows
-    ]}
+        members[key]["roles"].append(role)
+    return {"data": list(members.values())}
 
 
 @router.get("/api/admin/staff/roles")

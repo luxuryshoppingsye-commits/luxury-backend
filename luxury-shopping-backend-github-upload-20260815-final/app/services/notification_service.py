@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import uuid
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -699,6 +700,11 @@ class NotificationService:
 
     async def register_web_push_subscription(self, user_id: uuid.UUID, body: dict[str, Any]) -> dict[str, Any]:
         endpoint = str(body.get("endpoint") or "").strip()
+        parsed = urlsplit(endpoint)
+        host = (parsed.hostname or "").lower()
+        providers = ("fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com", "notify.windows.com")
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in {None, 443} or not any(host == provider or host.endswith("." + provider) for provider in providers):
+            raise ValueError("invalid_push_endpoint")
         keys = body.get("keys") or {}
         p256dh = str(body.get("p256dh") or keys.get("p256dh") or "").strip()
         auth = str(body.get("auth") or keys.get("auth") or "").strip()

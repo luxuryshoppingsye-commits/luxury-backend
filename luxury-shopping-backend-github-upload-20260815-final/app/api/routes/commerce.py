@@ -874,6 +874,8 @@ async def _advisory_xact_lock(session: AsyncSession, scope: str) -> None:
 
 def _serialize_order(order: Order, *, idempotency_replayed: bool | None = None) -> dict[str, Any]:
     row = serialize_record(order)
+    if "assigned_to" not in row and row.get("assignee_id"):
+        row["assigned_to"] = row["assignee_id"]
     for key in IDEMPOTENCY_RESPONSE_INTERNAL_FIELDS:
         row.pop(key, None)
     if idempotency_replayed is not None:

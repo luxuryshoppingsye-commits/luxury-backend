@@ -2130,6 +2130,8 @@ class CourierLocationService:
         ).scalar_one_or_none()
         if assignment is None:
             raise HTTPException(status_code=404, detail="assignment_not_found")
+        if (assignment.extra_data or {}).get("is_current") is False:
+            raise HTTPException(status_code=404, detail="assignment_not_found")
         lat = self._coordinate(body.get("latitude"), field="latitude", low=Decimal("-90"), high=Decimal("90"))
         lon = self._coordinate(body.get("longitude"), field="longitude", low=Decimal("-180"), high=Decimal("180"))
         recorded_at = _parse_datetime(body.get("recordedAt") or body.get("recorded_at") or _now().isoformat(), "recorded_at")
@@ -2201,6 +2203,12 @@ class CourierLocationService:
             "out_for_delivery": {"delivered", "failed"},
         }
         current = str(assignment.status or "assigned").lower()
+        if (assignment.extra_data or {}).get("is_current") is False:
+            raise HTTPException(status_code=404, detail="assignment_not_found")
+        if status == current:
+            return serialize_record(assignment)
+        if current not in allowed:
+            raise HTTPException(status_code=409, detail="invalid_assignment_status_transition")
         if status not in set().union(*allowed.values()) or (current in allowed and status not in allowed[current]):
             raise HTTPException(status_code=409, detail="invalid_assignment_status_transition")
         assignment.status = status
@@ -2234,6 +2242,24 @@ class CourierLocationService:
                             deduplication_key=f"courier-order-status:{assignment.id}:{status}",
                         )
                     )
+        local_id = (assignment.extra_data or {}).get("local_request_id")
+        if local_id:
+            local = await session.get(MODEL_BY_TABLE["local_shopping_requests"], uuid.UUID(local_id), with_for_update=True)
+            if local is None or local.deleted_at is not None or (local.extra_data or {}).get("courier_assignment_id") != str(assignment.id):
+                raise HTTPException(409, "assignment_no_longer_current")
+            if local.status in {"cancelled", "rejected"}:
+                raise HTTPException(409, "local_request_delivery_closed")
+            local_status = {"picked_up": "shipping", "in_transit": "shipping", "delivering": "shipped", "out_for_delivery": "shipped", "delivered": "delivered"}.get(status)
+            if (local_status and local.status != local_status) or status == "failed":
+                if local_status:
+                    local.status = local_status
+                local.extra_data = {**(local.extra_data or {}), "delivery_status": status}
+                await NotificationService(session).create_notification(NotificationPayload(
+                    user_id=local.user_id, title="تحديث توصيل الطلب المحلي", body="تعذر إتمام توصيل طلبك المحلي؛ سنتواصل معك." if status == "failed" else "تم تسليم طلبك المحلي." if status == "delivered" else "طلبك المحلي في طريقه للتوصيل.",
+                    notification_type="shipping_status_changed", category="shipping", priority="high", action_url="/my-orders",
+                    entity_type="local_shopping_request", entity_id=str(local.id), payload={"local_request_id": str(local.id), "delivery_status": status},
+                    deduplication_key=f"local-courier-status:{assignment.id}:{status}",
+                ))
         await session.commit()
         return serialize_record(assignment)
 
@@ -2620,6 +2646,46 @@ class SupportWorkflowService:
 
 
 class OperationalDayService:
+    async def payload(self, session: AsyncSession, row: Any, day: date) -> dict[str, Any]:
+        start = datetime.combine(day, time.min, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        data = serialize_record(row)
+        orders = 0
+        for model in (Order, MODEL_BY_TABLE["local_shopping_requests"], MODEL_BY_TABLE["international_orders"]):
+            orders += int((await session.execute(select(func.count()).select_from(model).where(
+                model.deleted_at.is_(None), model.created_at >= start, model.created_at < end,
+            ))).scalar_one())
+        revenue = await RevenueRecognitionService.summary(session, start=start, end=end - timedelta(microseconds=1))
+        rates, target = await RevenueRecognitionService.currency_context(session)
+        paid, pending, unverified = Decimal("0"), 0, 0
+        for table in ("order_payments", "payments", "international_order_payments"):
+            model = MODEL_BY_TABLE[table]
+            rows = (await session.execute(select(model).where(
+                model.deleted_at.is_(None), model.created_at >= start, model.created_at < end,
+            ))).scalars()
+            for payment in rows:
+                status = str(payment.status or "").lower()
+                if status in RECOGNIZED_PAYMENT_STATUSES:
+                    payload = serialize_record(payment)
+                    paid += RevenueRecognitionService.converted_amount(payment.amount, payload.get("currency_code") or "YER", rates, target)
+                elif status in PENDING_PAYMENT_STATUSES:
+                    pending += 1
+        receipts = MODEL_BY_TABLE["payment_receipts"]
+        unverified = int((await session.execute(select(func.count()).select_from(receipts).where(
+            receipts.deleted_at.is_(None), receipts.created_at >= start, receipts.created_at < end,
+            func.lower(receipts.status).in_(tuple(PENDING_PAYMENT_STATUSES)),
+        ))).scalar_one())
+        workflow = (row.extra_data or {}).get("workflow", [])
+        opened = next((event for event in reversed(workflow) if event.get("action") in {"open", "reopen"}), {})
+        closed = next((event for event in reversed(workflow) if event.get("action") == "close"), {})
+        data.update(operation_date=day.isoformat(), total_orders=orders,
+            total_revenue=float(revenue["net_revenue"]), total_payments_received=float(money(paid)),
+            pending_payments_count=pending, unverified_payments_count=unverified, currency_code=target,
+            opened_at=opened.get("at"), opened_by=opened.get("by"),
+            closed_at=closed.get("at") if row.status == "closed" else None,
+            closed_by=closed.get("by") if row.status == "closed" else None)
+        return data
+
     async def today(self, session: AsyncSession) -> dict[str, Any]:
         day = _parse_day(None)
         date_text = day.isoformat()
@@ -2634,7 +2700,7 @@ class OperationalDayService:
             .limit(1)
         )
         row = result.scalar_one_or_none()
-        return {"data": serialize_record(row) if row is not None else None}
+        return {"data": await self.payload(session, row, day) if row is not None else None}
 
     async def action(self, session: AsyncSession, *, actor: User, action: str, raw_date: Any) -> dict[str, Any]:
         day = _parse_day(raw_date)
@@ -2665,7 +2731,7 @@ class OperationalDayService:
         workflow.append({"action": action, "at": _now().isoformat(), "by": str(actor.id)})
         row.extra_data = {**(row.extra_data or {}), "date": date_text, "workflow": workflow, "pending_orders_checked": len(blockers)}
         await session.commit()
-        return {"data": serialize_record(row)}
+        return {"data": await self.payload(session, row, day)}
 
     @staticmethod
     async def _pending_orders_for_day(session: AsyncSession, day: date) -> list[dict[str, Any]]:
