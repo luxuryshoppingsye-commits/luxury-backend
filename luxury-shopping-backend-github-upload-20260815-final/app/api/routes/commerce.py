@@ -59,6 +59,7 @@ from ...services.financial_calculator import (
     award_loyalty_points_for_fulfilled_order,
     approved_payment_total,
     calculate_checkout_financials,
+    confirmed_order_payment_totals,
     line_total,
     loyalty_points,
     money,
@@ -2746,31 +2747,15 @@ async def _serialize_orders_with_financials(session: AsyncSession, orders: list[
     for order, payload in zip(orders, payloads):
         payload["items"] = items_by_order.get(order.id, [])
 
-    recognized_statuses = ("confirmed", "approved", "paid", "completed")
-    paid_by_order: dict[uuid.UUID, Decimal] = {order.id: Decimal("0.00") for order in orders}
-    for table_name in ("order_payments", "payments"):
-        payment_model = MODEL_BY_TABLE[table_name]
-        result = await session.execute(
-            select(payment_model.order_id, func.coalesce(func.sum(payment_model.amount), 0))
-            .where(
-                payment_model.order_id.in_(order_ids),
-                payment_model.deleted_at.is_(None),
-                func.lower(payment_model.status).in_(recognized_statuses),
-            )
-            .group_by(payment_model.order_id)
-        )
-        for order_id, amount in result.all():
-            paid_by_order[order_id] = money(paid_by_order.get(order_id, Decimal("0.00")) + _money(amount))
+    paid_by_order = await confirmed_order_payment_totals(session, order_ids)
 
     for order, payload in zip(orders, payloads):
-        # Keep any older derived value when it is larger than the new ledger
-        # total; this makes the rollout safe for legacy orders.
-        paid = max(paid_by_order.get(order.id, Decimal("0.00")), _money(payload.get("paid_amount")))
+        paid = paid_by_order.get(order.id, Decimal("0.00"))
         total = _money(payload.get("total"))
         payload["paid_amount"] = format(money(paid), "f")
         payload["remaining_balance"] = format(money(max(total - paid, Decimal("0.00"))), "f")
-        if paid > 0 and str(payload.get("payment_status") or "").lower() not in {"refunded", "partial_refund", "partially_refunded"}:
-            payload["payment_status"] = "paid" if total > 0 and paid >= total else "partial"
+        if "payment_status" in payload and str(payload.get("payment_status") or "").lower() not in {"refunded", "partial_refund", "partially_refunded", "rejected"}:
+            payload["payment_status"] = "paid" if total > 0 and paid >= total else "partial" if paid > 0 else "pending"
         payload.setdefault("shipping_cost", payload.get("shipping_total", "0"))
     await _attach_courier_assignments(session, orders, payloads)
     return payloads
@@ -2804,20 +2789,7 @@ async def customer_order_counts(
     # /orders derives confirmed payments from both existing ledgers. Only
     # load payment totals for the small, visible store-order subset.
     store_ids = [row["id"] for row in rows if row["source"] == "store"]
-    paid_by_order: dict[uuid.UUID, Decimal] = {}
-    if store_ids:
-        for table_name in ("order_payments", "payments"):
-            payment_model = MODEL_BY_TABLE[table_name]
-            paid_rows = (await session.execute(
-                select(payment_model.order_id, func.coalesce(func.sum(payment_model.amount), 0))
-                .where(
-                    payment_model.order_id.in_(store_ids),
-                    payment_model.deleted_at.is_(None),
-                    func.lower(payment_model.status).in_(("confirmed", "approved", "paid", "completed")),
-                ).group_by(payment_model.order_id)
-            )).all()
-            for order_id, paid in paid_rows:
-                paid_by_order[order_id] = paid_by_order.get(order_id, Decimal("0")) + _dashboard_number(paid)
+    paid_by_order = await confirmed_order_payment_totals(session, store_ids)
 
     counts = dict.fromkeys(("unpaid", "processing", "shipped", "review", "returns"), 0)
     for row in rows:
@@ -2846,11 +2818,11 @@ def _dashboard_payment_status(row: Any, paid_by_order: dict[uuid.UUID, Decimal])
     extra = row["extra_data"] if isinstance(row["extra_data"], dict) else {}
     if row["source"] == "store":
         payment = str(row["payment_status"] or "").strip().lower()
-        paid = max(paid_by_order.get(row["id"], Decimal("0")), _dashboard_number(extra.get("paid_amount")))
+        paid = paid_by_order.get(row["id"], Decimal("0"))
         if paid > 0 and payment not in {"refunded", "partial_refund", "partially_refunded"}:
             total = _dashboard_number(row["total"])
             return "paid" if total > 0 and paid >= total else "partial"
-        return payment
+        return payment if payment in {"refunded", "partial_refund", "partially_refunded", "rejected"} else "unpaid"
 
     raw = extra.get("payment_status")
     if raw is None:
@@ -3946,6 +3918,12 @@ async def order_detail(
     for return_item in return_item_rows:
         items_by_return.setdefault(str(return_item.return_id), []).append(return_item)
     order_payload = _serialize_order(order)
+    paid = await approved_payment_total(session, order.id)
+    total = money(order.total)
+    order_payload["paid_amount"] = format(paid, "f")
+    order_payload["remaining_balance"] = format(max(total - paid, Decimal("0.00")), "f")
+    if str(order.payment_status or "").lower() not in {"refunded", "partial_refund", "partially_refunded", "rejected"}:
+        order_payload["payment_status"] = "paid" if total > 0 and paid >= total else "partial" if paid > 0 else "pending"
     _attach_latest_receipt_to_order_payload(order_payload, order_receipts)
     payload = {
         "order": order_payload,

@@ -92,6 +92,9 @@ from ...services.financial_calculator import (
     LOCAL_PAYMENT_SUCCESS_STATUSES,
     local_request_total,
     money,
+    ORDER_PAYMENT_SUCCESS_STATUSES,
+    payment_balance_conflict,
+    payment_receipt_reference,
     reconcile_loyalty_for_user,
     receipt_amount_for_order,
     refunded_total,
@@ -3992,6 +3995,47 @@ async def _api_catalog_settings_uncached(session: AsyncSession) -> dict[str, Any
     return {"data": {str(row.get("name") or row.get("key") or row.get("id")): row.get("extra_data") or row for row in rows}}
 
 
+async def _lock_payment_orders(session: AsyncSession, table: str, order_ids: list[Any]) -> list[tuple[Order, Decimal]]:
+    if table not in {"order_payments", "payments"}:
+        return []
+    ids = sorted({uuid.UUID(str(value)) for value in order_ids if value}, key=str)
+    if not ids:
+        return []
+    orders = (await session.execute(
+        select(Order).where(Order.id.in_(ids)).order_by(Order.id).with_for_update()
+    )).scalars().all()
+    return [(order, await approved_payment_total(session, order.id)) for order in orders]
+
+
+async def _sync_payment_orders(session: AsyncSession, orders: list[tuple[Order, Decimal]]) -> None:
+    for order, previous_paid in orders:
+        paid = await approved_payment_total(session, order.id)
+        if paid > previous_paid and paid > money(order.total):
+            raise payment_balance_conflict(order, previous_paid, money(paid - previous_paid))
+        await sync_order_payment_status(session, order)
+
+
+async def _validate_order_payment_receipt(session: AsyncSession, table: str, row: Any) -> None:
+    if table != "order_payments" or not row.order_id:
+        return
+    if str(row.status or "").lower() not in ORDER_PAYMENT_SUCCESS_STATUSES:
+        return
+    extra = row.extra_data or {}
+    reference = str(extra.get("payment_receipt_id") or extra.get("receipt_url") or extra.get("receiptUrl") or extra.get("receiptPath") or "").strip().removeprefix("receipt:").lower()
+    if not reference:
+        return
+    model = MODEL_BY_TABLE["order_payments"]
+    duplicate = (await session.execute(select(model.id).where(
+        model.order_id == row.order_id,
+        model.id != row.id,
+        model.deleted_at.is_(None),
+        func.lower(model.status).in_(ORDER_PAYMENT_SUCCESS_STATUSES),
+        payment_receipt_reference(model) == reference,
+    ).limit(1))).scalar_one_or_none()
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="payment_receipt_already_recorded")
+
+
 async def _create_resource_row(session: AsyncSession, table: str, body: dict[str, Any]) -> dict[str, Any]:
     if table == "categories":
         return await create_category_record(session, body)
@@ -3999,8 +4043,12 @@ async def _create_resource_row(session: AsyncSession, table: str, body: dict[str
     values = {key: value for key, value in body.items() if key in model.__table__.c and key not in {"id", "created_at", "updated_at", "deleted_at", "extra_data"}}
     extra = {key: _jsonable(value) for key, value in body.items() if key not in model.__table__.c}
     row = model(**values, extra_data=extra) if "extra_data" in model.__table__.c else model(**values)
+    payment_orders = await _lock_payment_orders(session, table, [getattr(row, "order_id", None)])
     session.add(row)
     await session.flush()
+    if payment_orders:
+        await _validate_order_payment_receipt(session, table, row)
+    await _sync_payment_orders(session, payment_orders)
     return serialize_record(row)
 
 
@@ -11357,6 +11405,7 @@ async def _api_update(
     if row is None:
         raise HTTPException(status_code=404, detail="record_not_found")
     values = _normalize_admin_body(table, body, actor)
+    payment_orders = await _lock_payment_orders(session, table, [getattr(row, "order_id", None), values.get("order_id")])
     previous = {
         "status": getattr(row, "status", None),
         "approval_status": getattr(row, "approval_status", None),
@@ -11382,6 +11431,9 @@ async def _api_update(
             actor.id if actor is not None else None,
         )
     await session.flush()
+    if payment_orders:
+        await _validate_order_payment_receipt(session, table, row)
+    await _sync_payment_orders(session, payment_orders)
     return serialize_record(row)
 
 
@@ -11425,7 +11477,10 @@ async def _api_delete(
     row = await session.get(model, record_id)
     if row is None:
         return
+    payment_orders = await _lock_payment_orders(session, table, [getattr(row, "order_id", None)])
     await session.execute(delete(model).where(model.id == record_id))
+    await session.flush()
+    await _sync_payment_orders(session, payment_orders)
     if actor_id is not None:
         _add_audit_log(
             session,
@@ -13744,11 +13799,6 @@ async def set_local_courier_assignment(request_id: uuid.UUID, request: Request, 
         courier = await session.get(MODEL_BY_TABLE["couriers"], requested_id)
         if courier is None or courier.deleted_at is not None or (courier.extra_data or {}).get("is_active") is False or str(courier.status or "active").lower() in {"inactive", "disabled"}:
             raise HTTPException(422, "active_courier_required")
-        eligible = (await session.execute(select(User.id).join(UserRole, UserRole.user_id == User.id).where(
-            User.id == courier.user_id, User.is_active.is_(True), User.deleted_at.is_(None), UserRole.role.in_(("courier", "delivery")),
-        ).limit(1))).scalar_one_or_none()
-        if eligible is None:
-            raise HTTPException(422, "courier_account_link_required")
     current_rows = await _local_courier_rows(session, request_id, lock=True)
     for previous in current_rows:
         if not _assignment_is_current(previous):

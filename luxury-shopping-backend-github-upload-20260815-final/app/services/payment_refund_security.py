@@ -24,6 +24,7 @@ from .financial_calculator import (
     approved_payment_total,
     loyalty_points,
     money,
+    payment_balance_conflict,
     refunded_total,
     sync_order_payment_status,
 )
@@ -405,6 +406,7 @@ async def review_payment_receipt(
         ).scalar_one_or_none()
         if order is not None and next_status == "approved":
             previous_order_payment_status = str(order.payment_status or "pending").strip().lower()
+            previous_paid = await approved_payment_total(session, order.id)
             payments_model = MODEL_BY_TABLE["payments"]
             existing_payment = (
                 await session.execute(
@@ -426,10 +428,14 @@ async def review_payment_receipt(
                     )
                 )
             await session.flush()
+            current_paid = await approved_payment_total(session, order.id)
+            if current_paid > previous_paid and current_paid > money(order.total):
+                raise payment_balance_conflict(order, previous_paid, money(row.amount))
             await sync_order_payment_status(session, order)
         elif order is not None and next_status == "rejected":
             previous_order_payment_status = str(order.payment_status or "pending").strip().lower()
             paid = await approved_payment_total(session, order.id)
+            await sync_order_payment_status(session, order)
             if paid <= 0:
                 order.payment_status = "rejected"
     elif extra.get("payment_type") == "merchant_subscription" and next_status == "approved":

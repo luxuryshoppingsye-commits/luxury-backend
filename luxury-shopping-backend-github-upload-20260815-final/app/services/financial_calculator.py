@@ -940,40 +940,75 @@ async def calculate_checkout_financials(
     )
 
 
+ORDER_PAYMENT_SUCCESS_STATUSES = ("confirmed", "approved", "paid")
+
+
+def payment_receipt_reference(model: Any):
+    return func.lower(func.coalesce(
+        func.nullif(model.extra_data["payment_receipt_id"].astext, ""),
+        *(
+            func.nullif(func.replace(model.extra_data[key].astext, "receipt:", ""), "")
+            for key in ("receipt_url", "receiptUrl", "receiptPath")
+        ),
+    ))
+
+
+async def confirmed_order_payment_totals(
+    session: AsyncSession, order_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, Decimal]:
+    """Read confirmed ledgers, counting an approved receipt only once."""
+    totals: dict[uuid.UUID, Decimal] = {}
+    if not order_ids:
+        return totals
+    manual = MODEL_BY_TABLE["order_payments"]
+    legacy = MODEL_BY_TABLE["payments"]
+    for model, statuses in (
+        (manual, ORDER_PAYMENT_SUCCESS_STATUSES),
+        (legacy, (*ORDER_PAYMENT_SUCCESS_STATUSES, "completed")),
+    ):
+        statement = select(model.order_id, func.coalesce(func.sum(model.amount), 0)).where(
+            model.order_id.in_(order_ids),
+            model.deleted_at.is_(None),
+            func.lower(model.status).in_(statuses),
+        )
+        if model is legacy:
+            matching_manual = select(manual.id).where(
+                manual.order_id == legacy.order_id,
+                manual.deleted_at.is_(None),
+                func.lower(manual.status).in_(ORDER_PAYMENT_SUCCESS_STATUSES),
+                payment_receipt_reference(manual) == payment_receipt_reference(legacy),
+            ).correlate(legacy).exists()
+            statement = statement.where(~matching_manual)
+        for order_id, amount in (await session.execute(statement.group_by(model.order_id))).all():
+            totals[order_id] = money(totals.get(order_id, Decimal("0.00")) + money_or_zero(amount))
+    return totals
+
+
+def payment_balance_conflict(order: Order, paid: Decimal, requested: Decimal) -> HTTPException:
+    total = money(order.total)
+    return HTTPException(status_code=409, detail={
+        "code": "payment_exceeds_order_balance",
+        "message": "المبلغ يتجاوز الرصيد المتبقي للطلب.",
+        "order_total": float(total),
+        "current_paid": float(paid),
+        "remaining_balance": float(max(total - paid, Decimal("0.00"))),
+        "requested_amount": float(requested),
+    })
+
+
 async def receipt_amount_for_order(session: AsyncSession, order: Order, raw_amount: Any) -> Decimal:
-    amount = money(raw_amount if raw_amount is not None else order.total)
+    paid = await approved_payment_total(session, order.id)
+    outstanding = max(money(order.total) - paid, Decimal("0.00"))
+    amount = money(raw_amount if raw_amount is not None else outstanding)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="payment_amount_required")
-    receipts_model = MODEL_BY_TABLE["payment_receipts"]
-    reserved = (
-        await session.execute(
-            select(func.coalesce(func.sum(receipts_model.amount), 0))
-            .where(
-                receipts_model.order_id == order.id,
-                receipts_model.deleted_at.is_(None),
-                receipts_model.status.in_(["pending", "pending_review", "uploaded", "reviewing", "approved"]),
-            )
-        )
-    ).scalar_one()
-    outstanding = money(order.total) - money_or_zero(reserved)
     if amount > outstanding:
-        raise HTTPException(status_code=409, detail="payment_exceeds_order_balance")
+        raise payment_balance_conflict(order, paid, amount)
     return amount
 
 
 async def approved_payment_total(session: AsyncSession, order_id: uuid.UUID) -> Decimal:
-    receipts_model = MODEL_BY_TABLE["payment_receipts"]
-    amount = (
-        await session.execute(
-            select(func.coalesce(func.sum(receipts_model.amount), 0))
-            .where(
-                receipts_model.order_id == order_id,
-                receipts_model.deleted_at.is_(None),
-                receipts_model.status == "approved",
-            )
-        )
-    ).scalar_one()
-    return money_or_zero(amount)
+    return (await confirmed_order_payment_totals(session, [order_id])).get(order_id, Decimal("0.00"))
 
 
 async def refunded_total(session: AsyncSession, order_id: uuid.UUID) -> Decimal:
@@ -995,6 +1030,11 @@ async def sync_order_payment_status(session: AsyncSession, order: Order) -> None
     paid = await approved_payment_total(session, order.id)
     refunded = await refunded_total(session, order.id)
     total = money(order.total)
+    order.extra_data = {
+        **(getattr(order, "extra_data", None) or {}),
+        "paid_amount": format(paid, "f"),
+        "remaining_balance": format(max(total - paid, Decimal("0.00")), "f"),
+    }
     if refunded >= paid and paid > 0:
         order.payment_status = "refunded"
     elif refunded > 0:

@@ -99,6 +99,7 @@ MERCHANT_APPLICATION_REVIEW_STATUSES = (
 )
 MERCHANT_APPLICATION_ACTIVE_STATUSES = ("approved", "active")
 STAFF_ROLE_KEYS = ("admin", "manager", "finance", "logistics", "staff", "employee")
+MANAGED_ACCOUNT_ROLE_KEYS = (*STAFF_ROLE_KEYS, "courier", "delivery")
 
 
 async def _welcome_customer(session: AsyncSession, user_id: uuid.UUID) -> None:
@@ -1659,7 +1660,7 @@ async def admin_staff_roles(
         select(UserRole, Profile, User)
         .join(Profile, Profile.user_id == UserRole.user_id, isouter=True)
         .join(User, User.id == UserRole.user_id)
-        .where(UserRole.role.in_(STAFF_ROLE_KEYS))
+        .where(UserRole.role.in_(MANAGED_ACCOUNT_ROLE_KEYS))
         .order_by(UserRole.created_at.desc())
     )).all()
     return {"data": [
@@ -1726,7 +1727,7 @@ async def admin_create_staff_member(
         raise HTTPException(status_code=422, detail="invalid_staff_department")
     if len(employee_code) > 64:
         raise HTTPException(status_code=422, detail="invalid_staff_employee_code")
-    if role not in STAFF_ROLE_KEYS:
+    if role not in MANAGED_ACCOUNT_ROLE_KEYS:
         raise HTTPException(status_code=422, detail="invalid_staff_role")
     if not isinstance(is_active, bool):
         raise HTTPException(status_code=422, detail="invalid_staff_active_state")
@@ -1775,7 +1776,7 @@ async def admin_add_staff_role(
     role = str(body.get("role") or "").strip()
     if not role:
         raise HTTPException(status_code=422, detail="role_required")
-    if role not in STAFF_ROLE_KEYS:
+    if role not in MANAGED_ACCOUNT_ROLE_KEYS:
         raise HTTPException(status_code=422, detail="invalid_staff_role")
     requested_user_id = body.get("user_id") or body.get("userId")
     if requested_user_id:
@@ -1825,7 +1826,7 @@ async def admin_update_staff_role(
     old_user_id, old_role = _parse_role_id(role_id)
     body = await request.json()
     new_role = str(body.get("role") or old_role).strip()
-    if new_role not in STAFF_ROLE_KEYS:
+    if new_role not in MANAGED_ACCOUNT_ROLE_KEYS:
         raise HTTPException(status_code=422, detail="invalid_staff_role")
     row = await session.get(UserRole, {"user_id": old_user_id, "role": old_role})
     if row is None:
