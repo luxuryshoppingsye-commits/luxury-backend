@@ -5,11 +5,11 @@ import json
 import random
 import uuid
 from urllib.parse import urlsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -17,7 +17,7 @@ from ..models.domain import UserRole
 from ..models import MODEL_BY_TABLE
 from ..repositories.resources import serialize_record
 from .firebase_auth_service import ensure_firebase_admin_app
-from .outbox_service import email_delivery_configured
+from .outbox_service import email_delivery_configured, rtl_notification_text
 from .realtime import RealtimeEventService, realtime_hub
 
 try:
@@ -88,6 +88,9 @@ CUSTOMER_NOTIFICATION_TYPES = frozenset([
     'admin_broadcast',
     'admin_message',
     'general_alert',
+    'announcement',
+    'update',
+    'alert',
     'promo_notification',
     'greeting',
     'holiday_greeting',
@@ -289,6 +292,12 @@ def _english_notification_content(row: Any, notification: dict[str, Any]) -> tup
     elif notification_type in {"email_verification_requested", "email_message"}:
         title = title or "Message from Luxury Shopping"
         body = body or "You have a new message in the app."
+    order_number = str(data.get("order_number") or "").strip()
+    if order_number:
+        if order_number not in title:
+            title = f"{title} — {order_number}"
+        if order_number not in body:
+            body = f"Order {order_number}: {body}"
     return title, body
 
 
@@ -405,6 +414,45 @@ class NotificationService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def _with_order_reference(self, payload: NotificationPayload) -> NotificationPayload:
+        data = dict(payload.payload or {})
+        entity_tables = {
+            "order": "orders", "orders": "orders",
+            "international_order": "international_orders", "international_orders": "international_orders",
+            "local_shopping_request": "local_shopping_requests", "local_shopping_requests": "local_shopping_requests",
+        }
+        table = entity_tables.get(payload.entity_type or "")
+        identity = payload.entity_id if table else None
+        if not identity:
+            identity = data.get("local_request_id") or data.get("localRequestId")
+            table = "local_shopping_requests" if identity else table
+        if not identity:
+            identity = data.get("international_order_id") or data.get("internationalOrderId")
+            table = "international_orders" if identity else table
+        if not identity:
+            identity = payload.order_id or data.get("orderId") or data.get("order_id")
+            table = table or "orders"
+        try:
+            order_id = uuid.UUID(str(identity))
+        except (ValueError, TypeError):
+            return payload
+        model = MODEL_BY_TABLE[table]
+        order = await self.session.get(model, order_id)
+        if order is None:
+            return payload
+        number = str(getattr(order, "order_number", None) or _extra(order).get("order_number") or "").strip()
+        if not number:
+            return payload
+        data["order_number"] = number
+        for key in ("title_en", "body_en"):
+            if data.get(key) and number not in str(data[key]):
+                data[key] = f"{data[key]} — {number}"
+        return replace(
+            payload, payload=data,
+            title=payload.title if number in payload.title else f"{payload.title} — {number}",
+            body=payload.body if number in payload.body else f"الطلب {number}: {payload.body}",
+        )
+
     async def customer_channels_allowed(self, user_id: uuid.UUID, notification_type: str) -> bool:
         if customer_notification_allowed(notification_type):
             return True
@@ -457,6 +505,7 @@ class NotificationService:
             ).scalar_one_or_none()
             if existing is not None:
                 return existing
+        payload = await self._with_order_reference(payload)
         row = model(
             user_id=payload.user_id,
             recipient_id=payload.user_id,
@@ -552,6 +601,7 @@ class NotificationService:
                 "max_attempts": get_settings().message_max_attempts,
                 "source": payload.source,
                 "delivery_channels": list(payload.delivery_channels) if payload.delivery_channels is not None else None,
+                "expires_at": payload.expires_at.isoformat() if payload.expires_at else None,
             },
         )
         self.session.add(row)
@@ -643,6 +693,7 @@ class NotificationService:
             await self.session.execute(select(model).where(model.token == token).with_for_update())
         ).scalars().all()
         row = existing_rows[0] if existing_rows else model(user_id=user_id, token=token)
+        binding_changed = not existing_rows or row.user_id != user_id or not row.is_active
         for duplicate in existing_rows[1:]:
             duplicate.is_active = False
             duplicate.status = "duplicate_inactive"
@@ -681,6 +732,30 @@ class NotificationService:
         if not existing_rows:
             self.session.add(row)
         await self.session.flush()
+        if binding_changed:
+            # A fresh device can resume recent missed alerts without repeating successful channels.
+            outbox = MODEL_BY_TABLE["notification_outbox"]
+            notification = MODEL_BY_TABLE["notifications"]
+            active_ids = select(notification.id.cast(String)).where(
+                notification.user_id == user_id,
+                notification.deleted_at.is_(None),
+                or_(notification.expires_at.is_(None), notification.expires_at > _now()),
+                customer_notification_visible_clause(notification, user_id),
+            )
+            await self.session.execute(
+                update(outbox).where(
+                    outbox.user_id == user_id,
+                    outbox.status.in_(("failed_retryable", "dead_letter")),
+                    outbox.deleted_at.is_(None),
+                    outbox.created_at >= _now() - timedelta(days=1),
+                    outbox.last_error.like("%mobile_push:failed%"),
+                    outbox.payload["notification_id"].astext.in_(active_ids),
+                    func.coalesce(outbox.extra_data["delivered_channels"]["mobile_push"].astext, "").notin_(("sent", "provider_accepted")),
+                ).values(
+                    status="queued", attempts=0, available_at=_now(), processed_at=None, last_error=None,
+                    extra_data=outbox.extra_data.op("||")({"locked_at": None, "lock_expires_at": None, "next_attempt_at": None, "last_error_code": None}),
+                ).execution_options(synchronize_session=False)
+            )
         data = serialize_record(row)
         data["token_ref"] = _token_ref(token)
         data.pop("token", None)
@@ -1063,7 +1138,8 @@ class NotificationService:
             # so Android can display a system tray/heads-up notification when the
             # app is backgrounded or terminated, without depending on Dart being
             # scheduled by the device.
-            notification_data["notification_type"] = row.type or "message"
+            # Keep foreground alerts compatible with installed app versions.
+            notification_data["notification_type"] = {"announcement": "admin_broadcast_message", "update": "info", "alert": "general_alert"}.get(row.type, row.type or "message")
             notification_data.setdefault("title", localized["title"])
             notification_data.setdefault("body", localized["body"])
             notification_data.setdefault("message", localized["body"])
@@ -1108,8 +1184,12 @@ class NotificationService:
                     notification=messaging.WebpushNotification(
                         title=localized["title"],
                         body=localized["body"],
-                        icon="/logo.png",
-                        badge="/favicon.png",
+                        icon=f"{settings.frontend_public_url.rstrip('/')}/logo.png",
+                        badge=f"{settings.frontend_public_url.rstrip('/')}/notification-badge.svg",
+                        direction="rtl",
+                        language="ar-YE",
+                        renotify=True,
+                        silent=False,
                         tag=notification["tag"],
                         require_interaction=False,
                     ),
@@ -1192,7 +1272,7 @@ class NotificationService:
         payload.setdefault("notification_id", notification_id or "")
         payload.setdefault("type", row.type or "message")
         payload.setdefault("icon", "/logo.png")
-        payload.setdefault("badge", "/favicon.png")
+        payload.setdefault("badge", "/notification-badge.svg")
         payload.setdefault("site_url", settings.frontend_public_url)
         if row.aggregate_id:
             payload.setdefault("entity_id", str(row.aggregate_id))
@@ -1204,11 +1284,11 @@ class NotificationService:
         )
         title = _clean_notification_text(row.title, "رفاهية التسوق")
         return {
-            "title": title,
-            "body": _clean_notification_text(body_value, title),
+            "title": rtl_notification_text(title),
+            "body": rtl_notification_text(_clean_notification_text(body_value, title)),
             "url": payload.get("url") or payload.get("deep_link") or "/notifications",
             "icon": payload.get("icon") or "/logo.png",
-            "badge": payload.get("badge") or "/favicon.png",
+            "badge": payload.get("badge") or "/notification-badge.svg",
             "tag": extra_data.get("dedupe_key") or notification_id or str(row.event_id),
             "data": payload,
         }

@@ -9,6 +9,38 @@ from app.api.routes import commerce
 
 
 @pytest.mark.asyncio
+async def test_manual_order_keeps_customer_name_when_read_as_a_single_order():
+    order = SimpleNamespace(user_id=uuid.uuid4(), extra_data={"customer": {"full_name": "أحمد محمد"}})
+    session = SimpleNamespace(execute=AsyncMock())
+    payload = {"shipping_address": {"full_name": "أحمد محمد", "phone": "777000202"}}
+    await commerce._attach_current_customer_name(session, order, payload)
+    assert payload["customer_name"] == "أحمد محمد"
+    assert payload["shipping_address"] == {"full_name": "أحمد محمد", "phone": "777000202"}
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_list_preserves_manual_customer_name_and_regular_profile_name():
+    staff_id, customer_id = uuid.uuid4(), uuid.uuid4()
+    orders = [
+        SimpleNamespace(user_id=staff_id, extra_data={"customer": {"full_name": "أحمد محمد"}}),
+        SimpleNamespace(user_id=customer_id, extra_data={}),
+    ]
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: [
+        (staff_id, "إدارة متجر رفاهية التسوق"), (customer_id, "سارة"),
+    ])))
+    payloads = [
+        {"shipping_address": {"full_name": "أحمد محمد", "city": "صنعاء"}},
+        {"shipping_address": {"full_name": "الاسم السابق", "city": "عدن"}},
+    ]
+    await commerce._attach_current_customer_names(session, orders, payloads)
+    assert payloads[0]["customer_name"] == "أحمد محمد"
+    assert payloads[0]["shipping_address"] == {"full_name": "أحمد محمد", "city": "صنعاء"}
+    assert payloads[1]["customer_name"] == "سارة"
+    assert payloads[1]["shipping_address"] == {"full_name": "سارة", "city": "عدن"}
+
+
+@pytest.mark.asyncio
 async def test_order_summary_serializer_exposes_paid_and_remaining_amounts(monkeypatch: pytest.MonkeyPatch) -> None:
     order = SimpleNamespace(id="order-1", total=Decimal("60000.00"), extra_data={})
     monkeypatch.setattr(commerce, "_serialize_order", lambda _: {

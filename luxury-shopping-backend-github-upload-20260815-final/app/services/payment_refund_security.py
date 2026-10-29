@@ -29,6 +29,7 @@ from .financial_calculator import (
     sync_order_payment_status,
 )
 from .image_pipeline import prepare_image_upload
+from .payment_methods import normalize_payment_method_key
 from .notification_service import create_payment_status_notification
 from .partner_subscription import activate_subscription_from_payment
 from .audit_trail import add_audit_log
@@ -103,6 +104,22 @@ def _add_audit_log(
     )
 
 
+def receipt_references(row: Any) -> list[str]:
+    extra = dict(getattr(row, "extra_data", {}) or {})
+    references = [f"receipt:{row.id}"]
+    asset_ids = extra.get("attachment_file_asset_ids", [])
+    if not isinstance(asset_ids, list):
+        return references
+    for asset_id in asset_ids:
+        if str(asset_id) == str(extra.get("file_asset_id")):
+            continue
+        try:
+            references.append(f"file:{uuid.UUID(str(asset_id))}")
+        except (TypeError, ValueError):
+            continue
+    return list(dict.fromkeys(references))
+
+
 def _safe_receipt_response(row: Any, order: Order | None = None) -> dict[str, Any]:
     receipt_ref = f"receipt:{row.id}"
     extra = dict(getattr(row, "extra_data", {}) or {})
@@ -114,6 +131,7 @@ def _safe_receipt_response(row: Any, order: Order | None = None) -> dict[str, An
         "status": str(row.status or ""),
         "amount": str(money(getattr(row, "amount", 0))),
         "receipt_url": receipt_ref,
+        "receipt_urls": receipt_references(row),
         "receiptPath": receipt_ref,
         "payment_receipt_url": receipt_ref,
         "reviewed_by": str(row.reviewed_by) if getattr(row, "reviewed_by", None) else None,
@@ -180,7 +198,7 @@ async def _load_order_for_receipt(
     return order
 
 
-async def _parse_required_receipt_form(request: Request) -> tuple[UploadFile, dict[str, Any]]:
+async def _parse_required_receipt_form(request: Request) -> tuple[list[UploadFile], dict[str, Any]]:
     content_type = request.headers.get("content-type", "").lower()
     if not content_type.startswith("multipart/form-data"):
         if "application/json" in content_type:
@@ -196,15 +214,17 @@ async def _parse_required_receipt_form(request: Request) -> tuple[UploadFile, di
     forbidden = RECEIPT_FORBIDDEN_INPUT_FIELDS.intersection(form.keys())
     if forbidden:
         raise HTTPException(status_code=422, detail="payment_proof_file_required")
-    candidate = form.get("file") or form.get("receipt") or form.get("proof")
-    if not isinstance(candidate, UploadFile) and not (hasattr(candidate, "filename") and hasattr(candidate, "read")):
+    candidates = [file for key in ("file", "files", "receipt", "proof") for file in form.getlist(key)]
+    if not candidates or any(not hasattr(file, "filename") or not hasattr(file, "read") for file in candidates):
         raise HTTPException(status_code=422, detail="payment_proof_file_required")
+    if len(candidates) > 10:
+        raise HTTPException(status_code=422, detail="payment_receipt_file_limit_exceeded")
     fields = {
         key: value
         for key, value in form.items()
         if not isinstance(value, UploadFile) and not (hasattr(value, "filename") and hasattr(value, "read"))
     }
-    return candidate, fields
+    return candidates, fields
 
 
 async def create_payment_receipt(
@@ -217,102 +237,127 @@ async def create_payment_receipt(
     storage: FileStorage,
 ) -> dict[str, Any]:
     order = await _load_order_for_receipt(session, order_id, user, roles)
-    upload_file, fields = await _parse_required_receipt_form(request)
-    data = await upload_file.read()
-    if not data:
-        raise HTTPException(status_code=422, detail="payment_proof_file_required")
+    upload_files, fields = await _parse_required_receipt_form(request)
     amount = await receipt_amount_for_order_compatible(session, order, fields.get("amount"))
-    image_metadata: dict[str, Any] = {}
-    upload_name = upload_file.filename or "payment-receipt"
-    upload_content_type = str(getattr(upload_file, "content_type", "") or "").lower()
-    if upload_content_type.startswith("image/") or Path(upload_name).suffix.lower() in {
-        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"
-    }:
-        try:
-            prepared = await prepare_image_upload(
-                data,
-                upload_name,
-                upload_content_type,
-                policy_key="payment_receipt",
-                max_bytes=min(10 * 1024 * 1024, get_settings().max_upload_bytes),
-            )
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=415, detail="invalid_receipt_image") from exc
-        data = prepared.data
-        upload_name = prepared.filename
-        image_metadata = {
-            "image_pipeline": "webp",
-            "image_width": prepared.width,
-            "image_height": prepared.height,
-            "original_size_bytes": prepared.original_size_bytes,
-            "ai_enhanced": False,
-            "ai_provider": "local_webp_receipt_safe",
-        }
-    stored = storage.save_bytes(
-        "payment_receipt",
-        upload_name,
-        data,
-        str(request.base_url),
-        roles=roles,
-    )
-
     model = MODEL_BY_TABLE["payment_receipts"]
-    row = model(
-        order_id=order.id,
-        user_id=user.id,
-        status="pending_review",
-        image_url=None,
-        amount=amount,
-        extra_data={
-            "storage_provider": stored.storage_provider,
-            "storage_bucket": stored.storage_bucket,
-            "storage_key": stored.relative_path,
-            "storage_visibility": stored.visibility,
-            "generated_filename": Path(stored.relative_path).name,
-            "original_filename": _safe_text(upload_file.filename, max_len=240) or "payment-receipt",
-            "mime_type": stored.content_type,
-            "size_bytes": stored.size,
-            "checksum_sha256": stored.sha256,
-            "malware_scan_status": stored.scan_status,
-            "malware_scan_provider": stored.scan_provider,
-            "payment_method": _safe_text(fields.get("paymentMethod") or fields.get("payment_method"), max_len=80),
-            "source_label": _safe_text(fields.get("sourceLabel") or fields.get("source_label"), max_len=160),
-            "transaction_reference": _safe_text(fields.get("transactionReference") or fields.get("transaction_reference"), max_len=160),
-            "financial_policy": "backend_decimal_half_up_2dp",
-            "receipt_payload_policy": "metadata_only_no_embedded_payload_no_external_url",
-            **image_metadata,
-        },
-    )
-    session.add(row)
-    await session.flush()
-    asset = FileAsset(
-        owner_user_id=user.id,
-        created_by=user.id,
-        policy_key=stored.policy_key,
-        visibility=stored.visibility,
-        storage_provider=stored.storage_provider,
-        storage_bucket=stored.storage_bucket,
-        storage_key=stored.relative_path,
-        original_filename=stored.original_filename,
-        content_type=stored.content_type,
-        size_bytes=stored.size,
-        checksum_sha256=stored.sha256,
-        status="available",
-        scan_status=stored.scan_status,
-        scan_provider=stored.scan_provider,
-        entity_type="payment_receipt",
-        entity_id=row.id,
-        extra_data={
-            "payment_receipt_id": str(row.id),
-            "order_id": str(order.id),
-            "quarantine_path": stored.quarantine_path,
-            **image_metadata,
-        },
-    )
-    session.add(asset)
-    await session.flush()
+    payment_method = normalize_payment_method_key(fields.get("paymentMethod") or fields.get("payment_method") or order.payment_method)
+    reference = _safe_text(fields.get("transactionReference") or fields.get("transaction_reference"), max_len=160)
+    pending = (await session.execute(select(model).where(model.order_id == order.id,
+        model.deleted_at.is_(None), model.status.in_(RECEIPT_PENDING_STATUSES)).order_by(model.created_at.desc()))).scalars()
+    row = next((item for item in pending if money(item.amount) == amount
+        and normalize_payment_method_key((item.extra_data or {}).get("payment_method") or order.payment_method) == payment_method
+        and _safe_text((item.extra_data or {}).get("transaction_reference"), max_len=160) == reference), None)
+    attachment_ids = list((row.extra_data or {}).get("attachment_file_asset_ids") or []) if row else []
+    if row and not attachment_ids and (row.extra_data or {}).get("file_asset_id"):
+        attachment_ids.append(row.extra_data["file_asset_id"])
+    if (len(receipt_references(row)) if row else 0) + len(upload_files) > 10:
+        raise HTTPException(status_code=422, detail="payment_receipt_file_limit_exceeded")
+    is_new_receipt = row is None
+    stored_uploads = []
+    for upload_file in upload_files:
+        data = await upload_file.read()
+        if not data:
+            raise HTTPException(status_code=422, detail="payment_proof_file_required")
+        image_metadata: dict[str, Any] = {}
+        upload_name = upload_file.filename or "payment-receipt"
+        upload_content_type = str(getattr(upload_file, "content_type", "") or "").lower()
+        if upload_content_type.startswith("image/") or Path(upload_name).suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"
+        }:
+            try:
+                prepared = await prepare_image_upload(
+                    data,
+                    upload_name,
+                    upload_content_type,
+                    policy_key="payment_receipt",
+                    max_bytes=min(10 * 1024 * 1024, get_settings().max_upload_bytes),
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=415, detail="invalid_receipt_image") from exc
+            data = prepared.data
+            upload_name = prepared.filename
+            image_metadata = {
+                "image_pipeline": "webp",
+                "image_width": prepared.width,
+                "image_height": prepared.height,
+                "original_size_bytes": prepared.original_size_bytes,
+                "ai_enhanced": False,
+                "ai_provider": "local_webp_receipt_safe",
+            }
+        stored = storage.save_bytes(
+            "payment_receipt",
+            upload_name,
+            data,
+            str(request.base_url),
+            roles=roles,
+        )
+        stored_uploads.append((stored, image_metadata, upload_file.filename))
+
+    stored, image_metadata, original_filename = stored_uploads[0]
+
+    if is_new_receipt:
+        model = MODEL_BY_TABLE["payment_receipts"]
+        row = model(
+            order_id=order.id,
+            user_id=user.id,
+            status="pending_review",
+            image_url=None,
+            amount=amount,
+            extra_data={
+                "storage_provider": stored.storage_provider,
+                "storage_bucket": stored.storage_bucket,
+                "storage_key": stored.relative_path,
+                "storage_visibility": stored.visibility,
+                "generated_filename": Path(stored.relative_path).name,
+                "original_filename": _safe_text(original_filename, max_len=240) or "payment-receipt",
+                "mime_type": stored.content_type,
+                "size_bytes": stored.size,
+                "checksum_sha256": stored.sha256,
+                "malware_scan_status": stored.scan_status,
+                "malware_scan_provider": stored.scan_provider,
+                "payment_method": _safe_text(fields.get("paymentMethod") or fields.get("payment_method"), max_len=80),
+                "source_label": _safe_text(fields.get("sourceLabel") or fields.get("source_label"), max_len=160),
+                "transaction_reference": _safe_text(fields.get("transactionReference") or fields.get("transaction_reference"), max_len=160),
+                "financial_policy": "backend_decimal_half_up_2dp",
+                "receipt_payload_policy": "metadata_only_no_embedded_payload_no_external_url",
+                **image_metadata,
+            },
+        )
+        session.add(row)
+        await session.flush()
+    asset_ids = []
+    for stored, image_metadata, _ in stored_uploads:
+        asset = FileAsset(
+            owner_user_id=user.id,
+            created_by=user.id,
+            policy_key=stored.policy_key,
+            visibility=stored.visibility,
+            storage_provider=stored.storage_provider,
+            storage_bucket=stored.storage_bucket,
+            storage_key=stored.relative_path,
+            original_filename=stored.original_filename,
+            content_type=stored.content_type,
+            size_bytes=stored.size,
+            checksum_sha256=stored.sha256,
+            status="available",
+            scan_status=stored.scan_status,
+            scan_provider=stored.scan_provider,
+            entity_type="payment_receipt",
+            entity_id=row.id,
+            extra_data={
+                "payment_receipt_id": str(row.id),
+                "order_id": str(order.id),
+                "quarantine_path": stored.quarantine_path,
+                **image_metadata,
+            },
+        )
+        session.add(asset)
+        await session.flush()
+        asset_ids.append(str(asset.id))
     extra_data = dict(row.extra_data or {})
-    extra_data["file_asset_id"] = str(asset.id)
+    if is_new_receipt:
+        extra_data["file_asset_id"] = asset_ids[0]
+    extra_data["attachment_file_asset_ids"] = [*attachment_ids, *asset_ids]
     row.extra_data = extra_data
     row.image_url = f"receipt:{row.id}"
     _add_audit_log(

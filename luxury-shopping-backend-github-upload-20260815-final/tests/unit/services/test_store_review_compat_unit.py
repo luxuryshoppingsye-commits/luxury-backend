@@ -1,6 +1,9 @@
 from backend.app.api.routes.operations import _normalize_store_review_status_payload
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
+from sqlalchemy.exc import ProgrammingError
 
 from backend.app.services.store_review_compat import (
     _GENERIC_PUBLIC_SQL,
@@ -9,7 +12,23 @@ from backend.app.services.store_review_compat import (
     update_handover_store_review,
     update_handover_store_review_status,
     mask_store_review_name,
+    _fetch_rows,
 )
+
+
+class ReviewSession:
+    @asynccontextmanager
+    async def begin_nested(self):
+        yield
+
+
+def test_schema_fallback_does_not_rollback_the_outer_transaction():
+    class Session(ReviewSession):
+        execute = AsyncMock(side_effect=ProgrammingError("SELECT rating FROM store_reviews", {}, Exception("missing column")))
+        rollback = AsyncMock()
+    session = Session()
+    assert asyncio.run(_fetch_rows(session, "SELECT rating FROM store_reviews", {})) is None
+    session.rollback.assert_not_awaited()
 
 
 def test_admin_approval_payload_also_updates_legacy_status_column() -> None:
@@ -64,7 +83,7 @@ def test_handover_create_uses_direct_review_columns() -> None:
         def mappings(self):
             return Mappings()
 
-    class Session:
+    class Session(ReviewSession):
         statement = ""
         params: dict[str, object] = {}
 
@@ -148,7 +167,7 @@ def test_handover_status_update_sets_visible_approval_fields() -> None:
         def mappings(self):
             return Mappings() if self.row is None else self.row
 
-    class Session:
+    class Session(ReviewSession):
         statement = ""
         params: dict[str, object] = {}
 
@@ -222,7 +241,7 @@ def test_handover_status_update_supports_resource_extra_data_schema() -> None:
         def mappings(self):
             return Mappings()
 
-    class Session:
+    class Session(ReviewSession):
         statements: list[str]
         params: dict[str, object]
 
@@ -281,7 +300,7 @@ def test_handover_content_update_is_scoped_to_the_review_owner() -> None:
         def mappings(self):
             return Mappings()
 
-    class Session:
+    class Session(ReviewSession):
         statement = ""
         params: dict[str, object] = {}
 

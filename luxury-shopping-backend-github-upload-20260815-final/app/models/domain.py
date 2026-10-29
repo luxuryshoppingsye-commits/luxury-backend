@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import secrets
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -28,6 +29,14 @@ from .base import Base, SoftDeleteMixin, TimestampMixin, UuidPrimaryKeyMixin
 
 
 MONEY = Numeric(18, 2)
+
+
+class DocumentNumberCounter(Base):
+    __tablename__ = "document_number_counters"
+    prefix: Mapped[str] = mapped_column(String(8), primary_key=True)
+    number_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    last_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    __table_args__ = (CheckConstraint("last_value > 0", name="ck_document_counter_positive"),)
 
 
 class User(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
@@ -771,3 +780,7 @@ for _table, _fields in RESOURCE_SPECS.items():
         MODEL_BY_TABLE[_table] = _build_resource_model(_table, _fields)
 
 RESOURCE_TABLES = frozenset(MODEL_BY_TABLE)
+
+from ..services.document_numbers import register_document_numbering
+
+register_document_numbering(Base, DocumentNumberCounter.__table__)

@@ -112,8 +112,10 @@ from ...services.notification_service import (
     customer_notification_visible_clause,
 )
 from ...services.payment_refund_security import (
+    receipt_references,
     RECEIPT_PENDING_STATUSES,
     create_payment_receipt,
+    _parse_required_receipt_form,
     create_refund_request,
     issue_signed_receipt_url,
     list_payment_receipts_for_review,
@@ -4728,7 +4730,7 @@ async def api_admin_update_customer(
 @router.post("/api/admin/profiles/lookup")
 async def api_admin_profiles_lookup(
     request: Request,
-    staff: User = Depends(require_staff),
+    staff: User = Depends(current_user),
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
@@ -4736,7 +4738,10 @@ async def api_admin_profiles_lookup(
     body = await request.json()
     ids = [uuid.UUID(str(value)) for value in body.get("user_ids", [])]
     model = MODEL_BY_TABLE["profiles"]
-    rows = (await session.execute(select(model).where(model.user_id.in_(ids)))).scalars().all() if ids else []
+    statement = select(model).where(model.user_id.in_(ids))
+    if not roles.intersection({"admin", "manager"}):
+        statement = statement.where(model.user_id.in_(select(Order.user_id).where(Order.deleted_at.is_(None))))
+    rows = (await session.execute(statement)).scalars().all() if ids else []
     data = []
     for row in rows:
         item = serialize_record(row)
@@ -5003,7 +5008,6 @@ async def _create_local_request_notification(
             },
             created_by=created_by,
             source="local_shopping",
-            delivery_channels=("in_app", "mobile_push", "web_push"),
             deduplication_key=f"local-request-created:{request_id}" if created else f"local-request-status:{request_id}:{status_key}",
         )
     )
@@ -5195,6 +5199,40 @@ async def api_create_local_shopping_request(
     return {"data": row}
 
 
+def _international_image_refs(item: dict[str, Any]) -> list[str]:
+    images = item.get("image_urls", [])
+    if not isinstance(images, list) or len(images) > 10 or any(not isinstance(ref, str) for ref in images):
+        raise HTTPException(422, "invalid_international_images")
+    primary = item.get("image_url")
+    if primary is not None and not isinstance(primary, str):
+        raise HTTPException(422, "invalid_international_images")
+    refs = list(dict.fromkeys(ref.strip() for ref in [primary or "", *images] if ref.strip()))
+    if len(refs) > 10:
+        raise HTTPException(422, "international_image_limit_exceeded")
+    return refs
+
+
+async def _validate_international_images(session: AsyncSession, items: list[dict[str, Any]], user_id: uuid.UUID) -> None:
+    for item in items:
+        refs = _international_image_refs(item)
+        for ref in refs:
+            if ref.startswith("file:"):
+                try:
+                    asset = await session.get(FileAsset, uuid.UUID(ref[5:]))
+                except ValueError:
+                    raise HTTPException(422, "invalid_international_image") from None
+                if (asset is None or asset.owner_user_id != user_id or asset.deleted_at is not None
+                    or asset.policy_key != "customer_request_attachment" or asset.status != "available"
+                    or asset.scan_status not in {"clean", "not_required"}
+                    or asset.content_type not in {"image/jpeg", "image/png", "image/webp"}):
+                    raise HTTPException(422, "invalid_international_image")
+            elif not ref.startswith("https://") or len(ref) > 2048:
+                raise HTTPException(422, "invalid_international_image")
+        if refs:
+            item["image_url"] = refs[0]
+            item["image_urls"] = refs
+
+
 @router.post("/api/shopping/international/orders", status_code=201)
 async def api_create_international_shopping_order(
     request: Request,
@@ -5219,6 +5257,7 @@ async def api_create_international_shopping_order(
         unit_price = _money_from_payload(item.get("unit_price") or item.get("estimated_price") or 0)
         total += unit_price * quantity
         descriptions.append(_first_text(item.get("product_name"), item.get("url"), default="منتج دولي"))
+    await _validate_international_images(session, items, user.id)
     description = _first_text(body.get("notes"), ", ".join(descriptions[:3]), default="طلب شراء دولي")
     row = await _api_create(
         session,
@@ -5261,6 +5300,19 @@ async def api_admin_international_preview_image(order_id: uuid.UUID, item_index:
     return Response(data, media_type=mime, headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
 
+@router.get("/api/orders/international-shopping/{order_id}/attachments/{file_id}")
+async def api_customer_international_order_attachment(
+    order_id: uuid.UUID,
+    file_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    order = await session.get(MODEL_BY_TABLE["international_orders"], order_id)
+    if order is None or order.deleted_at is not None or order.user_id != user.id:
+        raise HTTPException(status_code=404, detail="international_attachment_not_found")
+    return await api_admin_international_order_attachment(order_id, file_id, staff=user, session=session)
+
+
 @router.get("/api/admin-shopping/international-orders/{order_id}/attachments/{file_id}")
 async def api_admin_international_order_attachment(
     order_id: uuid.UUID,
@@ -5273,7 +5325,7 @@ async def api_admin_international_order_attachment(
     items = (order.extra_data or {}).get("items", []) if order is not None else []
     linked_to_order = any(
         isinstance(item, dict)
-        and str(item.get("image_url") or "").strip().lower() == f"file:{file_id}"
+        and f"file:{file_id}" in [ref.lower() for ref in _international_image_refs(item)]
         for item in (items if isinstance(items, list) else [])
     )
     if (
@@ -10046,7 +10098,6 @@ async def _create_international_order_status_notification(
             },
             created_by=created_by,
             source="international_order_status",
-            delivery_channels=("in_app", "mobile_push", "web_push"),
             deduplication_key=f"international-order-status:{order.id}:{previous_status}:{next_status}",
         )
     )
@@ -10620,6 +10671,29 @@ async def api_create_partner_payment(request: Request, staff: User = Depends(req
     return {"data": row}
 
 
+async def _validate_international_receipt_refs(session: AsyncSession, body: dict[str, Any], order_id: uuid.UUID) -> None:
+    refs = body.get("receipt_urls", [])
+    if not isinstance(refs, list) or len(refs) > 10 or any(not isinstance(ref, str) for ref in refs):
+        raise HTTPException(422, "invalid_receipt_references")
+    primary = body.get("receipt_url") or ""
+    refs = list(dict.fromkeys(ref.strip() for ref in [primary, *refs] if ref.strip()))
+    if len(refs) > 10:
+        raise HTTPException(422, "payment_receipt_file_limit_exceeded")
+    for ref in refs:
+        try:
+            asset_id = uuid.UUID(ref[5:]) if ref.startswith("file:") else None
+        except ValueError:
+            asset_id = None
+        asset = await session.get(FileAsset, asset_id) if asset_id else None
+        if (asset is None or asset.deleted_at is not None or asset.policy_key != "payment_receipt"
+            or asset.entity_type != "international_payment_order" or asset.entity_id != order_id
+            or asset.status != "available" or asset.scan_status not in {"clean", "not_required"}):
+            raise HTTPException(422, "invalid_receipt_reference")
+    if refs:
+        body["receipt_url"] = refs[0]
+        body["receipt_urls"] = refs
+
+
 @router.post("/api/finance/international-orders/{order_id}/payments", status_code=201)
 async def api_create_international_payment(order_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     require_finance_actor(roles)
@@ -10629,6 +10703,7 @@ async def api_create_international_payment(order_id: uuid.UUID, request: Request
     body = await request.json()
     _validate_payment_record_body(body)
     _validate_international_payment_details(body)
+    await _validate_international_receipt_refs(session, body, order_id)
     payload = {
         **body,
         "order_id": order_id,
@@ -10669,17 +10744,17 @@ async def api_upload_international_payment_receipt(
     international_order = await session.get(MODEL_BY_TABLE["international_orders"], order_id)
     if international_order is None:
         raise HTTPException(status_code=404, detail="international_order_not_found")
-    return {
-        "data": await _secure_upload_from_request(
-            request,
-            user=user,
-            roles=roles,
-            session=session,
-            forced_policy="payment_receipt",
-            entity_type="international_payment_order",
-            entity_id=order_id,
-        )
-    }
+    files, _ = await _parse_required_receipt_form(request)
+    uploaded = []
+    for file in files:
+        uploaded.append(await _secure_upload_from_request(
+            request, user=user, roles=roles, session=session,
+            forced_policy="payment_receipt", entity_type="international_payment_order",
+            entity_id=order_id, commit=False, uploaded_file=file,
+        ))
+    await session.commit()
+    return {"data": {**uploaded[0], "receipt_urls": [item["storage_ref"] for item in uploaded]}}
+
 
 
 @router.patch("/api/finance/international-order-payments/{payment_id}")
@@ -10687,6 +10762,11 @@ async def api_update_international_payment(payment_id: uuid.UUID, request: Reque
     require_finance_actor(roles)
     body = await request.json()
     _validate_payment_record_body(body)
+    existing = await session.get(MODEL_BY_TABLE["international_order_payments"], payment_id)
+    if existing is None:
+        raise HTTPException(404, "payment_not_found")
+    if "receipt_url" in body or "receipt_urls" in body:
+        await _validate_international_receipt_refs(session, body, existing.order_id)
     row = await _api_update(session, "international_order_payments", payment_id, body, staff)
     await session.commit()
     return {"data": row}
@@ -12874,6 +12954,7 @@ async def api_create_manual_order(request: Request, staff: User = Depends(requir
 
 @router.patch("/api/admin/orders/{order_id}/assignee")
 async def api_assign_order(order_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "orders.update")
     row = await session.get(Order, order_id)
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="order_not_found")
@@ -12946,9 +13027,11 @@ async def _admin_order_courier_assignment(
 @router.get("/api/admin/orders/{order_id}/courier-assignment")
 async def api_get_order_courier_assignment(
     order_id: uuid.UUID,
-    staff: User = Depends(require_staff),
+    staff: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
+    await require_staff_permission(session, staff.id, roles, "orders.view")
     order = await session.get(Order, order_id)
     if order is None or order.deleted_at is not None:
         raise HTTPException(status_code=404, detail="order_not_found")
@@ -12969,6 +13052,7 @@ async def api_set_order_courier_assignment(
     staff: User = Depends(require_staff),
     session: AsyncSession = Depends(get_session),
 ):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "orders.update")
     order = await session.get(Order, order_id, with_for_update=True)
     if order is None or order.deleted_at is not None:
         raise HTTPException(status_code=404, detail="order_not_found")
@@ -13136,11 +13220,11 @@ async def resend_order_confirmation(order_id: uuid.UUID, user: User = Depends(cu
 @router.get("/api/payments/orders/{order_id}")
 async def api_list_order_payments(
     order_id: uuid.UUID,
-    staff: User = Depends(require_staff),
+    staff: User = Depends(current_user),
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    require_finance_actor(roles)
+    await require_staff_permission(session, staff.id, roles, "orders.view")
     payment_rows = []
     for table_name in ("order_payments", "payments"):
         payment_model = MODEL_BY_TABLE[table_name]
@@ -13188,6 +13272,13 @@ async def api_list_order_payments(
             }
         )
         used_receipt_ids.add(str(receipt.id))
+
+    receipts_by_id = {str(receipt.id): receipt for receipt in receipt_rows}
+    for payment in payment_payloads:
+        reference = str(payment.get("receipt_url") or payment.get("receiptPath") or "")
+        receipt = receipts_by_id.get(reference.removeprefix("receipt:"))
+        if receipt is not None:
+            payment["receipt_urls"] = receipt_references(receipt)
 
     return {"data": payment_payloads}
 
@@ -13582,7 +13673,6 @@ async def api_create_expense(request: Request, staff: User = Depends(require_sta
         "receipt_url": str(body.get("receipt_url") or "").strip() or None,
         "is_recurring": bool(body.get("is_recurring", False)),
         "recurring_period": str(body.get("recurring_period") or "").strip() or None,
-        "voucher_number": str(body.get("voucher_number") or f"EXP-{uuid.uuid4().hex[:10].upper()}"),
     }
     row = await _api_create(session, "general_expenses", payload, staff)
     await session.commit()
@@ -13623,7 +13713,6 @@ async def api_create_financial_voucher(request: Request, staff: User = Depends(r
         "beneficiary_name": beneficiary_name,
         "payment_method": payment_method,
         "issued_date": body.get("issued_date") or datetime.now(timezone.utc).isoformat(),
-        "voucher_number": body.get("voucher_number") or f"{'RV' if raw_type == 'receipt' else 'PV'}-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}",
         "status": str(body.get("status") or "pending").strip().lower(),
     }
     row = await _api_create(session, "financial_vouchers", payload, staff)
@@ -14322,6 +14411,7 @@ async def _send_notifications(session: AsyncSession, body: dict[str, Any], actor
     if not str(body.get("title") or "").strip() or not str(body.get("message") or body.get("body") or "").strip():
         raise HTTPException(status_code=422, detail="template_not_allowed")
     service = NotificationService(session)
+    delivery_key = str(body.get("deduplicationKey") or body.get("deduplication_key") or uuid.uuid4().hex)
     count = 0
     seen: set[uuid.UUID] = set()
     for raw_user_id in recipients:
@@ -14342,7 +14432,8 @@ async def _send_notifications(session: AsyncSession, body: dict[str, Any], actor
             payload=body.get("payload") if isinstance(body.get("payload"), dict) else {"audience": audience or "explicit_recipients"},
             created_by=actor.id,
             source="admin",
-            deduplication_key=body.get("deduplicationKey") or body.get("deduplication_key") or f"admin-broadcast:{actor.id}:{user_id}:{hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode('utf-8')).hexdigest()[:24]}",
+            delivery_channels=("in_app", "mobile_push", "web_push"),
+            deduplication_key=f"admin-broadcast:{actor.id}:{user_id}:{hashlib.sha256(delivery_key.encode('utf-8')).hexdigest()[:24]}",
         ))
         count += 1
     await session.flush()

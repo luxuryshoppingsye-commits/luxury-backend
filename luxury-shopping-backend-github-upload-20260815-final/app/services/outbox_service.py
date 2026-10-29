@@ -38,7 +38,14 @@ TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 PERMANENT_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 422}
 EMAIL_RE = re.compile(r"^[^@\s\r\n]+@[^@\s\r\n]+\.[^@\s\r\n]+$")
 PHONE_RE = re.compile(r"^\+?[0-9]{8,18}$")
-BRAND_LOGO_URL = "https://luxuryshoppings.com/assets/logo-OdLYDlxV.png"
+BRAND_LOGO_URL = "https://luxuryshoppings.com/logo.png"
+
+
+def rtl_notification_text(value: str) -> str:
+    return "\n".join(
+        f"\u200f{line}" if re.search(r"[\u0600-\u08ff\ufb50-\ufdff\ufe70-\ufeff]", line) and not line.startswith("\u200f") else line
+        for line in str(value or "").split("\n")
+    )
 
 
 class _IPv4SMTP(smtplib.SMTP):
@@ -427,7 +434,7 @@ def _send_email_sync(
     email = EmailMessage(policy=SMTP)
     email["From"] = sender
     email["To"] = recipient
-    email["Subject"] = str(subject or "Luxury Shopping")[:200].replace("\r", " ").replace("\n", " ")
+    email["Subject"] = rtl_notification_text(str(subject or "Luxury Shopping")[:200].replace("\r", " ").replace("\n", " "))
     is_otp = str(extra.get("delivery_method") or "").strip().lower() == "otp"
     email.set_content(str(message or ""))
     if is_otp:
@@ -475,7 +482,7 @@ def _send_email_sync(
         plain_message = re.sub(r"https?://[^\s]+", "", plain_message).strip()
     if action_url and action_url.startswith(("https://", "http://")):
         plain_message = f"{plain_message}\n\n{action_label}: {action_url}"
-    email.set_content(plain_message)
+    email.set_content(rtl_notification_text(plain_message))
     email.add_alternative(
         _render_branded_email_html(
             logo_url=logo_url,
@@ -491,8 +498,8 @@ def _send_email_sync(
         _send_resend_email_sync(
             settings=settings,
             recipient=recipient,
-            subject=str(subject or "Luxury Shopping")[:200],
-            plain_message=plain_message,
+            subject=str(email["Subject"]),
+            plain_message=rtl_notification_text(plain_message),
             html_message=html_part.get_content() if html_part is not None else "",
             headers={
                 name: str(email[name])

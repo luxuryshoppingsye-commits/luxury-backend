@@ -79,10 +79,11 @@ from ...services.commerce_rules import (
 )
 from ...services.partner_subscription import public_partner_storefront_clause
 from ...services.payment_methods import validate_payment_method_for_checkout
-from ...services.staff_permissions import require_staff_permission
+from ...services.staff_permissions import effective_permissions, require_staff_permission
 from ...services.audit_trail import add_audit_log
 from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof, normalize_status
 from ...services.notification_service import NotificationPayload, NotificationService
+from ...services.payment_refund_security import receipt_references
 from ...storage import FileStorage
 
 
@@ -2342,6 +2343,12 @@ async def api_get_cart(user: User = Depends(current_user), session: AsyncSession
     return {"data": await get_cart(user, session)}
 
 
+async def _locked_cart_catalog(session: AsyncSession, product_ids: set[uuid.UUID], variant_ids: set[uuid.UUID]):
+    products = (await session.execute(select(Product).where(Product.id.in_(product_ids)).order_by(Product.id).with_for_update())).scalars()
+    variants = (await session.execute(select(ProductVariant).where(ProductVariant.id.in_(variant_ids)).order_by(ProductVariant.id).with_for_update())).scalars() if variant_ids else []
+    return {product.id: product for product in products}, {variant.id: variant for variant in variants}
+
+
 @router.put("/api/cart")
 async def api_sync_cart(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     body = await request.json()
@@ -2349,26 +2356,20 @@ async def api_sync_cart(request: Request, user: User = Depends(current_user), se
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items_required")
     validated: list[tuple[uuid.UUID, uuid.UUID | None, int]] = []
+    seen = set()
     for item in items:
+        if not isinstance(item, dict):
+            raise HTTPException(400, "invalid_cart_item")
         product_id = _uuid(item.get("productId") or item.get("product_id"), "productId")
         variant_id = _uuid(item.get("variantId") or item.get("variant_id"), "variantId") if item.get("variantId") or item.get("variant_id") else None
         quantity = parse_strict_quantity(item.get("quantity") if "quantity" in item else 1)
-        product = (
-            await session.execute(select(Product).where(Product.id == product_id).with_for_update())
-        ).scalar_one_or_none()
-        variant = None
-        if variant_id:
-            variant = (
-                await session.execute(select(ProductVariant).where(ProductVariant.id == variant_id).with_for_update())
-            ).scalar_one_or_none()
-        await eligible_line(
-            session,
-            product=product,
-            variant=variant,
-            variant_id=variant_id,
-            quantity=quantity,
-        )
+        if (product_id, variant_id) in seen:
+            raise HTTPException(422, "duplicate_cart_item")
+        seen.add((product_id, variant_id))
         validated.append((product_id, variant_id, quantity))
+    products, variants = await _locked_cart_catalog(session, {item[0] for item in validated}, {item[1] for item in validated if item[1]})
+    for product_id, variant_id, quantity in validated:
+        await eligible_line(session, product=products.get(product_id), variant=variants.get(variant_id), variant_id=variant_id, quantity=quantity)
     await session.execute(delete(UserCart).where(UserCart.user_id == user.id))
     rows = []
     for product_id, variant_id, quantity in validated:
@@ -2559,7 +2560,7 @@ async def _visible_orders(
     partner_id: uuid.UUID | None = None,
 ):
     statement = select(Order).where(Order.deleted_at.is_(None))
-    if scope == "admin" and roles.intersection({"admin", "manager", "finance", "logistics", "staff", "employee"}):
+    if scope == "admin":
         if partner_id is not None:
             order_ids = select(OrderItem.order_id).where(OrderItem.partner_id == partner_id)
             statement = statement.where(Order.id.in_(order_ids))
@@ -2572,11 +2573,27 @@ async def _visible_orders(
     return list(result.scalars())
 
 
+def _manual_order_customer_name(order: Order) -> str:
+    extra = getattr(order, "extra_data", None)
+    customer = extra.get("customer") if isinstance(extra, dict) else None
+    if not isinstance(customer, dict):
+        return ""
+    name = customer.get("full_name") or customer.get("fullName") or customer.get("name")
+    return name.strip() if isinstance(name, str) else ""
+
+
 async def _attach_current_customer_name(
     session: AsyncSession,
     order: Order,
     payload: dict[str, Any],
 ) -> None:
+    manual_name = _manual_order_customer_name(order)
+    if manual_name:
+        payload["customer_name"] = manual_name
+        address = payload.get("shipping_address")
+        if isinstance(address, dict):
+            payload["shipping_address"] = {**address, "full_name": manual_name}
+        return
     user_id = getattr(order, "user_id", None)
     if user_id is None:
         return
@@ -2623,7 +2640,7 @@ async def _attach_current_customer_names(
         if full_name is not None and str(full_name).strip()
     }
     for order, payload in zip(orders, payloads):
-        current_name = current_names.get(str(getattr(order, "user_id", "")))
+        current_name = _manual_order_customer_name(order) or current_names.get(str(getattr(order, "user_id", "")))
         if not current_name:
             continue
         payload["customer_name"] = current_name
@@ -2692,6 +2709,12 @@ def _attach_receipts_to_payment_payloads(
         )
         used_receipt_ids.add(str(receipt.id))
 
+    by_id = {str(receipt.id): receipt for receipt in receipts}
+    for payment in payment_payloads:
+        receipt = by_id.get(str(payment.get("payment_receipt_id") or ""))
+        if receipt is not None:
+            payment["receipt_urls"] = receipt_references(receipt)
+
 
 def _attach_latest_receipt_to_order_payload(
     payload: dict[str, Any],
@@ -2701,6 +2724,7 @@ def _attach_latest_receipt_to_order_payload(
         return
     latest = receipts[0]
     receipt_ref = f"receipt:{latest.id}"
+    payload["receipt_urls"] = list(dict.fromkeys(ref for receipt in receipts for ref in receipt_references(receipt)))
     payload["receipt_url"] = receipt_ref
     payload["receiptPath"] = receipt_ref
     payload["payment_receipt_id"] = str(latest.id)
@@ -3331,22 +3355,21 @@ async def _validated_cart_lines(
     subtotal = Decimal("0.00")
     product_discount = Decimal("0.00")
     lines: list[tuple[UserCart, Product, ProductVariant | None, Decimal]] = []
+    products, variants = await _locked_cart_catalog(session, {item.product_id for item in cart_items}, {item.variant_id for item in cart_items if item.variant_id})
+    quantities: dict[tuple[uuid.UUID, uuid.UUID | None], int] = {}
+    for item in cart_items:
+        key = (item.product_id, item.variant_id)
+        quantities[key] = quantities.get(key, 0) + parse_strict_quantity(item.quantity)
     for item in cart_items:
         quantity = parse_strict_quantity(item.quantity)
-        product = (
-            await session.execute(select(Product).where(Product.id == item.product_id).with_for_update())
-        ).scalar_one_or_none()
-        variant = None
-        if item.variant_id:
-            variant = (
-                await session.execute(select(ProductVariant).where(ProductVariant.id == item.variant_id).with_for_update())
-            ).scalar_one_or_none()
+        product = products.get(item.product_id)
+        variant = variants.get(item.variant_id)
         line = await eligible_line(
             session,
             product=product,
             variant=variant,
             variant_id=item.variant_id,
-            quantity=quantity,
+            quantity=quantities[(item.product_id, item.variant_id)],
         )
         original_unit = _line_original_unit(line.product, line.variant, line.unit_price)
         subtotal += line_total(original_unit, quantity)
@@ -3472,7 +3495,6 @@ async def checkout(
             body=body,
         )
         order = Order(
-            order_number=f"ORD-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
             user_id=user.id,
             status="pending",
             subtotal=financials.subtotal,
@@ -3544,6 +3566,7 @@ async def checkout(
         if "buyNowItem" not in body:
             await session.execute(delete(UserCart).where(UserCart.user_id == user.id))
     await session.commit()
+    public_read_cache.clear()
     response.status_code = 201
     return _serialize_order(order, idempotency_replayed=False if key else None)
 
@@ -3631,7 +3654,6 @@ async def create_manual_order(
             body=body,
         )
         order = Order(
-            order_number=f"ADM-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
             user_id=customer.id,
             created_by=admin.id,
             status="pending",
@@ -3826,7 +3848,7 @@ async def order_courier_assignment(
     session: AsyncSession = Depends(get_session),
 ):
     order = await session.get(Order, order_id)
-    is_staff = bool(roles.intersection({"admin", "manager", "finance", "logistics", "staff"}))
+    is_staff = "orders.view" in await effective_permissions(session, user.id, roles)
     if order is None or order.deleted_at is not None or (order.user_id != user.id and not is_staff):
         raise HTTPException(status_code=404, detail="order_not_found")
     payload: dict[str, Any] = {}
@@ -3847,7 +3869,7 @@ async def order_detail(
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    is_staff = bool(roles.intersection({"admin", "manager", "finance", "logistics", "staff"}))
+    is_staff = "orders.view" in await effective_permissions(session, user.id, roles)
     if (scope == "partner" or request.url.path.startswith("/api/partner/")) and "partner" in roles and not is_staff:
         payload = await merchant_order_detail(session, partner_id=user.id, order_id=order_id)
         return {"data": payload} if request.url.path.startswith("/api/") else payload
@@ -3934,6 +3956,7 @@ async def order_detail(
         "shippingHistory": [],
         "notes": order.notes,
         "receiptPath": order_payload.get("receiptPath"),
+        "receipt_urls": order_payload.get("receipt_urls", []),
         "customerReceived": bool((order.extra_data or {}).get("customer_received_at")),
         "returns": [_serialize_return(row, items_by_return.get(str(row.id), [])) for row in return_rows],
     }
@@ -3950,7 +3973,7 @@ async def confirm_customer_order_received(
     user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """Record the customer's explicit delivery confirmation once the order is delivered."""
+    """Let the owner confirm a dispatched order and record delivery once."""
     body = await request.json()
     if not isinstance(body, dict):
         body = {}
@@ -3963,12 +3986,20 @@ async def confirm_customer_order_received(
     ).scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="order_not_found")
-    if normalize_status(order.status) not in {"delivered", "completed"}:
+    previous_status = normalize_status(order.status)
+    if previous_status not in {"shipped", "out_for_delivery", "delivered", "completed"}:
         raise HTTPException(status_code=409, detail="order_not_delivered")
     extra = dict(order.extra_data or {})
     already_confirmed = bool(extra.get("customer_received_at"))
     if not already_confirmed:
         now = datetime.now(timezone.utc).isoformat()
+        if previous_status not in {"delivered", "completed"}:
+            order.status = "delivered"
+            session.add(MODEL_BY_TABLE["order_status_history"](
+                order_id=order.id, status="delivered", notes="أكد العميل وصول الطلب.",
+                extra_data={"previous_status": previous_status, "new_status": "delivered", "actor": "customer", "actor_id": str(user.id)},
+            ))
+            await award_loyalty_points_for_fulfilled_order(session, order)
         extra.update({
             "customer_received_at": now,
             "customer_received_by": str(user.id),
@@ -3983,7 +4014,7 @@ async def confirm_customer_order_received(
             extra_data={
                 "actor": "customer",
                 "confirmed_at": now,
-                "previous_status": order.status,
+                "previous_status": previous_status,
                 "new_status": "customer_received",
             },
         ))
@@ -4003,6 +4034,9 @@ async def confirm_customer_order_received(
             payload={"order_id": str(order.id), "customer_id": str(user.id)},
             deduplication_key=f"customer-order-received:{order.id}",
         )
+        add_audit_log(session, user_id=user.id, action="customer_order_received",
+            description=f"Customer confirmed receipt of order {order.order_number}",
+            extra_data={"order_id": str(order.id), "previous_status": previous_status, "new_status": order.status})
         await session.commit()
     return {"order": _serialize_order(order), "customerReceived": True, "idempotent": already_confirmed}
 
@@ -4404,7 +4438,8 @@ async def change_order_status(
     order.status = next_status
     await award_loyalty_points_for_fulfilled_order(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
-    session.add(history_model(order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status}))
+    history = history_model(id=uuid.uuid4(), order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status})
+    session.add(history)
     add_audit_log(
         session,
         user_id=user.id,
@@ -4432,7 +4467,7 @@ async def change_order_status(
             "title_en": "Order status updated",
             "body_en": f"Your order status is now {_order_status_notification_label_en(next_status)}.",
         },
-        deduplication_key=f"order-status:{order.id}:{next_status}",
+        deduplication_key=f"order-status:{order.id}:{history.id}",
     )
     await session.commit()
     return serialize_record(order)
@@ -4497,6 +4532,21 @@ async def rollback_order_status(
             "previous_status": current_status,
             "new_status": previous_status,
         },
+    )
+    await _create_notification(
+        session, "notifications", user_id=order.user_id, order_id=order.id,
+        title="التراجع عن حالة الطلب",
+        body=f"تم التراجع عن آخر تحديث. حالة طلبك الآن: {_order_status_notification_label(previous_status)}.",
+        type="order_status_rolled_back", category="order", priority="high",
+        created_by=user.id,
+        payload={
+            "deep_link": f"/orders/{order.id}",
+            "order_status": previous_status,
+            "previous_status": current_status,
+            "title_en": "Order status reverted",
+            "body_en": f"The latest status update was reverted. Your order status is now {_order_status_notification_label_en(previous_status)}.",
+        },
+        deduplication_key=f"order-status-rollback:{order.id}:{latest.id}",
     )
     await session.commit()
     return serialize_record(order)

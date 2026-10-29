@@ -21,7 +21,7 @@ from ...dependencies import current_bearer_user, current_user, require_admin, us
 from ...models import MODEL_BY_TABLE
 from ...config import get_settings
 from ...models.domain import AuthSession, LoginAttempt, PasswordResetToken, PasswordResetTokenState, PhoneOtpToken, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole, VerificationToken
-from ...models.domain import StaffPermissionSet
+from ...models.domain import Order, StaffPermissionSet
 from ...repositories.resources import serialize_record
 from ...schemas.auth import (
     AccountDeletionRequestCreate,
@@ -73,6 +73,7 @@ from ...services.staff_permissions import (
     PERMISSION_GROUPS,
     effective_permissions,
     normalize_permissions,
+    require_staff_permission,
 )
 from ...services.firebase_auth_service import firebase_admin_configuration_status, verify_firebase_id_token
 from ...services.outbox_service import deliver_email_now, email_delivery_configured
@@ -1911,15 +1912,25 @@ async def admin_save_staff_permissions(
 @router.post("/api/admin/profiles/lookup")
 async def admin_profiles_lookup(
     request: Request,
-    _: User = Depends(require_admin),
+    user: User = Depends(current_user),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
+    is_admin = bool(roles.intersection({"admin", "manager"}))
+    if not is_admin:
+        await require_staff_permission(session, user.id, roles, "orders.view")
     body = await request.json()
     ids = [uuid.UUID(str(item)) for item in body.get("user_ids", []) if item]
     if not ids:
         return {"data": []}
-    rows = (await session.execute(select(Profile).where(Profile.user_id.in_(ids)))).scalars().all()
-    return {"data": [serialize_record(row) for row in rows]}
+    statement = select(Profile).where(Profile.user_id.in_(ids))
+    if not is_admin:
+        statement = statement.where(Profile.user_id.in_(select(Order.user_id).where(Order.deleted_at.is_(None))))
+    rows = (await session.execute(statement)).scalars().all()
+    data = [serialize_record(row) for row in rows]
+    if not is_admin:
+        data = [{key: item.get(key) for key in ("id", "user_id", "full_name", "phone", "city")} for item in data]
+    return {"data": data}
 
 
 def _parse_role_id(role_id: str) -> tuple[uuid.UUID, str]:

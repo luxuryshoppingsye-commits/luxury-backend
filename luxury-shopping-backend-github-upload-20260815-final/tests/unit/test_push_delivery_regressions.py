@@ -93,7 +93,8 @@ def test_campaigns_always_include_in_app_and_phone_alert_channels():
 
 
 @pytest.mark.asyncio
-async def test_mobile_payload_has_visible_alert_sound_and_android_channel(monkeypatch):
+@pytest.mark.parametrize("notification_type", ["order_status", "order_status_rolled_back", "payment_status_changed"])
+async def test_mobile_payload_has_visible_alert_sound_and_android_channel(monkeypatch, notification_type):
     settings = SimpleNamespace(firebase_project_id="test", google_application_credentials=None,
         google_application_credentials_json="{}", firebase_service_account_json=None,
         frontend_public_url="https://example.test")
@@ -106,12 +107,51 @@ async def test_mobile_payload_has_visible_alert_sound_and_android_channel(monkey
         SimpleNamespace(all=lambda: [SimpleNamespace(token="test-only-device-token")])) )
     service = ns.NotificationService(session)
     service._record_delivery = AsyncMock(return_value="provider_accepted")
-    assert await service._send_mobile_push(outbox(), None) == "provider_accepted"
+    row = outbox()
+    row.type = notification_type
+    row.title = "تحديث الطلب — ORD-261012-0001"
+    row.message = "الطلب ORD-261012-0001: تم تحديث حالة الطلب."
+    row.payload = {"order_number": "ORD-261012-0001"}
+    assert await service._send_mobile_push(row, None) == "provider_accepted"
     message = captured[0]
-    assert message.notification.title == "Welcome"
-    assert message.notification.body == "Welcome"
+    assert message.notification.title == f"\u200f{row.title}"
+    assert message.notification.body == f"\u200f{row.message}"
+    assert message.webpush.notification.direction == "rtl"
+    assert message.webpush.notification.language == "ar-YE"
+    assert message.webpush.notification.icon == "https://example.test/logo.png"
+    assert message.webpush.notification.renotify is True
     assert message.apns.headers == {"apns-priority": "10", "apns-push-type": "alert"}
     assert message.apns.payload.aps.sound == "default"
     assert message.android.priority == "high"
     assert message.android.notification.channel_id == "luxury_notifications"
-    assert message.data["notification_type"] == "customer_welcome"
+    assert message.data["notification_type"] == notification_type
+    assert message.data["order_number"] == "ORD-261012-0001"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notification_type", ["order_status", "order_status_rolled_back", "payment_status_changed"])
+async def test_web_push_sends_order_reference_and_text_without_an_open_page(monkeypatch, notification_type):
+    monkeypatch.setattr(ns, "get_settings", lambda: SimpleNamespace(
+        vapid_public_key="public-key", vapid_private_key="private-key", vapid_subject="mailto:ghaya@gmail.com",
+        frontend_public_url="https://luxuryshoppings.com",
+    ))
+    captured = []
+    monkeypatch.setattr(ns, "webpush", lambda **kwargs: captured.append(kwargs) or SimpleNamespace(status_code=201))
+    session = Session()
+    session.execute = AsyncMock(return_value=SimpleNamespace(scalars=lambda:
+        SimpleNamespace(all=lambda: [SimpleNamespace(endpoint="https://fcm.googleapis.com/fcm/send/device", p256dh="public", auth="auth")])) )
+    service = ns.NotificationService(session)
+    service._record_delivery = AsyncMock(return_value="provider_accepted")
+    row = outbox()
+    row.type = notification_type
+    row.title = "تحديث الطلب — ORD-261012-0001"
+    row.message = "الطلب ORD-261012-0001: تم تحديث حالة الطلب."
+    row.payload = {"order_number": "ORD-261012-0001", "deep_link": "/my-orders"}
+    assert await service._send_web_push(row, None) == "provider_accepted"
+    import json
+    payload = json.loads(captured[0]["data"])
+    assert payload["title"] == f"\u200f{row.title}"
+    assert payload["body"] == f"\u200f{row.message}"
+    assert payload["badge"] == "/notification-badge.svg"
+    assert payload["data"]["order_number"] == "ORD-261012-0001"
+    assert payload["url"] == "/my-orders"

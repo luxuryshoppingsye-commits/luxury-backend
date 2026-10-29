@@ -711,10 +711,6 @@ def _normalize_resource_payload(
     """Normalize dashboard aliases before the generic resource writer persists them."""
     values = dict(raw)
     if table == "international_orders" and operation in {"insert", "upsert"}:
-        if not str(values.get("order_number") or "").strip():
-            values["order_number"] = (
-                f"INTL-{datetime.now():%Y%m%d}-{uuid.uuid4().hex.upper()}"
-            )
         values.pop("orderNumber", None)
     if table == "site_settings":
         # Keep both the REST content API and the resource API on the same

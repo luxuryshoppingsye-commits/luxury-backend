@@ -111,7 +111,9 @@ def test_resend_payload_contains_arabic_content_logo_and_action_link(monkeypatch
     assert payload["to"] == ["customer@example.com"]
     assert "استعادة كلمة المرور" in payload["subject"]
     assert "رفاهية التسوق" in payload["html"]
-    assert "logo-OdLYDlxV.png" in payload["html"]
+    assert "https://luxuryshoppings.com/logo.png" in payload["html"]
+    assert payload["subject"].startswith("\u200f")
+    assert payload["text"].startswith("\u200f")
     assert 'width="24" height="24"' in payload["html"]
     assert 'color:#58a6ff;text-decoration:underline' in payload["html"]
     assert 'padding:11px 24px' not in payload["html"]
@@ -160,7 +162,9 @@ def test_smtp_strips_google_app_password_spaces_and_uses_branded_html(monkeypatc
 
     assert captured["credentials"] == ("luxuryshoppingsye@gmail.com", "abcdefghijklmnop")
     html = captured["message"].get_body(preferencelist=("html",)).get_content()
-    assert "https://luxuryshoppings.com/assets/logo-OdLYDlxV.png" in html
+    assert "https://luxuryshoppings.com/logo.png" in html
+    assert str(captured["message"]["Subject"]).startswith("\u200f")
+    assert captured["message"].get_body(preferencelist=("plain",)).get_content().startswith("\u200f")
     assert "تجربة تسوق تليق بك" in html
     assert "letter-spacing:normal" in html
     assert 'width="24" height="24"' in html

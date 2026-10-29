@@ -235,12 +235,16 @@ def normalize_store_review_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _schema_compatible_execute(session: AsyncSession, statement: Any, params: dict[str, Any] | None = None):
+    async with session.begin_nested():
+        return await session.execute(statement, params)
+
+
 async def _fetch_rows(session: AsyncSession, sql: str, params: dict[str, Any]) -> list[dict[str, Any]] | None:
     try:
-        result = await session.execute(text(sql), params)
+        result = await _schema_compatible_execute(session, text(sql), params)
         return [dict(row) for row in result.mappings().all()]
     except ProgrammingError:
-        await session.rollback()
         return None
 
 
@@ -290,7 +294,7 @@ async def create_handover_store_review(
     route continue with the resource-table writer for newer installations.
     """
     try:
-        result = await session.execute(
+        result = await _schema_compatible_execute(session,
             text(_HANDOVER_CREATE_SQL),
             {
                 "user_id": user_id,
@@ -306,7 +310,6 @@ async def create_handover_store_review(
             return {}
         return normalize_store_review_row(dict(row))
     except ProgrammingError:
-        await session.rollback()
         return None
 
 
@@ -325,7 +328,7 @@ async def update_handover_store_review(
     resource-table writer without changing the public endpoint contract.
     """
     try:
-        result = await session.execute(
+        result = await _schema_compatible_execute(session,
             text(_HANDOVER_CONTENT_UPDATE_SQL),
             {
                 "review_id": review_id,
@@ -338,7 +341,6 @@ async def update_handover_store_review(
         row = result.mappings().one_or_none()
         return normalize_store_review_row(dict(row)) if row is not None else {}
     except ProgrammingError:
-        await session.rollback()
         return None
 
 
@@ -353,7 +355,7 @@ async def update_handover_store_review_status(
 ) -> dict[str, Any] | None:
     """Update moderation fields across legacy and resource-table schemas."""
     try:
-        columns_result = await session.execute(text(_STORE_REVIEW_COLUMNS_SQL))
+        columns_result = await _schema_compatible_execute(session, text(_STORE_REVIEW_COLUMNS_SQL))
         columns = {str(column) for column in columns_result.scalars().all()}
         assignments: list[str] = []
         params: dict[str, Any] = {
@@ -389,7 +391,7 @@ async def update_handover_store_review_status(
         if not assignments or not ({"status", "is_approved", "is_rejected", "extra_data"} & columns):
             return None
 
-        result = await session.execute(
+        result = await _schema_compatible_execute(session,
             text(
                 "UPDATE public.store_reviews "
                 f"SET {', '.join(assignments)} "
@@ -400,5 +402,4 @@ async def update_handover_store_review_status(
         row = result.mappings().one_or_none()
         return normalize_store_review_row(dict(row)) if row is not None else {}
     except SQLAlchemyError:
-        await session.rollback()
         return None
