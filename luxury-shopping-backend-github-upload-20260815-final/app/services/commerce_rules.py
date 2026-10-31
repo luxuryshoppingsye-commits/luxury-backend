@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..models import MODEL_BY_TABLE
-from ..models.domain import Category, Product, ProductVariant
+from ..models.domain import Category, Order, OrderItem, Product, ProductVariant
 from .catalog_policy import is_public_approval_status, is_public_product
 from .financial_calculator import money, unit_price
 
@@ -220,3 +220,143 @@ def require_shipping_zone_id(body: dict[str, Any]) -> uuid.UUID:
         return uuid.UUID(str(raw))
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid_uuid:shippingZoneId")
+
+
+def _stock_reference(data: dict[str, Any], *keys: str) -> str:
+    return next((str(data[key]).strip() for key in keys if data.get(key)), "")
+
+
+def _stock_amount(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_warehouse_movement(session: AsyncSession, *, product: Product,
+                               item: OrderItem, location: Any, quantity: int,
+                               movement_type: str) -> None:
+    model = MODEL_BY_TABLE["inventory_movements"]
+    session.add(model(
+        product_id=product.id, variant_id=item.variant_id, quantity=quantity,
+        type=movement_type, status="completed",
+        notes="خصم الطلب" if movement_type == "out" else "إعادة مخزون الطلب الملغي",
+        extra_data={"order_id": str(item.order_id), "order_item_id": str(item.id),
+                    "warehouse_id": _stock_reference(location.extra_data or {}, "warehouse_id", "warehouseId"),
+                    "inventory_location_id": str(location.id), "source": "order_inventory"},
+    ))
+
+
+async def deduct_order_inventory(session: AsyncSession, *, product: Product,
+                                 variant: ProductVariant | None, item: OrderItem) -> None:
+    """Deduct only this product's stock and retain its exact source for cancellation."""
+    if not product.track_inventory:
+        return
+    model = MODEL_BY_TABLE["inventory_locations"]
+    locations = list((await session.execute(select(model).where(
+        model.deleted_at.is_(None),
+        or_(model.extra_data["product_id"].astext == str(product.id),
+            model.extra_data["productId"].astext == str(product.id)),
+    ).order_by(model.created_at, model.id).with_for_update())).scalars())
+    variant_id = str(variant.id) if variant else ""
+    explicit = [row for row in locations if _stock_reference(row.extra_data or {}, "variant_id", "variantId") == variant_id]
+    if variant and not explicit:
+        explicit = [row for row in locations if not _stock_reference(row.extra_data or {}, "variant_id", "variantId")]
+    locations = explicit
+    warehouse_model = MODEL_BY_TABLE["warehouses"]
+    warehouse_ids = {_stock_reference(row.extra_data or {}, "warehouse_id", "warehouseId") for row in locations}
+    warehouse_ids.discard("")
+    warehouses = {str(row.id): row for row in (await session.execute(select(warehouse_model).where(
+        warehouse_model.id.in_([uuid.UUID(value) for value in warehouse_ids]),
+    ))).scalars()} if warehouse_ids else {}
+    eligible = []
+    for row in locations:
+        data = row.extra_data or {}
+        warehouse_id = _stock_reference(data, "warehouse_id", "warehouseId")
+        warehouse = warehouses.get(warehouse_id)
+        if row.is_active is False:
+            continue
+        if warehouse_id and (warehouse is None or warehouse.deleted_at is not None or warehouse.is_active is False):
+            continue
+        owner = _stock_reference(warehouse.extra_data or {}, "partner_id", "partnerId", "owner_id", "user_id") if warehouse else ""
+        if owner and owner != str(product.partner_id or ""):
+            continue
+        eligible.append(row)
+    assigned = sum(_stock_amount((row.extra_data or {}).get("quantity")) for row in locations)
+    stock = variant.stock_quantity if variant else product.stock_quantity
+    unassigned = max(_stock_amount(stock) - assigned, 0)
+    available = unassigned + sum(_stock_amount((row.extra_data or {}).get("quantity")) for row in eligible)
+    if available < item.quantity:
+        raise HTTPException(status_code=409, detail="insufficient_stock")
+    remaining = item.quantity
+    allocation = []
+    for row in eligible:
+        data = dict(row.extra_data or {})
+        taken = min(remaining, _stock_amount(data.get("quantity")))
+        if not taken:
+            continue
+        data["quantity"] = _stock_amount(data.get("quantity")) - taken
+        row.extra_data = data
+        allocation.append({"location_id": str(row.id),
+                           "warehouse_id": _stock_reference(data, "warehouse_id", "warehouseId"),
+                           "quantity": taken})
+        _record_warehouse_movement(session, product=product, item=item,
+                                   location=row, quantity=taken, movement_type="out")
+        remaining -= taken
+        if not remaining:
+            break
+    product_delta = item.quantity if variant is None or locations else 0
+    product_base = _stock_amount(product.stock_quantity)
+    if variant is not None:
+        if product_delta:
+            product_base = max(product_base, _stock_amount(variant.stock_quantity))
+        variant.stock_quantity -= item.quantity
+    if product_delta:
+        product.stock_quantity = product_base - product_delta
+    item.extra_data = {**(item.extra_data or {}), "stock_allocation": {
+        "product_id": str(product.id), "variant_id": variant_id,
+        "locations": allocation, "unassigned_quantity": remaining,
+        "product_quantity_deducted": product_delta, "restored": False,
+    }}
+
+
+async def restore_order_inventory(session: AsyncSession, order: Order) -> None:
+    items = list((await session.execute(select(OrderItem).where(
+        OrderItem.order_id == order.id,
+    ).order_by(OrderItem.product_id, OrderItem.variant_id, OrderItem.id).with_for_update())).scalars())
+    for item in items:
+        data = dict(item.extra_data or {})
+        allocation = data.get("stock_allocation")
+        if data.get("stock_restored") is True or isinstance(allocation, dict) and allocation.get("restored") is True:
+            continue
+        product = await session.get(Product, item.product_id, with_for_update=True)
+        if product is None:
+            continue
+        variant = await session.get(ProductVariant, item.variant_id, with_for_update=True) if item.variant_id else None
+        if isinstance(allocation, dict):
+            if allocation.get("product_id") != str(item.product_id) or allocation.get("variant_id", "") != str(item.variant_id or ""):
+                raise HTTPException(status_code=409, detail="stock_allocation_invalid")
+            model = MODEL_BY_TABLE["inventory_locations"]
+            for source in sorted(allocation.get("locations", []), key=lambda value: value["location_id"]):
+                row = await session.get(model, uuid.UUID(source["location_id"]), with_for_update=True)
+                if row is None or row.deleted_at is not None:
+                    raise HTTPException(status_code=409, detail="stock_location_unavailable")
+                payload = dict(row.extra_data or {})
+                if _stock_reference(payload, "product_id", "productId") != str(item.product_id) or _stock_reference(payload, "warehouse_id", "warehouseId") != source["warehouse_id"]:
+                    raise HTTPException(status_code=409, detail="stock_allocation_invalid")
+                quantity = _stock_amount(source["quantity"])
+                payload["quantity"] = _stock_amount(payload.get("quantity")) + quantity
+                row.extra_data = payload
+                _record_warehouse_movement(session, product=product, item=item,
+                                           location=row, quantity=quantity, movement_type="in")
+            product.stock_quantity += _stock_amount(allocation.get("product_quantity_deducted"))
+            if variant is not None:
+                variant.stock_quantity += item.quantity
+            data["stock_allocation"] = {**allocation, "restored": True}
+        elif product.track_inventory:
+            if variant is not None:
+                variant.stock_quantity += item.quantity
+            elif not item.variant_id:
+                product.stock_quantity += item.quantity
+        data["stock_restored"] = True
+        item.extra_data = data

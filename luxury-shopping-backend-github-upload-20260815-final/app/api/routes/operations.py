@@ -5200,9 +5200,12 @@ async def api_create_local_shopping_request(
 
 
 def _international_image_refs(item: dict[str, Any]) -> list[str]:
-    images = item.get("image_urls", [])
-    if not isinstance(images, list) or len(images) > 10 or any(not isinstance(ref, str) for ref in images):
-        raise HTTPException(422, "invalid_international_images")
+    images = []
+    for key in ("image_urls", "cart_images"):
+        values = item.get(key, [])
+        if not isinstance(values, list) or len(values) > 10 or any(not isinstance(ref, str) for ref in values):
+            raise HTTPException(422, "invalid_international_images")
+        images.extend(values)
     primary = item.get("image_url")
     if primary is not None and not isinstance(primary, str):
         raise HTTPException(422, "invalid_international_images")
@@ -7593,11 +7596,11 @@ async def api_store_reviews_eligibility(
                 "has_order": True,
             }
         }
-    reason, has_order = await _customer_store_review_eligibility(session, user.id)
+    _reason, has_order = await _customer_store_review_eligibility(session, user.id)
     return {
         "data": {
-            "can_review": reason == "eligible",
-            "reason": reason,
+            "can_review": True,
+            "reason": "eligible",
             "has_order": has_order,
         }
     }
@@ -9110,15 +9113,6 @@ async def api_create_store_review(request: Request, user: User = Depends(current
     existing = await fetch_user_store_review(session, user.id)
     if existing and existing.get("id"):
         raise HTTPException(status_code=409, detail="review_already_submitted")
-    review_reason, _ = await _customer_store_review_eligibility(session, user.id)
-    if review_reason != "eligible":
-        detail = (
-            "review_requires_delivery"
-            if review_reason == "not_delivered"
-            else "review_requires_order"
-        )
-        raise HTTPException(status_code=403, detail=detail)
-
     account_name = await _review_account_name(session, user)
     show_name = _review_bool(
         body.get("show_name", body.get("showName")),

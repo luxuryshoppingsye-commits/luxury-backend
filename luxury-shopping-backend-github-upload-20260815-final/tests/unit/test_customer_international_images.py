@@ -25,8 +25,11 @@ def records(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_customer_can_read_own_order_image_without_public_caching(tmp_path, monkeypatch):
+@pytest.mark.parametrize("image_field", ["image_url", "image_urls", "cart_images"])
+async def test_customer_can_read_own_order_image_without_public_caching(tmp_path, monkeypatch, image_field):
     order, asset, image, session = records(tmp_path)
+    reference = f"file:{asset.id}"
+    order.extra_data["items"] = [{image_field: reference if image_field == "image_url" else [reference]}]
     monkeypatch.setattr(operations.storage, "_safe_join", lambda _: image)
     response = await operations.api_customer_international_order_attachment(order.id, asset.id,
         user=SimpleNamespace(id=order.user_id), session=session)
@@ -48,8 +51,11 @@ async def test_other_customer_cannot_read_an_order_image(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["unlinked", "foreign_asset", "infected", "deleted"])
-async def test_customer_cannot_read_unlinked_or_unsafe_images(tmp_path, change):
+@pytest.mark.parametrize("image_field", ["image_url", "cart_images"])
+async def test_customer_cannot_read_unlinked_or_unsafe_images(tmp_path, change, image_field):
     order, asset, _, session = records(tmp_path)
+    reference = f"file:{asset.id}"
+    order.extra_data["items"] = [{image_field: reference if image_field == "image_url" else [reference]}]
     if change == "unlinked": order.extra_data = {"items": []}
     if change == "foreign_asset": asset.owner_user_id = uuid.uuid4()
     if change == "infected": asset.scan_status = "infected"
@@ -58,3 +64,20 @@ async def test_customer_cannot_read_unlinked_or_unsafe_images(tmp_path, change):
         await operations.api_customer_international_order_attachment(order.id, asset.id,
             user=SimpleNamespace(id=order.user_id), session=session)
     assert error.value.status_code == 404
+
+
+def test_international_cart_images_are_merged_without_duplicates():
+    assert operations._international_image_refs({"image_url": "file:one", "image_urls": ["file:one"], "cart_images": ["file:one", "file:two"]}) == ["file:one", "file:two"]
+
+
+@pytest.mark.parametrize("images", ["file:one", [1], ["file:one"] * 11])
+def test_invalid_cart_image_groups_are_rejected(images):
+    with pytest.raises(HTTPException) as error:
+        operations._international_image_refs({"cart_images": images})
+    assert error.value.status_code == 422
+
+
+def test_combined_cart_and_product_images_keep_the_ten_image_limit():
+    with pytest.raises(HTTPException) as error:
+        operations._international_image_refs({"image_urls": [f"file:{index}" for index in range(10)], "cart_images": ["file:ten"]})
+    assert error.value.status_code == 422

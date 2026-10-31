@@ -1521,6 +1521,12 @@ async def create_profile_address(
     is_default = _address_boolean(
         body.get("is_default", body.get("isDefault")),
     )
+    # Serialize first-address/default changes for this account.
+    await session.execute(select(User).where(User.id == user.id).with_for_update())
+    existing_address_id = (await session.execute(select(model.id).where(
+        model.user_id == user.id, model.deleted_at.is_(None),
+    ).limit(1))).scalar_one_or_none()
+    is_default = is_default or existing_address_id is None
     district = str(body.get("district") or "").strip()
     row = model(
         user_id=user.id,

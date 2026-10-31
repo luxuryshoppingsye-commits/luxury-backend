@@ -71,6 +71,8 @@ from ...services.merchant_order_scope import merchant_order_count, merchant_orde
 from ...services.public_read_cache import cache_key, public_read_cache
 from ...services.product_identifier import decode_compact_uuid
 from ...services.commerce_rules import (
+    deduct_order_inventory,
+    restore_order_inventory,
     eligible_line,
     parse_strict_quantity,
     validate_product_for_sale,
@@ -3527,7 +3529,7 @@ async def checkout(
             financials=financials,
         )
         for item, product, variant, calculated_unit_price in lines:
-            session.add(OrderItem(
+            order_item = OrderItem(id=uuid.uuid4(),
                 order_id=order.id,
                 product_id=product.id,
                 variant_id=variant.id if variant else None,
@@ -3541,12 +3543,9 @@ async def checkout(
                     "pricing_snapshot": {"unit_price": str(money(calculated_unit_price)), "quantity": item.quantity},
                     "return_policy": _return_policy_snapshot(product, calculated_unit_price),
                 },
-            ))
-            if product.track_inventory:
-                if variant:
-                    variant.stock_quantity -= item.quantity
-                else:
-                    product.stock_quantity -= item.quantity
+            )
+            session.add(order_item)
+            await deduct_order_inventory(session, product=product, variant=variant, item=order_item)
         history_model = MODEL_BY_TABLE["order_status_history"]
         session.add(history_model(order_id=order.id, status="pending", notes="Order created", extra_data={"new_status": "pending"}))
         payment_model = MODEL_BY_TABLE["order_payments"]
@@ -3689,7 +3688,7 @@ async def create_manual_order(
             financials=financials,
         )
         for product, variant, quantity, calculated_unit_price in lines:
-            session.add(OrderItem(
+            order_item = OrderItem(id=uuid.uuid4(),
                 order_id=order.id,
                 product_id=product.id,
                 variant_id=variant.id if variant else None,
@@ -3700,13 +3699,9 @@ async def create_manual_order(
                 total_price=line_total(calculated_unit_price, quantity),
                 partner_id=product.partner_id,
                 extra_data={"pricing_snapshot": {"unit_price": str(money(calculated_unit_price)), "quantity": quantity}},
-            ))
-            if product.track_inventory:
-                if variant:
-                    variant.stock_quantity -= quantity
-                else:
-                    product.stock_quantity -= quantity
-
+            )
+            session.add(order_item)
+            await deduct_order_inventory(session, product=product, variant=variant, item=order_item)
         history_model = MODEL_BY_TABLE["order_status_history"]
         session.add(history_model(
             order_id=order.id,
@@ -4435,6 +4430,8 @@ async def change_order_status(
     # explicitly linked, so the final order state remains traceable.
     if courier_actor:
         assert_delivery_proof(next_status, body)
+    if next_status == "cancelled":
+        await restore_order_inventory(session, order)
     order.status = next_status
     await award_loyalty_points_for_fulfilled_order(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
@@ -4470,6 +4467,8 @@ async def change_order_status(
         deduplication_key=f"order-status:{order.id}:{history.id}",
     )
     await session.commit()
+    if next_status == "cancelled":
+        public_read_cache.clear()
     return serialize_record(order)
 
 
@@ -4580,23 +4579,7 @@ async def cancel_customer_order(
         raise HTTPException(status_code=404, detail="order_not_found")
 
     previous, next_status = assert_allowed_transition(order.status, "cancelled")
-    item_rows = list(
-        (
-            await session.execute(
-                select(OrderItem).where(OrderItem.order_id == order.id).with_for_update()
-            )
-        ).scalars()
-    )
-    for item in item_rows:
-        product = await session.get(Product, item.product_id, with_for_update=True)
-        if product is None or not product.track_inventory:
-            continue
-        if item.variant_id:
-            variant = await session.get(ProductVariant, item.variant_id, with_for_update=True)
-            if variant is not None:
-                variant.stock_quantity += item.quantity
-        else:
-            product.stock_quantity += item.quantity
+    await restore_order_inventory(session, order)
 
     order.status = next_status
     history_model = MODEL_BY_TABLE["order_status_history"]
@@ -4634,6 +4617,7 @@ async def cancel_customer_order(
         extra_data={"order_id": str(order.id), "user_id": str(user.id)},
     )
     await session.commit()
+    public_read_cache.clear()
     return serialize_record(order)
 
 
