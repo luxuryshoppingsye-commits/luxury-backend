@@ -11,6 +11,27 @@ from reportlab.pdfbase.ttfonts import TTFont
 from backend.app.services import report_admin_services as ras
 
 
+def test_reporting_currency_without_explicit_default_uses_ledger_base() -> None:
+    service = ras.RevenueRecognitionService
+    rates, target = service.reporting_currency([{"code": "SAR", "exchange_rate": "0.0071"}])
+
+    assert target["code"] == "YER"
+    assert service.converted_amount(71, "SAR", rates, target["code"]) == Decimal("10000")
+    with pytest.raises(HTTPException) as error:
+        service.converted_amount(1, "USD", rates, target["code"])
+    assert error.value.status_code == 503
+
+
+def test_reporting_currency_keeps_explicit_default() -> None:
+    rates, target = ras.RevenueRecognitionService.reporting_currency([
+        {"code": "YER", "exchange_rate": 1},
+        {"code": "SAR", "exchange_rate": "0.0071", "is_default": True},
+    ])
+
+    assert target["code"] == "SAR"
+    assert ras.RevenueRecognitionService.converted_amount(10000, "YER", rates, target["code"]) == Decimal("71")
+
+
 def test_pdf_arabic_font_registration_skips_missing_candidate(monkeypatch, tmp_path) -> None:
     packaged_font = ras.BACKEND_DIR / "assets" / "fonts" / "Tajawal-Regular.ttf"
     assert packaged_font.is_file()
@@ -25,7 +46,7 @@ def test_pdf_arabic_font_registration_skips_missing_candidate(monkeypatch, tmp_p
 
 @pytest.mark.parametrize(
     "report_type",
-    ("summary", "sales", "orders", "revenue", "customers", "merchant_revenue"),
+    ("summary", "sales", "orders", "revenue", "customers", "merchant_revenue", "refunds"),
 )
 def test_pdf_reports_use_arabic_font_and_brand_identity(report_type: str) -> None:
     logo = ras.BACKEND_DIR / "assets" / "branding" / "luxury-shopping-logo.png"

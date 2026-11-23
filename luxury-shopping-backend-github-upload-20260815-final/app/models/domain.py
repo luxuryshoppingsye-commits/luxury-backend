@@ -11,6 +11,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    FetchedValue,
     ForeignKey,
     Index,
     Integer,
@@ -19,11 +20,13 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    inspect,
+    select,
     func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, attributes, mapped_column
 
 from .base import Base, SoftDeleteMixin, TimestampMixin, UuidPrimaryKeyMixin
 
@@ -257,7 +260,8 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "products"
     name: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     name_en: Mapped[str | None] = mapped_column(String(500), index=True)
-    sku: Mapped[str | None] = mapped_column(String(160), unique=True, index=True)
+    sku: Mapped[str | None] = mapped_column(String(160), unique=True, index=True, server_default=FetchedValue())
+    previous_auto_sku: Mapped[str | None] = mapped_column(String(160))
     short_code: Mapped[str | None] = mapped_column(String(6), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text)
     rich_description: Mapped[str | None] = mapped_column(Text)
@@ -294,6 +298,7 @@ class Product(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
         CheckConstraint("price >= 0", name="ck_products_price_nonnegative"),
         CheckConstraint("stock_quantity >= 0", name="ck_products_stock_nonnegative"),
         Index("ix_products_catalog", "is_active", "approval_status", "category_id"),
+        Index("uq_products_previous_auto_sku", "previous_auto_sku", unique=True, postgresql_where=text("previous_auto_sku <> ''")),
     )
 
 
@@ -325,7 +330,8 @@ class ProductVariant(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin)
     product_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), index=True
     )
-    sku: Mapped[str | None] = mapped_column(String(160), unique=True, index=True)
+    sku: Mapped[str | None] = mapped_column(String(160), unique=True, index=True, server_default=FetchedValue())
+    previous_auto_sku: Mapped[str | None] = mapped_column(String(160))
     size: Mapped[str | None] = mapped_column(String(80))
     color: Mapped[str | None] = mapped_column(String(120))
     color_hex: Mapped[str | None] = mapped_column(String(16))
@@ -337,7 +343,25 @@ class ProductVariant(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin)
     is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", index=True)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0")
     extra_data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
-    __table_args__ = (CheckConstraint("stock_quantity >= 0", name="ck_variants_stock_nonnegative"),)
+    __table_args__ = (
+        CheckConstraint("stock_quantity >= 0", name="ck_variants_stock_nonnegative"),
+        Index("uq_product_variants_previous_auto_sku", "previous_auto_sku", unique=True, postgresql_where=text("previous_auto_sku <> ''")),
+    )
+
+
+@event.listens_for(Product, "after_insert")
+@event.listens_for(Product, "after_update")
+@event.listens_for(ProductVariant, "after_insert")
+@event.listens_for(ProductVariant, "after_update")
+def _read_assigned_sku(mapper, connection, target):
+    # RETURNING covers omitted SKUs. An explicit value can also be rewritten by the trigger.
+    if inspect(target).attrs.sku.history.has_changes():
+        table = target.__table__
+        sku, previous = connection.execute(
+            select(table.c.sku, table.c.previous_auto_sku).where(table.c.id == target.id)
+        ).one()
+        attributes.set_committed_value(target, "sku", sku)
+        attributes.set_committed_value(target, "previous_auto_sku", previous)
 
 
 class FileAsset(Base, UuidPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):

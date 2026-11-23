@@ -1448,7 +1448,10 @@ class ResourceRepository:
                 if resolved_field not in data:
                     raise HTTPException(status_code=422, detail=f"missing_on_conflict_value:{self.table}:{field}")
                 value = data[resolved_field]
-                clauses.append(table.c[resolved_field].is_(None) if value is None else table.c[resolved_field] == value)
+                if resolved_field == "sku" and value and self.table in {"products", "product_variants"}:
+                    clauses.append(or_(table.c.sku == value, table.c.previous_auto_sku == value))
+                else:
+                    clauses.append(table.c[resolved_field].is_(None) if value is None else table.c[resolved_field] == value)
             statement = select(self.model).where(and_(*clauses)).limit(1)
             result = await self.session.execute(statement)
             record = result.scalars().first()

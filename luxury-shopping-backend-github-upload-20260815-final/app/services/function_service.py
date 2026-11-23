@@ -1950,6 +1950,7 @@ async def _chat_site_context(
                     Product.description.ilike(pattern),
                     Product.promotional_title.ilike(pattern),
                     Product.sku.ilike(pattern),
+                    Product.previous_auto_sku.ilike(pattern),
                 ]
             )
             category_filters.extend(

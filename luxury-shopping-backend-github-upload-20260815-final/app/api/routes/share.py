@@ -76,7 +76,7 @@ async def _share_product_payload(identifier: str, session: AsyncSession) -> dict
         compact_uuid = decode_compact_uuid(identifier)
         if compact_uuid is not None:
             lookup_clauses.append(Product.id == compact_uuid)
-    lookup_clauses.extend((Product.short_code == identifier, Product.sku == identifier))
+    lookup_clauses.extend((Product.short_code == identifier, Product.sku == identifier, Product.previous_auto_sku == identifier))
     product = (
         await session.execute(
             select(Product)

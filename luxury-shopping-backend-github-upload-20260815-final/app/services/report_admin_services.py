@@ -445,10 +445,19 @@ class RevenueRecognitionService:
         result = await session.execute(
             select(model).where(model.deleted_at.is_(None), model.is_active.is_(True))
         )
-        currencies = [serialize_record(row) for row in result.scalars()]
+        rates, selected = RevenueRecognitionService.reporting_currency([serialize_record(row) for row in result.scalars()])
+        return rates, selected["code"]
+
+    @staticmethod
+    def reporting_currency(currencies: list[dict[str, Any]]) -> tuple[dict[str, Decimal], dict[str, Any]]:
         default = next((row for row in currencies if row.get("is_default") is True), None)
         if default is None:
-            raise HTTPException(status_code=503, detail="admin_default_currency_not_configured")
+            # YER is the ledger's base currency. Its identity rate does not
+            # supply an exchange rate for an unconfigured foreign currency.
+            default = next((row for row in currencies if str(row.get("code")).upper() == "YER"), None)
+            if default is None:
+                default = {"code": "YER", "symbol": "ر.ي", "exchange_rate": 1}
+                currencies = [*currencies, default]
         target = str(default.get("code") or "").strip().upper()
         rates: dict[str, Decimal] = {}
         for row in currencies:
@@ -461,7 +470,7 @@ class RevenueRecognitionService:
                 rates[code] = rate
         if target not in rates:
             raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{target}")
-        return rates, target
+        return rates, {**default, "code": target}
 
     @staticmethod
     def converted_amount(
@@ -937,6 +946,7 @@ class ReportGenerationService:
         "sales": ("orders", ("order_id", "order_number", "status", "payment_status", "gross", "paid", "refunds", "net")),
         "revenue": ("revenue", ("metric", "value")),
         "summary": ("revenue", ("metric", "value")),
+        "refunds": ("refunds", ("id", "order_number", "reason", "status", "amount", "currency_code", "created_at")),
         "customers": ("customers", ("customer_id", "name", "email", "classification", "created_at", "orders", "total_spent")),
         "merchant_revenue": ("merchant_revenue", ("order_id", "order_number", "merchant_gross", "refunds", "net")),
     }
@@ -1069,10 +1079,46 @@ class ReportGenerationService:
         )
         return result.scalar_one_or_none()
 
+    async def refund_rows(
+        self, *, order_id: uuid.UUID | None = None, user_id: uuid.UUID | None = None,
+        statuses: tuple[str, ...] = (), start: Any = None, end: Any = None,
+    ) -> list[dict[str, Any]]:
+        model = MODEL_BY_TABLE["refunds"]
+        query = (select(model, Order.order_number, Order.currency_code)
+                 .outerjoin(Order, model.order_id == Order.id).where(model.deleted_at.is_(None)))
+        if order_id is not None:
+            query = query.where(model.order_id == order_id)
+        if user_id is not None:
+            query = query.where(model.user_id == user_id)
+        if statuses:
+            query = query.where(model.status.in_(statuses))
+        since, until = _date_range(start, end)
+        if since is not None:
+            query = query.where(model.created_at >= since)
+        if until is not None:
+            query = query.where(model.created_at <= until)
+        result = await self.session.execute(query.order_by(model.created_at.desc(), model.id))
+        rows = []
+        for refund, order_number, currency in result:
+            record = serialize_record(refund)
+            fields = ("id", "order_id", "user_id", "international_order_id", "local_request_id",
+                      "status", "notes", "refund_method", "voucher_number", "created_at", "updated_at")
+            rows.append({
+                **{key: record.get(key) for key in fields},
+                "reason": record.get("reason") or "",
+                "order_number": order_number,
+                "amount": format(money(refund.amount), "f"),
+                "currency_code": record.get("currency_code") or currency or "YER",
+            })
+        return rows
+
     async def _query_rows(self, report_type: str, body: dict[str, Any]) -> tuple[list[dict[str, Any]], tuple[str, ...], dict[str, Any]]:
         start = body.get("dateFrom") or body.get("date_from") or body.get("start")
         end = body.get("dateTo") or body.get("date_to") or body.get("end")
         partner_id = _parse_uuid(body.get("partnerId") or body.get("partner_id"), "partner_id") if body.get("partnerId") or body.get("partner_id") else None
+        if report_type == "refunds":
+            rows = await self.refund_rows(start=start, end=end)
+            return rows, self.DEFINITIONS[report_type][1], {"refund_count": len(rows)}
         if report_type in {"orders", "sales"}:
             orders = await RevenueRecognitionService.eligible_orders(self.session, start=start, end=end)
             recognized = await RevenueRecognitionService.order_rows(self.session, start=start, end=end)
@@ -1213,6 +1259,7 @@ class ReportGenerationService:
         generated_label = generated_at.strftime("%Y/%m/%d - %H:%M UTC")
         report_reference = generated_at.strftime("RPT-%Y%m%d-%H%M%S")
         report_titles = {
+            "refunds": ("تقرير الاستردادات", "طلبات الاسترداد ومبالغها وحالاتها"),
             "summary": ("الملخص المالي", "ملخص مؤشرات الإيرادات والمدفوعات"),
             "sales": ("تقرير المبيعات", "تفاصيل الطلبات والإيرادات"),
             "orders": ("تقرير الطلبات", "حالات الطلبات والتحصيل المالي"),
@@ -1544,6 +1591,17 @@ class ReportGenerationService:
             if key == "partner_scope":
                 return "كافة الشركاء" if not value else _safe_csv_cell(value)
             if key in {"status", "payment_status", "classification"}:
+                if report_type == "refunds" and key == "status":
+                    refund_statuses = {
+                        "pending": "قيد المراجعة", "requires_manual_action": "قيد المراجعة",
+                        "approved": "تمت الموافقة", "manual_processing": "تمت الموافقة",
+                        "provider_processing": "قيد المعالجة", "failed": "تعذر الاسترداد",
+                        "processed": "تم الاسترداد", "manual_completed": "تم الاسترداد",
+                        "completed": "تم الاسترداد", "succeeded": "تم الاسترداد",
+                        "provider_succeeded": "تم الاسترداد",
+                    }
+                    if value in refund_statuses:
+                        return refund_statuses[value]
                 labels = {
                     "accepted": "مقبول",
                     "cancelled": "ملغى",
@@ -1568,6 +1626,10 @@ class ReportGenerationService:
             "order_count": "عدد الطلبات",
             "eligible_order_count": "عدد الطلبات المؤهلة",
             "gross_revenue": "إجمالي الإيرادات",
+            "refund_count": "عدد طلبات الاسترداد",
+            "id": "المعرّف",
+            "amount": "المبلغ",
+            "reason": "السبب",
             "paid_amount": "إجمالي المبالغ المدفوعة",
             "refund_amount": "إجمالي المبالغ المستردة",
             "net_revenue": "صافي الإيرادات",

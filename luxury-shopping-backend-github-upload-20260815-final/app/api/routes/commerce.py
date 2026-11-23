@@ -1280,6 +1280,7 @@ async def _apply_public_product_filters(
                 Product.name_en.ilike(term),
                 Product.description.ilike(term),
                 Product.sku.ilike(term),
+                Product.previous_auto_sku.ilike(term),
                 Product.short_code.ilike(term),
                 Product.category_id.in_(matching_category_ids),
                 Product.brand_id.in_(matching_brand_ids),
@@ -1873,7 +1874,7 @@ async def _product_detail_uncached(identifier: str, session: AsyncSession) -> di
         if compact_uuid is not None:
             lookup_clauses.append(Product.id == compact_uuid)
     lookup_clauses.append(Product.short_code == identifier)
-    lookup_clauses.append(Product.sku == identifier)
+    lookup_clauses.extend((Product.sku == identifier, Product.previous_auto_sku == identifier))
     product = (
         await session.execute(
             select(Product).where(or_(*lookup_clauses), *public_product_clauses(Product)).limit(1)
@@ -2560,6 +2561,7 @@ async def _visible_orders(
     scope: str | None,
     limit: int,
     partner_id: uuid.UUID | None = None,
+    before: Order | None = None,
 ):
     statement = select(Order).where(Order.deleted_at.is_(None))
     if scope == "admin":
@@ -2571,7 +2573,12 @@ async def _visible_orders(
         statement = statement.where(Order.id.in_(order_ids))
     else:
         statement = statement.where(Order.user_id == user.id)
-    result = await session.execute(statement.order_by(Order.created_at.desc()).limit(limit))
+    if before is not None:
+        statement = statement.where(or_(
+            Order.created_at < before.created_at,
+            and_(Order.created_at == before.created_at, Order.id < before.id),
+        ))
+    result = await session.execute(statement.order_by(Order.created_at.desc(), Order.id.desc()).limit(limit))
     return list(result.scalars())
 
 
@@ -2882,6 +2889,8 @@ async def orders(
     limit: int = Query(50, ge=1, le=1000),
     scope: str | None = None,
     partnerId: str | None = None,
+    paged: bool = False,
+    beforeOrder: uuid.UUID | None = None,
     user: User = Depends(current_user),
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
@@ -2892,6 +2901,15 @@ async def orders(
         rows = await merchant_order_list(session, partner_id=user.id, limit=limit)
         return {"data": rows} if request.url.path.startswith("/api/") else rows
     partner_uuid = _uuid(partnerId, "partnerId") if partnerId else None
+    if paged and scope == "admin" and request.url.path.startswith("/api/"):
+        before = await session.get(Order, beforeOrder) if beforeOrder else None
+        if beforeOrder and before is None:
+            raise HTTPException(status_code=422, detail="invalid_order_cursor")
+        page = await _visible_orders(session, user, roles, scope, limit + 1, partner_id=partner_uuid, before=before)
+        return {
+            "data": await _serialize_orders_with_financials(session, page[:limit]),
+            "next_cursor": str(page[limit - 1].id) if len(page) > limit else None,
+        }
     rows = await _serialize_orders_with_financials(session, await _visible_orders(session, user, roles, scope, limit, partner_id=partner_uuid))
     return {"data": rows} if request.url.path.startswith("/api/") else rows
 

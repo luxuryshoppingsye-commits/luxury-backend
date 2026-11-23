@@ -318,7 +318,10 @@ async def effective_permissions(session: AsyncSession, user_id: UUID, roles: set
     if "admin" in roles:
         return set(ALL_PERMISSIONS)
     explicit = await explicit_permissions_for(session, user_id)
-    return set(explicit) if explicit is not None else default_permissions_for_roles(roles)
+    permissions = set(explicit) if explicit is not None else default_permissions_for_roles(roles)
+    if roles.intersection({"employee", "staff"}) and {"tickets.view", "tickets.update"} <= permissions:
+        permissions.add("orders.view")
+    return permissions
 
 
 async def require_staff_permission(

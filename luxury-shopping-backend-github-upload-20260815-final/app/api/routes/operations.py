@@ -3766,7 +3766,7 @@ async def api_catalog_products(
     if q:
         search = f"%{q.strip()}%"
         search_clauses = []
-        for column_name in ("name", "name_en", "description", "sku", "short_code"):
+        for column_name in ("name", "name_en", "description", "sku", "previous_auto_sku", "short_code"):
             if column_name in columns:
                 search_clauses.append(columns[column_name].ilike(search))
         if search_clauses:
@@ -3916,7 +3916,7 @@ async def api_catalog_product(identifier: str, session: AsyncSession = Depends(g
     if "slug" in model.__table__.c:
         clauses.append(model.slug == identifier)
     if "sku" in model.__table__.c:
-        clauses.append(model.sku == identifier)
+        clauses.extend((model.sku == identifier, model.previous_auto_sku == identifier))
     if not clauses:
         raise HTTPException(status_code=404, detail="product_not_found")
     row = (
@@ -4069,25 +4069,12 @@ _DASHBOARD_MONTHLY_TARGET_KEY = "admin_dashboard_monthly_target"
 
 async def _admin_currency_context(session: AsyncSession) -> tuple[dict[str, Decimal], dict[str, Any]]:
     currency_rows = [serialize_record(row) for row in await _rows(session, "currencies", limit=500)]
-    active = {
-        str(row.get("code") or "").upper(): row
+    active = [
+        row
         for row in currency_rows
         if row.get("is_active") is True and row.get("deleted_at") is None
-    }
-    selected = next((row for row in active.values() if row.get("is_default") is True), None)
-    if selected is None:
-        raise HTTPException(status_code=503, detail="admin_default_currency_not_configured")
-    rates: dict[str, Decimal] = {}
-    for code, row in active.items():
-        try:
-            rate = Decimal(str(row.get("exchange_rate")))
-        except (ValueError, TypeError, ArithmeticError):
-            continue
-        if rate.is_finite() and rate > 0:
-            rates[code] = rate
-    if str(selected["code"]).upper() not in rates:
-        raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{selected['code']}")
-    return rates, selected
+    ]
+    return RevenueRecognitionService.reporting_currency(active)
 
 
 def _admin_convert_amount(amount: Any, currency: Any, rates: dict[str, Decimal], target_code: str) -> Decimal:
@@ -6117,6 +6104,18 @@ async def api_admin_list_brands(staff: User = Depends(require_staff), session: A
         row["logoUrl"] = logo_url
         data.append(row)
     return {"data": data}
+
+
+@router.post("/api/catalog/admin/variant-skus")
+async def api_admin_allocate_variant_skus(
+    count: int = Query(1, ge=1, le=500),
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    await require_staff_permission(session, staff.id, roles, "products.create")
+    codes = await session.scalars(text("SELECT next_product_variants_sku() FROM generate_series(1, :count)"), {"count": count})
+    return {"data": codes.all()}
 
 
 @router.get("/api/catalog/admin/products")
@@ -9808,6 +9807,22 @@ async def api_pay_marketer_commission(request: Request, staff: User = Depends(re
     return {"data": rows, "count": len(commissions)}
 
 
+@router.get("/api/operations/refunds")
+async def api_list_refunds(
+    orderId: uuid.UUID | None = None,
+    userId: uuid.UUID | None = None,
+    status: str | None = None,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    require_finance_actor(roles)
+    aliases = {"pending": ("pending", "requires_manual_action"), "approved": ("approved", "manual_processing")}
+    statuses = aliases.get(status, (status,)) if status else ()
+    rows = await ReportGenerationService(session).refund_rows(order_id=orderId, user_id=userId, statuses=statuses)
+    return {"data": rows}
+
+
 @router.post("/api/operations/refunds", status_code=201)
 async def api_create_refund(
     request: Request,
@@ -10847,7 +10862,7 @@ async def api_import_products(request: Request, staff: User = Depends(require_st
             name = str(values["name"]).strip()
             duplicate_clauses = [func.lower(product_model.name) == name.lower()]
             if values.get("sku"):
-                duplicate_clauses.append(product_model.sku == values["sku"])
+                duplicate_clauses.extend((product_model.sku == values["sku"], product_model.previous_auto_sku == values["sku"]))
             existing = await _rows(
                 session,
                 "products",
