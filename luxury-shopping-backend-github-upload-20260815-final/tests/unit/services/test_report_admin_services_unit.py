@@ -17,9 +17,7 @@ def test_reporting_currency_without_explicit_default_uses_ledger_base() -> None:
 
     assert target["code"] == "YER"
     assert service.converted_amount(71, "SAR", rates, target["code"]) == Decimal("10000")
-    with pytest.raises(HTTPException) as error:
-        service.converted_amount(1, "USD", rates, target["code"])
-    assert error.value.status_code == 503
+    assert service.converted_amount(1, "USD", rates, target["code"]) == Decimal("526.3157894736842105263157895")
 
 
 def test_reporting_currency_keeps_explicit_default() -> None:

@@ -482,6 +482,8 @@ def policy_for_route(method: str, path: str) -> ApiProtectionPolicy:
         return _policy("public_write", auth=False, rate="customer_write", public=True, audit=False, maximum_request_bytes=1024)
     if method == "POST" and normalized == "/api/partnership/apply":
         return _policy("public_write", auth=False, rate="support_write", public=True, sensitive=True, audit=True)
+    if method == "POST" and normalized == "/api/communication/client-errors":
+        return _policy("public_write", auth=False, rate="support_write", public=True, audit=False, maximum_request_bytes=32768)
     if method == "POST" and normalized == "/api/communication/contact":
         return _policy("public_write", auth=False, rate="support_write", public=True, sensitive=True, audit=True)
     if method == "POST" and normalized == "/api/loyalty/initialize":

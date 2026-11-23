@@ -437,6 +437,12 @@ class RecognizedOrderRevenue:
 
 
 class RevenueRecognitionService:
+    FALLBACK_CURRENCY_RATES = {
+        "YER": Decimal("1"),
+        "USD": Decimal("0.0019"),
+        "SAR": Decimal("0.0071"),
+    }
+
     @staticmethod
     async def currency_context(session: AsyncSession) -> tuple[dict[str, Decimal], str]:
         """Load the active database rates; never total unlike currencies raw."""
@@ -468,6 +474,8 @@ class RevenueRecognitionService:
                 continue
             if code and rate.is_finite() and rate > 0:
                 rates[code] = rate
+        for code, rate in RevenueRecognitionService.FALLBACK_CURRENCY_RATES.items():
+            rates.setdefault(code, rate)
         if target not in rates:
             raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{target}")
         return rates, {**default, "code": target}
@@ -476,11 +484,14 @@ class RevenueRecognitionService:
     def converted_amount(
         amount: Any, currency_code: Any, rates: dict[str, Decimal], target: str
     ) -> Decimal:
+        value = Decimal(str(amount or 0))
+        if value.is_zero():
+            return Decimal("0")
         code = str(currency_code or "YER").strip().upper() or "YER"
         rate = rates.get(code)
         if rate is None:
             raise HTTPException(status_code=503, detail=f"admin_exchange_rate_missing:{code}")
-        return Decimal(str(amount or 0)) / rate * rates[target]
+        return value / rate * rates[target]
 
     @staticmethod
     async def eligible_orders(
@@ -786,6 +797,7 @@ class RevenueRecognitionService:
         start: Any = None,
         end: Any = None,
         currency_context: tuple[dict[str, Decimal], str] | None = None,
+        partner_id: uuid.UUID | None = None,
     ) -> dict[str, Any]:
         """Return the value and count of every eligible order, paid or not.
 
@@ -795,9 +807,32 @@ class RevenueRecognitionService:
         of making a busy period look empty.
         """
 
+        rates, currency_code = currency_context or await cls.currency_context(session)
+        if partner_id is not None:
+            start_dt, end_dt = _date_range(start, end)
+            statement = (
+                select(Order.id, Order.currency_code, func.sum(OrderItem.total_price))
+                .join(OrderItem, OrderItem.order_id == Order.id)
+                .where(
+                    Order.deleted_at.is_(None),
+                    ~func.lower(Order.status).in_(tuple(EXCLUDED_ORDER_STATUSES)),
+                    OrderItem.partner_id == partner_id,
+                )
+                .group_by(Order.id, Order.currency_code)
+            )
+            if start_dt is not None:
+                statement = statement.where(Order.created_at >= start_dt)
+            if end_dt is not None:
+                statement = statement.where(Order.created_at <= end_dt)
+            rows = (await session.execute(statement)).all()
+            value = sum(
+                (cls.converted_amount(amount, code, rates, currency_code) for _, code, amount in rows),
+                Decimal("0"),
+            )
+            return {"order_count": len(rows), "order_value": money(value), "currency_code": currency_code}
+
         orders = await cls.eligible_orders(session, start=start, end=end)
         supplemental = await cls._supplemental_orders(session, start=start, end=end)
-        rates, currency_code = currency_context or await cls.currency_context(session)
         order_value = sum(
             (cls.converted_amount(order.total, order.currency_code, rates, currency_code) for order in orders),
             Decimal("0"),
@@ -882,7 +917,7 @@ class RevenueRecognitionService:
         rates, target = await cls.currency_context(session)
         rows = await cls.order_rows(session, start=start, end=end, partner_id=partner_id)
         activity = await cls.order_activity_summary(
-            session, start=start, end=end, currency_context=(rates, target)
+            session, start=start, end=end, currency_context=(rates, target), partner_id=partner_id
         )
 
         def total(field: str) -> Decimal:

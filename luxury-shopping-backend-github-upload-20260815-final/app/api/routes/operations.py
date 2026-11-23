@@ -13416,6 +13416,18 @@ def _validated_public_contact_message(body: Any) -> dict[str, Any]:
     }
 
 
+@router.post("/api/communication/client-errors", status_code=202)
+async def log_client_error(body: dict[str, Any]):
+    message = body.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise HTTPException(status_code=422, detail="Missing error message")
+    kind = "react_boundary" if body.get("error_type") == "react_boundary" else "runtime"
+    # Group recurring reports without writing browser URLs or customer data to logs.
+    signature = hashlib.sha256(message[:500].encode("utf-8", errors="replace")).hexdigest()[:16]
+    logger.warning("Storefront client error type=%s signature=%s", kind, signature)
+    return {"accepted": True}
+
+
 @router.post("/api/communication/contact", status_code=201)
 async def api_create_contact_message(
     request: Request,
@@ -15088,7 +15100,8 @@ async def reports_summary(
     session: AsyncSession = Depends(get_session),
 ):
     statement = select(Order).where(Order.deleted_at.is_(None))
-    if request.url.path.startswith("/partner"):
+    report_path = request.url.path.removeprefix("/api/operations").removeprefix("/api")
+    if report_path.startswith("/partner/"):
         if "partner" not in roles:
             raise HTTPException(status_code=403, detail="partner_required")
         payload = await _partner_sales_analytics(
@@ -15105,9 +15118,9 @@ async def reports_summary(
             or 0
         )
         return {**payload, "productsCount": products_count, "appPending": 0}
-    elif request.url.path.startswith("/admin") and not roles.intersection({"admin", "manager", "finance", "staff"}):
+    elif report_path.startswith("/admin/") and not roles.intersection({"admin", "manager", "finance", "staff"}):
         raise HTTPException(status_code=403, detail="staff_required")
-    elif not request.url.path.startswith("/admin"):
+    elif not report_path.startswith("/admin/"):
         statement = statement.where(Order.user_id == user.id)
     orders = list((await session.execute(statement)).scalars())
     recognized = await RevenueRecognitionService.summary(session)
