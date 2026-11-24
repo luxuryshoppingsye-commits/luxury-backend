@@ -26,22 +26,18 @@ from .catalog_policy import _public_upload_url, public_product_clauses
 
 
 _IMAGE_SIGNATURE_CACHE_MAX = 2048
-_IMAGE_SIGNATURE_CACHE: dict[
-    str,
-    tuple[
-        tuple[tuple[bool, ...], ...],
-        tuple[tuple[bool, ...], ...],
-        tuple[tuple[float, ...], ...],
-    ],
-] = {}
+_VisualSignature = tuple[tuple[int, ...], tuple[int, ...], tuple[tuple[float, ...], ...]]
+_IMAGE_SIGNATURE_CACHE: dict[str, _VisualSignature] = {}
 _IMAGE_SIGNATURE_FAILURE_CACHE: dict[str, float] = {}
 _IMAGE_SIGNATURE_FAILURE_TTL_SECONDS = 60.0
 _CATALOG_HTTP_CLIENT: contextvars.ContextVar[httpx.AsyncClient | None] = contextvars.ContextVar(
     "catalog_http_client",
     default=None,
 )
-_VISUAL_MATCH_THRESHOLD = 0.68
-_VISUAL_EXPAND_THRESHOLD = 0.78
+_IMAGE_SEARCH_SLOTS = asyncio.Semaphore(2)
+_IMAGE_DOWNLOAD_SLOTS = asyncio.Semaphore(4)
+_VISUAL_MATCH_THRESHOLD = 0.86
+_VISUAL_EXPAND_THRESHOLD = 0.93
 
 
 def _normalized_image_data(raw: bytes, *, error_code: str) -> str:
@@ -51,8 +47,9 @@ def _normalized_image_data(raw: bytes, *, error_code: str) -> str:
         with Image.open(io.BytesIO(raw)) as original:
             if original.width * original.height > 25_000_000:
                 raise ValueError("image_dimensions")
+            original.draft("RGB", (1280, 1280))
+            original.thumbnail((1280, 1280))
             image = ImageOps.exif_transpose(original).convert("RGB")
-            image.thumbnail((1280, 1280))
             output = io.BytesIO()
             image.save(output, "JPEG", quality=85)
         return base64.b64encode(output.getvalue()).decode("ascii")
@@ -136,7 +133,7 @@ async def _image_data_from_public_url(
                     if size > 6 * 1024 * 1024:
                         raise ValueError("product_image_size")
                     chunks.append(chunk)
-                return _normalized_image_data(b"".join(chunks), error_code="invalid_product_image")
+                return await asyncio.to_thread(_normalized_image_data, b"".join(chunks), error_code="invalid_product_image")
         raise HTTPException(422, "product_image_redirect_limit")
 
     try:
@@ -444,12 +441,8 @@ def _match(value: str, terms: list[str]) -> int:
 
 
 def _visual_signature(
-    encoded: str,
-) -> tuple[
-    tuple[tuple[bool, ...], ...],
-    tuple[tuple[bool, ...], ...],
-    tuple[tuple[float, ...], ...],
-]:
+    encoded: str, *, query_views: bool = False,
+) -> _VisualSignature:
     """Build a text-independent visual fingerprint from an image."""
     try:
         raw = base64.b64decode(encoded, validate=True)
@@ -459,6 +452,15 @@ def _visual_signature(
                 ImageOps.fit(image, (32, 32), method=Image.Resampling.LANCZOS),
                 ImageOps.pad(image, (32, 32), method=Image.Resampling.LANCZOS, color=(245, 245, 245)),
             )
+            if query_views and image.height >= 1.7 * image.width:
+                # Portrait screenshots can include navigation and product details.
+                # Compare the photo region as well as the complete upload.
+                margin = round(image.width * 0.07)
+                side = image.width - 2 * margin
+                for fraction in (0.10, 0.15, 0.20, 0.25, 0.30):
+                    top = round(image.height * fraction)
+                    crop = image.crop((margin, top, margin + side, top + side))
+                    views += (crop.resize((32, 32), Image.Resampling.LANCZOS),)
             average_hashes = []
             difference_hashes = []
             color_histograms = []
@@ -466,14 +468,14 @@ def _visual_signature(
                 grayscale = fitted.convert("L")
                 pixels = list(grayscale.resize((16, 16), Image.Resampling.LANCZOS).get_flattened_data())
                 average = sum(pixels) / len(pixels)
-                average_hashes.append(tuple(value >= average for value in pixels))
+                average_hashes.append(int.from_bytes(bytes(value >= average for value in pixels), "big"))
 
                 gradient_pixels = list(grayscale.resize((17, 16), Image.Resampling.LANCZOS).get_flattened_data())
-                difference_hashes.append(tuple(
+                difference_hashes.append(int.from_bytes(bytes(
                     gradient_pixels[index] < gradient_pixels[index + 1]
                     for row in range(16)
                     for index in range(row * 17, row * 17 + 16)
-                ))
+                ), "big"))
 
                 histogram = [0] * 24
                 for red, green, blue in fitted.resize((32, 32), Image.Resampling.BOX).get_flattened_data():
@@ -486,35 +488,13 @@ def _visual_signature(
     return tuple(average_hashes), tuple(difference_hashes), tuple(color_histograms)
 
 
-def _hamming_similarity(left: tuple[bool, ...], right: tuple[bool, ...]) -> float:
-    if len(left) != len(right) or not left:
-        return 0.0
-    return 1.0 - (sum(a != b for a, b in zip(left, right)) / len(left))
-
-
-def _visual_similarity(
-    query: tuple[
-        tuple[tuple[bool, ...], ...],
-        tuple[tuple[bool, ...], ...],
-        tuple[tuple[float, ...], ...],
-    ],
-    candidate: tuple[
-        tuple[tuple[bool, ...], ...],
-        tuple[tuple[bool, ...], ...],
-        tuple[tuple[float, ...], ...],
-    ],
-) -> float:
-    """Return a perceptual similarity score without reading product text."""
-    def views(signature):
-        if signature[0] and isinstance(signature[0][0], bool):
-            return [signature]
-        return list(zip(*signature))
-
+def _visual_similarity(query: _VisualSignature, candidate: _VisualSignature) -> float:
+    """Each fingerprint encodes 256 binary comparisons. XOR counts differing bits."""
     best_score = 0.0
-    for query_view in views(query):
-        for candidate_view in views(candidate):
-            average_score = _hamming_similarity(query_view[0], candidate_view[0])
-            difference_score = _hamming_similarity(query_view[1], candidate_view[1])
+    for query_view in zip(*query):
+        for candidate_view in zip(*candidate):
+            average_score = 1.0 - (query_view[0] ^ candidate_view[0]).bit_count() / 256
+            difference_score = 1.0 - (query_view[1] ^ candidate_view[1]).bit_count() / 256
             histogram_distance = sum(abs(a - b) for a, b in zip(query_view[2], candidate_view[2]))
             color_score = max(0.0, 1.0 - histogram_distance / 6.0)
             best_score = max(
@@ -566,7 +546,10 @@ async def _product_image_encoded(
     local_path = _local_product_image_path(value)
     if local_path is not None and local_path.is_file():
         try:
-            return _normalized_image_data(local_path.read_bytes(), error_code="invalid_product_image")
+            if local_path.stat().st_size > 6 * 1024 * 1024:
+                return None
+            raw = await asyncio.to_thread(local_path.read_bytes)
+            return await asyncio.to_thread(_normalized_image_data, raw, error_code="invalid_product_image")
         except OSError:
             return None
 
@@ -630,7 +613,7 @@ async def _cached_product_image_signature(value: str):
         _IMAGE_SIGNATURE_FAILURE_CACHE[value] = time.monotonic()
         return None
     try:
-        signature = _visual_signature(encoded)
+        signature = await asyncio.to_thread(_visual_signature, encoded)
     except HTTPException:
         if len(_IMAGE_SIGNATURE_FAILURE_CACHE) >= _IMAGE_SIGNATURE_CACHE_MAX:
             _IMAGE_SIGNATURE_FAILURE_CACHE.pop(next(iter(_IMAGE_SIGNATURE_FAILURE_CACHE)))
@@ -649,14 +632,18 @@ async def _rank_by_visual_similarity(
     *,
     max_refs: int = 1,
 ) -> list[tuple[float, Product]]:
-    query_signature = _visual_signature(encoded)
+    query_signature = await asyncio.to_thread(_visual_signature, encoded, query_views=True)
     semaphore = asyncio.Semaphore(24)
     signature_tasks: dict[str, asyncio.Task] = {}
+
+    async def limited_signature(ref: str):
+        async with _IMAGE_DOWNLOAD_SLOTS:
+            return await _cached_product_image_signature(ref)
 
     async def cached_signature(ref: str):
         task = signature_tasks.get(ref)
         if task is None:
-            task = asyncio.create_task(_cached_product_image_signature(ref))
+            task = asyncio.create_task(limited_signature(ref))
             signature_tasks[ref] = task
         return await task
 
@@ -729,7 +716,8 @@ async def _search_catalog_encoded(encoded: str, session) -> dict:
             not visual_ranked or expanded_ranked[0][0] > visual_ranked[0][0]
         ):
             visual_ranked = expanded_ranked
-    products = [serialize_record(product) for _, product in visual_ranked[:24]]
+    products = [serialize_record(product) for score, product in visual_ranked[:24]
+                if score >= visual_ranked[0][0] - 0.035]
     source = "visual_image_similarity" if products else "image_analysis"
 
     # Keep the existing vision/text analysis as a compatibility fallback only
@@ -773,10 +761,17 @@ async def _search_catalog_encoded(encoded: str, session) -> dict:
 
 async def search_catalog_image(body: dict, session) -> dict:
     """Search the catalogue with a browser-uploaded base64 image."""
-    return await _search_catalog_encoded(_image_data(body), session)
+    if _IMAGE_SEARCH_SLOTS.locked():
+        raise HTTPException(429, "image_search_busy", headers={"Retry-After": "3"})
+    async with _IMAGE_SEARCH_SLOTS:
+        encoded = await asyncio.to_thread(_image_data, body)
+        return await _search_catalog_encoded(encoded, session)
 
 
 async def search_catalog_image_url(image_url: str, session) -> dict:
     """Search the catalogue with an already-uploaded public product image."""
-    encoded = await _image_data_from_public_url(image_url)
-    return await _search_catalog_encoded(encoded, session)
+    if _IMAGE_SEARCH_SLOTS.locked():
+        raise HTTPException(429, "image_search_busy", headers={"Retry-After": "3"})
+    async with _IMAGE_SEARCH_SLOTS:
+        encoded = await _image_data_from_public_url(image_url)
+        return await _search_catalog_encoded(encoded, session)

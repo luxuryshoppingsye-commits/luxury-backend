@@ -38,6 +38,7 @@ from ...models.domain import (
     Wishlist,
 )
 from ...repositories.resources import serialize_record
+from ...services.merchant_pricing import contract_share, latest_partner_contract, retail_price
 from ...services.catalog_policy import (
     apply_merchant_product_server_defaults,
     assert_merchant_product_payload_allowed,
@@ -4674,6 +4675,7 @@ def _require_product_owner(product: Product, user: User, roles: set[str]) -> Non
 async def manage_products(
     limit: int = Query(1000, ge=1, le=2000),
     partnerOnly: bool = False,
+    netPrices: bool = False,
     user: User = Depends(current_user),
     roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
@@ -4685,7 +4687,11 @@ async def manage_products(
         statement = statement.where(Product.partner_id == user.id)
     result = await session.execute(statement.order_by(Product.updated_at.desc()).limit(limit))
     products = list(result.scalars())
-    return await _serialize_manage_products(session, products)
+    rows = await _serialize_manage_products(session, products)
+    if netPrices and "partner" in roles and not roles.intersection({"admin", "manager"}):
+        share = contract_share(await latest_partner_contract(session, user.id))
+        return [_merchant_edit_prices(row, product, share) for row, product in zip(rows, products)]
+    return rows
 
 
 def _partner_draft_payload(body: Any) -> dict[str, Any]:
@@ -4900,6 +4906,45 @@ async def catalog_admin_products(
     return {"data": rows}
 
 
+async def _merchant_priced_values(session, partner_id, values: dict[str, Any], *, net_input: bool, existing=None, currency="YER") -> dict[str, Any]:
+    """Persist retail prices and retain the merchant input for later edits."""
+    extra = dict(getattr(existing, "extra_data", None) or {})
+    pricing = dict(extra.get("merchant_pricing") or {})
+    if not net_input:
+        for key in ("price", "original_price"):
+            if key in pricing and key in values and values[key] != getattr(existing, key, None):
+                pricing.pop(key)
+                values["extra_data"] = {**extra, "merchant_pricing": pricing}
+        return values
+    if not any(key in values for key in ("price", "original_price")):
+        return values
+    share = contract_share(await latest_partner_contract(session, partner_id, for_update=True))
+    for key in ("price", "original_price"):
+        if key not in values:
+            continue
+        amount = values[key]
+        retail = getattr(existing, key, None)
+        if key not in pricing and existing is not None and retail is not None and money(retail * share / 100) == amount:
+            values[key] = retail
+            continue
+        pricing[key] = None if amount is None else str(amount)
+        if amount is not None:
+            values[key] = retail_price(amount, share, currency or "YER")
+    if pricing:
+        values["extra_data"] = {**extra, "merchant_pricing": pricing}
+    return values
+
+
+def _merchant_edit_prices(row: dict[str, Any], record, share: Decimal | None = None) -> dict[str, Any]:
+    pricing = (getattr(record, "extra_data", None) or {}).get("merchant_pricing", {})
+    for key in ("price", "original_price"):
+        if key in pricing:
+            row[key] = pricing[key]
+        elif share is not None and getattr(record, key, None) is not None:
+            row[key] = str(money(getattr(record, key) * share / 100))
+    return row
+
+
 def _product_values(body: dict[str, Any], user: User, roles: set[str], *, partial: bool) -> dict[str, Any]:
     mapping = {
         "name": "name", "nameEn": "name_en", "sku": "sku", "description": "description",
@@ -4951,6 +4996,8 @@ async def create_product(request: Request, user: User = Depends(current_user), r
         raise HTTPException(status_code=403, detail="insufficient_permissions")
     body = await request.json()
     values = _product_values(body, user, roles, partial=False)
+    if "partner" in roles and not roles.intersection({"admin", "manager"}):
+        values = await _merchant_priced_values(session, user.id, values, net_input=request.query_params.get("netPrices") == "true", currency=values.get("currency_code"))
     values.setdefault("is_active", True)
     if "name" not in values:
         raise HTTPException(status_code=422, detail={"code": "product_name_required", "message": "Product name is required"})
@@ -4986,7 +5033,8 @@ async def create_product(request: Request, user: User = Depends(current_user), r
             )
         )
     await session.commit()
-    return serialize_record(product)
+    row = serialize_record(product)
+    return _merchant_edit_prices(row, product) if request.query_params.get("netPrices") == "true" and "partner" in roles and not roles.intersection({"admin", "manager"}) else row
 
 
 @router.post("/api/partner/products", status_code=201)
@@ -5095,13 +5143,16 @@ async def update_product(product_id: uuid.UUID, request: Request, user: User = D
     values = _product_values(body, user, roles, partial=True)
     if "partner" in roles and not roles.intersection({"admin", "manager"}):
         values = apply_merchant_product_server_defaults(values, existing=product)
+    if product.partner_id:
+        values = await _merchant_priced_values(session, product.partner_id, values, net_input="partner" in roles and not roles.intersection({"admin", "manager"}) and request.query_params.get("netPrices") == "true", existing=product, currency=values.get("currency_code", product.currency_code))
     await _apply_brand_supplier_name_refs(session, body, values)
     await _validate_product_references(session, values)
     for key, value in values.items():
         setattr(product, key, value)
     _enforce_product_public_quality(product, roles)
     await session.commit()
-    return serialize_record(product)
+    row = serialize_record(product)
+    return _merchant_edit_prices(row, product) if request.query_params.get("netPrices") == "true" and "partner" in roles and not roles.intersection({"admin", "manager"}) else row
 
 
 @router.patch("/manage/products/{product_id}/featured")
@@ -5203,13 +5254,16 @@ async def delete_product(product_id: uuid.UUID, user: User = Depends(current_use
 
 
 @router.get("/manage/products/{product_id}/variants")
-async def manage_variants(product_id: uuid.UUID, user: User = Depends(current_user), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
+async def manage_variants(product_id: uuid.UUID, netPrices: bool = False, user: User = Depends(current_user), roles: set[str] = Depends(user_roles), session: AsyncSession = Depends(get_session)):
     await require_staff_permission(session, user.id, roles, "products.view")
     product = await session.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="product_not_found")
     _require_product_owner(product, user, roles)
     result = await session.execute(select(ProductVariant).where(ProductVariant.product_id == product_id, ProductVariant.deleted_at.is_(None)))
+    if netPrices and "partner" in roles and not roles.intersection({"admin", "manager"}):
+        share = contract_share(await latest_partner_contract(session, product.partner_id))
+        return [_merchant_edit_prices(serialize_record(row), row, share) for row in result.scalars()]
     return [serialize_record(row) for row in result.scalars()]
 
 
@@ -5245,13 +5299,16 @@ async def upsert_variant(product_id: uuid.UUID, request: Request, response: Resp
     mapping = {"color": "color", "colorHex": "color_hex", "size": "size", "price": "price", "originalPrice": "original_price", "stockQuantity": "stock_quantity", "sku": "sku", "images": "images", "isActive": "is_active", "sortOrder": "sort_order"}
     raw_values = {target: body[source] for source, target in mapping.items() if source in body}
     values = normalize_product_mutation_values(raw_values, partial=True)
+    if product.partner_id:
+        values = await _merchant_priced_values(session, product.partner_id, values, net_input="partner" in roles and not roles.intersection({"admin", "manager"}) and request.query_params.get("netPrices") == "true", existing=variant, currency=product.currency_code)
     for target, value in values.items():
         setattr(variant, target, value)
     if product.partner_id and not roles.intersection({"admin", "manager"}):
         product.approval_status = "pending"
         product.is_active = False
     await session.commit()
-    return serialize_record(variant)
+    row = serialize_record(variant)
+    return _merchant_edit_prices(row, variant) if request.query_params.get("netPrices") == "true" and "partner" in roles and not roles.intersection({"admin", "manager"}) else row
 
 
 @router.delete("/manage/product-variants/{variant_id}")

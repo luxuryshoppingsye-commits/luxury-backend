@@ -604,6 +604,8 @@ def serialize_record(record: Any) -> dict[str, Any]:
                 if table_name == "site_settings":
                     result["setting_value"] = _json_value(value)
                 for extra_key, extra_value in value.items():
+                    if extra_key == "merchant_pricing" and table_name in {"products", "product_variants"}:
+                        continue
                     result.setdefault(extra_key, _json_value(extra_value))
             continue
         result[key] = _json_value(value)

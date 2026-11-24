@@ -26,6 +26,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from starlette.datastructures import Headers
+from ...services.merchant_pricing import contract_share, latest_partner_contract as _latest_partner_contract, partner_rate as _partner_rate, reprice_merchant_catalog
 from ...services.product_preview import product_preview_image
 
 from ...config import BACKEND_DIR, get_settings
@@ -1743,7 +1744,9 @@ async def get_partner_storefront(user: User = Depends(require_partner), session:
     # client.  Previously PUT returned {data: ...}, while GET returned the
     # record directly.  That made a successful save look lost after reload in
     # clients that correctly read response.data.
-    return {"data": _partner_storefront_payload(row, profile)}
+    data = _partner_storefront_payload(row, profile)
+    data["partner_commission_rate"] = float(contract_share(await _latest_partner_contract(session, user.id)))
+    return {"data": data}
 
 
 @router.put("/partner/storefront")
@@ -2181,24 +2184,6 @@ async def request_partner_account_deletion(
     payload = serialize_record(row)
     await session.commit()
     return {"data": payload}
-
-
-async def _latest_partner_contract(
-    session: AsyncSession,
-    partner_id: uuid.UUID,
-    *,
-    for_update: bool = False,
-):
-    model = MODEL_BY_TABLE["partner_contracts"]
-    statement = (
-        select(model)
-        .where(model.partner_id == partner_id, model.deleted_at.is_(None))
-        .order_by(model.updated_at.desc())
-        .limit(1)
-    )
-    if for_update:
-        statement = statement.with_for_update()
-    return (await session.execute(statement)).scalar_one_or_none()
 
 
 @router.get("/partner/subscription")
@@ -3742,6 +3727,7 @@ async def api_catalog_products(
     brandId: str | None = None,
     brandSlug: str | None = None,
     supplierId: str | None = None,
+    partnerId: uuid.UUID | None = None,
     mainStoreOnly: bool | None = None,
     minPrice: Decimal | None = None,
     maxPrice: Decimal | None = None,
@@ -3822,7 +3808,12 @@ async def api_catalog_products(
             brand_ids = select(brand_model.__table__.c.id).where(or_(*brand_clauses))
             clauses.append(columns["brand_id"].in_(brand_ids))
 
-    if supplierId:
+    if isinstance(partnerId, uuid.UUID):
+        owner_filter = columns["partner_id"] == partnerId
+        if supplierId == str(partnerId) and "supplier_id" in columns:
+            owner_filter = or_(owner_filter, columns["supplier_id"] == partnerId)
+        clauses.append(owner_filter)
+    elif supplierId:
         for column_name in ("supplier_id", "partner_id"):
             if column_name in columns:
                 try:
@@ -9391,18 +9382,6 @@ async def api_approve_partner_application(application_id: uuid.UUID, request: Re
     }
 
 
-def _partner_rate(value: Any, default: int = 85) -> int | float:
-    if value is None or str(value).strip() == "":
-        return default
-    try:
-        rate = float(value)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="invalid_commission_rate")
-    if not 0 <= rate <= 100:
-        raise HTTPException(status_code=422, detail="invalid_commission_rate")
-    return int(rate) if rate.is_integer() else rate
-
-
 async def _ensure_partner_account(
     session: AsyncSession,
     body: dict[str, Any],
@@ -9520,13 +9499,7 @@ async def _ensure_partner_account(
         storefront.deleted_at = None
 
     contract_model = MODEL_BY_TABLE["partner_contracts"]
-    contract_result = await session.execute(
-        select(contract_model)
-        .where(contract_model.partner_id == partner_user.id, contract_model.deleted_at.is_(None))
-        .order_by(contract_model.created_at.asc())
-        .with_for_update()
-    )
-    contract = contract_result.scalars().first()
+    contract = await _latest_partner_contract(session, partner_user.id, for_update=True)
     if contract is None:
         contract = contract_model(
             partner_id=partner_user.id,
@@ -9541,7 +9514,8 @@ async def _ensure_partner_account(
             },
         )
         session.add(contract)
-    rate = _partner_rate(body.get("commissionRate", body.get("commission_rate", body.get("rate"))))
+    old_share = contract_share(contract)
+    rate = _partner_rate(body.get("commissionRate", body.get("commission_rate", body.get("rate", old_share))))
     contract.status = "active"
     contract.is_active = True
     contract.extra_data = {
@@ -9551,6 +9525,8 @@ async def _ensure_partner_account(
         **({"notes": _jsonable(body["notes"])} if body.get("notes") not in (None, "") else {}),
     }
     await session.flush()
+    if contract_share(contract) != old_share:
+        await reprice_merchant_catalog(session, partner_user.id, contract_share(contract))
     return partner_user, profile, storefront, contract, created
 
 
@@ -9578,12 +9554,16 @@ async def api_create_partner_contract(request: Request, staff: User = Depends(re
 @router.patch("/api/partnership/partners/{partner_id}/commission")
 async def api_update_partner_commission(partner_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     model = MODEL_BY_TABLE["partner_contracts"]
-    rows = await _rows(session, "partner_contracts", clauses=(model.partner_id == partner_id,), limit=1)
-    row = rows[0] if rows else model(partner_id=partner_id, status="active", is_active=True, extra_data={})
-    if not rows:
+    row = await _latest_partner_contract(session, partner_id, for_update=True)
+    if row is None:
+        row = model(partner_id=partner_id, status="active", is_active=True, extra_data={})
         session.add(row)
+    old_share = contract_share(row)
     body = await request.json()
-    row.extra_data = {**(row.extra_data or {}), **_jsonable(body)}
+    rate = _partner_rate(body.get("commissionRate", body.get("rate", body.get("partner_commission_rate", old_share))))
+    row.extra_data = {**(row.extra_data or {}), **_jsonable(body), "rate": rate, "commissionRate": rate}
+    if contract_share(row) != old_share:
+        await reprice_merchant_catalog(session, partner_id, contract_share(row))
     await session.commit()
     return {"data": serialize_record(row)}
 
@@ -14882,10 +14862,7 @@ async def _partner_sales_analytics(
     gross_revenue = money(sum((row["total"] for row in sale_orders), Decimal("0.00")))
     orders_count = len(sale_orders)
     contract = await _latest_partner_contract(session, partner_id)
-    contract_data = contract.extra_data if contract is not None and isinstance(contract.extra_data, dict) else {}
-    partner_share_rate = Decimal(
-        str(_partner_rate(contract_data.get("commissionRate", contract_data.get("rate"))))
-    )
+    partner_share_rate = contract_share(contract)
     platform_commission_rate = Decimal("100.00") - partner_share_rate
     expected_partner_earnings = money(gross_revenue * partner_share_rate / Decimal("100.00"))
     expected_platform_commission = money(gross_revenue - expected_partner_earnings)
