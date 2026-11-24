@@ -38,7 +38,8 @@ from ...models.domain import (
     Wishlist,
 )
 from ...repositories.resources import serialize_record
-from ...services.merchant_pricing import contract_share, latest_partner_contract, retail_price, sync_order_partner_settlements
+from ...services.marketer_referrals import active_marketer_for_code
+from ...services.merchant_pricing import contract_share, latest_partner_contract, retail_price
 from ...services.catalog_policy import (
     apply_merchant_product_server_defaults,
     assert_merchant_product_payload_allowed,
@@ -66,6 +67,7 @@ from ...services.financial_calculator import (
     money,
     refunded_total,
     serialize_local_shopping_requests,
+    sync_order_sales_payables,
     unit_price,
 )
 from ...services.merchant_order_scope import merchant_order_count, merchant_order_detail, merchant_order_list
@@ -87,6 +89,7 @@ from ...services.audit_trail import add_audit_log
 from ...services.order_state_machine import assert_allowed_transition, assert_delivery_proof, normalize_status
 from ...services.notification_service import NotificationPayload, NotificationService
 from ...services.payment_refund_security import receipt_references
+from ...services.report_admin_services import RevenueRecognitionService
 from ...storage import FileStorage
 
 
@@ -3011,9 +3014,10 @@ async def api_admin_partner_requests(
     status: str | None = Query(None),
     limit: int = Query(200, ge=1, le=500),
     staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
-    del staff
+    await require_staff_permission(session, staff.id, roles, "partners.view")
     normalized_status = str(status or "").strip().lower()
     if normalized_status and normalized_status not in {
         "pending",
@@ -3178,8 +3182,10 @@ async def api_review_partner_request(
     record_id: uuid.UUID,
     request: Request,
     staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
     session: AsyncSession = Depends(get_session),
 ):
+    await require_staff_permission(session, staff.id, roles, "partners.update")
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="invalid_review_payload")
@@ -3515,6 +3521,7 @@ async def checkout(
             apply_membership_discount=True,
             body=body,
         )
+        marketer = await active_marketer_for_code(session, body.get("referral_code"))
         order = Order(
             user_id=user.id,
             status="pending",
@@ -3532,6 +3539,11 @@ async def checkout(
                 "financial_breakdown": financials.breakdown,
                 "coupon_id": financials.coupon_id,
                 "shipping_source": financials.shipping_source,
+                **(
+                    {"marketer_id": str(marketer.id)}
+                    if marketer is not None and marketer.user_id != user.id
+                    else {}
+                ),
                 **({
                     "idempotency_actor_id": str(user.id),
                     "idempotency_endpoint": "/orders/checkout",
@@ -3836,7 +3848,7 @@ async def api_user_international_shopping_orders(
         .order_by(model.created_at.desc())
         .limit(500)
     )
-    return {"data": [serialize_record(row) for row in result.scalars()]}
+    return {"data": await RevenueRecognitionService.international_order_financial_payloads(session, list(result.scalars()))}
 
 
 @router.get("/api/orders/international-shopping/{order_id}")
@@ -3850,7 +3862,8 @@ async def api_user_international_shopping_order_detail(
     row = await session.get(model, order_id)
     if row is None or row.deleted_at is not None or row.user_id != user.id:
         raise HTTPException(status_code=404, detail="international_order_not_found")
-    return {"data": serialize_record(row)}
+    payload = (await RevenueRecognitionService.international_order_financial_payloads(session, [row]))[0]
+    return {"data": payload}
 
 
 @router.get("/orders/{order_id}/courier-assignment")
@@ -4014,13 +4027,13 @@ async def confirm_customer_order_received(
                 extra_data={"previous_status": previous_status, "new_status": "delivered", "actor": "customer", "actor_id": str(user.id)},
             ))
             await award_loyalty_points_for_fulfilled_order(session, order)
-            await sync_order_partner_settlements(session, order)
         extra.update({
             "customer_received_at": now,
             "customer_received_by": str(user.id),
             "customer_confirmed_received": True,
         })
         order.extra_data = extra
+        await sync_order_sales_payables(session, order)
         history_model = MODEL_BY_TABLE["order_status_history"]
         session.add(history_model(
             order_id=order.id,
@@ -4454,7 +4467,7 @@ async def change_order_status(
         await restore_order_inventory(session, order)
     order.status = next_status
     await award_loyalty_points_for_fulfilled_order(session, order)
-    await sync_order_partner_settlements(session, order)
+    await sync_order_sales_payables(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
     history = history_model(id=uuid.uuid4(), order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status})
     session.add(history)
@@ -4528,7 +4541,7 @@ async def rollback_order_status(
     if not previous_status or previous_status == current_status:
         raise HTTPException(status_code=409, detail="no_rollback_available")
     order.status = previous_status
-    await sync_order_partner_settlements(session, order, reopened=True)
+    await sync_order_sales_payables(session, order, reopened=True)
     session.add(history_model(
         order_id=order.id,
         status=previous_status,

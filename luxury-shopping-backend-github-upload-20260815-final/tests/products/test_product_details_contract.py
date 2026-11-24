@@ -39,6 +39,23 @@ def test_public_product_response_exposes_variant_options() -> None:
 
     assert payload["has_variant_options"] is True
     assert payload["variants"][0]["size"] == "M"
+    assert payload["stock_quantity"] == 3
+
+
+def test_product_catalog_availability_uses_only_active_variant_stock() -> None:
+    product_id = uuid.uuid4()
+    product = Product(
+        id=product_id, name="فستان كتان", price=Decimal("10"),
+        is_active=True, approval_status="approved", track_inventory=True, stock_quantity=1,
+    )
+    sold_out = ProductVariant(product_id=product_id, size="M", is_active=True, stock_quantity=0)
+    hidden = ProductVariant(product_id=product_id, size="L", is_active=False, stock_quantity=5)
+
+    payload = public_product_response(product, variants=[sold_out, hidden])
+
+    assert payload["stock_quantity"] == 0
+    assert payload["stock_status"] == "out_of_stock"
+    assert payload["is_available_for_checkout"] is False
 
 
 def test_product_images_are_deduplicated_for_mutation_and_public_gallery() -> None:

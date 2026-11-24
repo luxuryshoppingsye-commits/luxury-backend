@@ -1565,6 +1565,7 @@ async def update_profile_address(
 ):
     body = await request.json()
     model = MODEL_BY_TABLE["customer_addresses"]
+    await session.execute(select(User).where(User.id == user.id).with_for_update())
     row = await session.get(model, address_id, with_for_update=True)
     if row is None or row.user_id != user.id or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="address_not_found")
@@ -1619,10 +1620,25 @@ async def delete_profile_address(
     session: AsyncSession = Depends(get_session),
 ):
     model = MODEL_BY_TABLE["customer_addresses"]
+    await session.execute(select(User).where(User.id == user.id).with_for_update())
     row = await session.get(model, address_id, with_for_update=True)
     if row is None or row.user_id != user.id or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="address_not_found")
     row.deleted_at = datetime.now(timezone.utc)
+    if row.is_default:
+        # Remove the old default from the partial unique index before promoting
+        # another address in the same transaction.
+        await session.flush()
+        replacement = (
+            await session.execute(
+                select(model)
+                .where(model.user_id == user.id, model.deleted_at.is_(None))
+                .order_by(model.created_at.desc(), model.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if replacement is not None:
+            replacement.is_default = True
     await session.commit()
     return {"ok": True}
 

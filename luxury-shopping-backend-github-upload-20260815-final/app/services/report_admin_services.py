@@ -24,7 +24,7 @@ from ..models import MODEL_BY_TABLE
 from ..models.domain import FileAsset, Order, OrderItem, Product, Profile, User, UserRole
 from ..repositories.resources import serialize_record
 from ..services.catalog_policy import build_public_product_rows, public_product_clauses
-from ..services.financial_calculator import advisory_xact_lock, local_request_total, money
+from ..services.financial_calculator import advisory_xact_lock, local_request_total, money, sync_order_sales_payables
 from ..services.notification_service import NotificationPayload, NotificationService
 from ..services.realtime import RealtimeEventService, realtime_hub
 from .audit_trail import add_audit_log
@@ -702,32 +702,23 @@ class RevenueRecognitionService:
                 if request_id
             }
 
-        paid_by_international: dict[str, Decimal] = {}
-        if international_records:
-            payment_model = MODEL_BY_TABLE["international_order_payments"]
-            result = await session.execute(
-                select(payment_model.order_id, func.coalesce(func.sum(payment_model.amount), 0))
-                .where(
-                    payment_model.deleted_at.is_(None),
-                    payment_model.order_id.in_([record.id for record in international_records]),
-                    func.lower(payment_model.status).in_(tuple(RECOGNIZED_PAYMENT_STATUSES)),
-                )
-                .group_by(payment_model.order_id)
-            )
-            paid_by_international = {
-                str(order_id): money(amount or 0)
-                for order_id, amount in result.all()
-                if order_id
-            }
+        international_payloads = {
+            str(row["id"]): row
+            for row in await cls.international_order_financial_payloads(session, international_records)
+        }
 
         rows: list[RecognizedOrderRevenue] = []
         for table, record in records:
-            payload = serialize_record(record)
+            payload = (
+                international_payloads[str(record.id)]
+                if table == "international_orders"
+                else serialize_record(record)
+            )
             order_total = cls._supplemental_payload_total(payload)
             payment_total = (
                 paid_by_local.get(str(record.id), Decimal("0.00"))
                 if table == "local_shopping_requests"
-                else paid_by_international.get(str(record.id), Decimal("0.00"))
+                else money(payload["paid_amount"])
             )
             payment_status = str(
                 payload.get("payment_status") or payload.get("paymentStatus") or ""
@@ -765,6 +756,58 @@ class RevenueRecognitionService:
                 )
             )
         return rows
+
+    @classmethod
+    async def international_order_financial_payloads(
+        cls, session: AsyncSession, orders: list[Any]
+    ) -> list[dict[str, Any]]:
+        if not orders:
+            return []
+        payloads = [serialize_record(order) for order in orders]
+        order_currencies = {
+            order.id: str(payload.get("currency_code") or payload.get("currencyCode") or "YER").strip().upper()
+            for order, payload in zip(orders, payloads)
+        }
+        payment = MODEL_BY_TABLE["international_order_payments"]
+        payment_currency = payment.extra_data.op("->>")(literal_column("'currency_code'"))
+        result = await session.execute(
+            select(payment.order_id, payment_currency, func.sum(payment.amount))
+            .where(
+                payment.deleted_at.is_(None),
+                payment.order_id.in_(order_currencies),
+                func.lower(payment.status).in_(tuple(RECOGNIZED_PAYMENT_STATUSES)),
+            )
+            .group_by(payment.order_id, payment_currency)
+        )
+        paid_by_order: dict[uuid.UUID, Decimal] = {}
+        rates: dict[str, Decimal] | None = None
+        for order_id, currency, amount in result.all():
+            target = order_currencies[order_id]
+            source = str(currency or target).strip().upper() or target
+            paid = money(amount)
+            if paid and source != target:
+                if rates is None:
+                    rates, _ = await cls.currency_context(session)
+                if source not in rates or target not in rates:
+                    continue
+                paid = cls.converted_amount(paid, source, rates, target)
+            paid_by_order[order_id] = paid_by_order.get(order_id, Decimal("0.00")) + paid
+
+        for order, payload in zip(orders, payloads):
+            total = cls._supplemental_payload_total(payload)
+            paid = money(max(paid_by_order.get(order.id, Decimal("0.00")), money(payload.get("paid_amount"))))
+            status = str(payload.get("payment_status") or payload.get("paymentStatus") or "unpaid").strip().lower()
+            if status not in {"refunded", "partial_refund", "partially_refunded"}:
+                if paid <= 0 and status in RECOGNIZED_PAYMENT_STATUSES:
+                    paid = total
+                if paid > 0:
+                    status = "paid" if total > 0 and paid >= total else "partial"
+            payload.update(
+                paid_amount=format(paid, "f"),
+                remaining_balance=format(max(total - paid, Decimal("0.00")), "f"),
+                payment_status=status,
+            )
+        return payloads
 
     @classmethod
     async def order_rows(
@@ -2275,14 +2318,23 @@ class CourierLocationService:
 
     async def update_status(self, session: AsyncSession, *, user: User, assignment_id: uuid.UUID, body: dict[str, Any]) -> dict[str, Any]:
         assignment_model = MODEL_BY_TABLE["courier_assignments"]
+        assignment_scope = (
+            assignment_model.id == assignment_id,
+            assignment_model.deleted_at.is_(None),
+            or_(assignment_model.user_id == user.id, assignment_model.courier_id == user.id),
+        )
+        order_id = (await session.execute(
+            select(assignment_model.order_id).where(*assignment_scope)
+        )).scalar_one_or_none()
+        # Administration locks the order before replacing its courier assignment.
+        order = (
+            await session.get(Order, order_id, with_for_update=True)
+            if order_id is not None else None
+        )
         assignment = (
             await session.execute(
                 select(assignment_model)
-                .where(
-                    assignment_model.id == assignment_id,
-                    assignment_model.deleted_at.is_(None),
-                    or_(assignment_model.user_id == user.id, assignment_model.courier_id == user.id),
-                )
+                .where(*assignment_scope)
                 .with_for_update()
                 .limit(1)
             )
@@ -2309,36 +2361,48 @@ class CourierLocationService:
         if status not in set().union(*allowed.values()) or (current in allowed and status not in allowed[current]):
             raise HTTPException(status_code=409, detail="invalid_assignment_status_transition")
         assignment.status = status
-        if getattr(assignment, "order_id", None):
-            order = await session.get(Order, assignment.order_id)
-            if order is not None:
-                order_status = {"picked_up": "shipped", "in_transit": "shipped", "delivering": "out_for_delivery", "out_for_delivery": "out_for_delivery", "delivered": "delivered", "failed": "delivery_failed"}.get(status)
-                if order_status:
-                    order.status = order_status
-                    history_model = MODEL_BY_TABLE["order_status_history"]
-                    session.add(history_model(order_id=order.id, status=order_status, notes=f"Courier assignment {assignment.id} changed to {status}", extra_data={"changed_by": str(user.id), "assignment_id": str(assignment.id)}))
-                    message = {
-                        "shipped": "تم شحن طلبك.",
-                        "out_for_delivery": "طلبك في الطريق للتوصيل.",
-                        "delivered": "تم تسليم طلبك.",
-                        "delivery_failed": "تعذر إتمام التوصيل وسيتم التواصل معك.",
-                    }.get(order_status, "تم تحديث حالة شحن طلبك.")
-                    await NotificationService(session).create_notification(
-                        NotificationPayload(
-                            user_id=order.user_id,
-                            title="تحديث شحن الطلب",
-                            body=message,
-                            notification_type="shipping_status_changed",
-                            category="shipping",
-                            priority="high",
-                            action_url=f"/orders/{order.id}",
-                            entity_type="order",
-                            entity_id=str(order.id),
-                            order_id=order.id,
-                            payload={"deep_link": f"/orders/{order.id}", "order_status": order_status},
-                            deduplication_key=f"courier-order-status:{assignment.id}:{status}",
-                        )
+        if order is not None:
+            order_status = {
+                "picked_up": "shipped",
+                "in_transit": "shipped",
+                "delivering": "out_for_delivery",
+                "out_for_delivery": "out_for_delivery",
+                "delivered": "delivered",
+                "failed": "delivery_failed",
+            }.get(status)
+            if order_status:
+                order.status = order_status
+                if order_status == "delivered":
+                    await sync_order_sales_payables(session, order)
+                history_model = MODEL_BY_TABLE["order_status_history"]
+                session.add(history_model(
+                    order_id=order.id,
+                    status=order_status,
+                    notes=f"Courier assignment {assignment.id} changed to {status}",
+                    extra_data={"changed_by": str(user.id), "assignment_id": str(assignment.id)},
+                ))
+                message = {
+                    "shipped": "تم شحن طلبك.",
+                    "out_for_delivery": "طلبك في الطريق للتوصيل.",
+                    "delivered": "تم تسليم طلبك.",
+                    "delivery_failed": "تعذر إتمام التوصيل وسيتم التواصل معك.",
+                }.get(order_status, "تم تحديث حالة شحن طلبك.")
+                await NotificationService(session).create_notification(
+                    NotificationPayload(
+                        user_id=order.user_id,
+                        title="تحديث شحن الطلب",
+                        body=message,
+                        notification_type="shipping_status_changed",
+                        category="shipping",
+                        priority="high",
+                        action_url=f"/orders/{order.id}",
+                        entity_type="order",
+                        entity_id=str(order.id),
+                        order_id=order.id,
+                        payload={"deep_link": f"/orders/{order.id}", "order_status": order_status},
+                        deduplication_key=f"courier-order-status:{assignment.id}:{status}",
                     )
+                )
         local_id = (assignment.extra_data or {}).get("local_request_id")
         if local_id:
             local = await session.get(MODEL_BY_TABLE["local_shopping_requests"], uuid.UUID(local_id), with_for_update=True)

@@ -504,7 +504,10 @@ def policy_for_route(method: str, path: str) -> ApiProtectionPolicy:
     # Keep it uncached and let signed_receipt_file_response validate the token.
     if method == "GET" and normalized == "/receipts/access":
         return _policy("public_read", auth=False, rate="public_read", sensitive=True)
-    if method == "GET" and normalized == "/api/marketing/campaigns/active":
+    if method == "GET" and (
+        normalized == "/api/marketing/campaigns/active"
+        or re.fullmatch(r"/api/marketing/marketers/by-code/[^/]+", normalized)
+    ):
         return _policy("public_read", auth=False, rate="public_read", public=True)
     if _matches(normalized, FINANCE_PREFIXES):
         return _policy("finance_write", auth=True, roles=("admin", "manager", "finance"), rate="finance_write", sensitive=True, audit=method != "GET")

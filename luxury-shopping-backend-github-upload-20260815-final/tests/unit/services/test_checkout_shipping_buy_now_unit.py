@@ -101,7 +101,10 @@ async def test_buy_now_validates_selected_variant_without_reading_cart(monkeypat
     product_id, variant_id = uuid.uuid4(), uuid.uuid4()
     product = Product(id=product_id, name="فستان سهرة", price=Decimal(55000), track_inventory=True, stock_quantity=10)
     variant = ProductVariant(id=variant_id, product_id=product_id, price=Decimal(56000), stock_quantity=5)
-    results = [SimpleNamespace(scalar_one_or_none=lambda: product), SimpleNamespace(scalar_one_or_none=lambda: variant)]
+    results = [
+        SimpleNamespace(scalars=lambda: [product]),
+        SimpleNamespace(scalars=lambda: [variant]),
+    ]
     session = SimpleNamespace(execute=AsyncMock(side_effect=results))
     eligible = SimpleNamespace(product=product, variant=variant, unit_price=Decimal(56000))
     monkeypatch.setattr(commerce, "eligible_line", AsyncMock(return_value=eligible))

@@ -32,6 +32,11 @@ from ...services.product_preview import product_preview_image
 from ...config import BACKEND_DIR, get_settings
 from ...database import SessionFactory, get_session
 from ...dependencies import bearer, current_bearer_user, current_user, optional_user, require_admin, require_courier, require_marketer, require_partner, require_staff, user_roles
+from ...services.marketer_referrals import (
+    PAYABLE_COMMISSION_STATUSES,
+    active_marketer_for_code,
+    marketer_commission_totals,
+)
 from ...models import MODEL_BY_TABLE, RESOURCE_TABLES
 from ...models.domain import FileAsset, Order, OrderItem, Product, ProductVariant, Profile, User, UserRole
 from ...repositories.resources import (
@@ -53,7 +58,7 @@ from ...services.auth_service import (
     roles_for,
 )
 from ...services.audit_trail import add_audit_log
-from ...services.staff_permissions import require_staff_permission
+from ...services.staff_permissions import effective_permissions, require_staff_permission
 from ...services.store_review_compat import (
     create_handover_store_review,
     fetch_admin_store_reviews,
@@ -2461,6 +2466,16 @@ def _partner_option_permission(option: str, action: str) -> str:
     return f"{scope}.{action}"
 
 
+def _validate_merchant_size_name(name: str) -> None:
+    if (
+        name.lower() == "general"
+        or "," in name
+        or "،" in name
+        or re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", name, re.IGNORECASE)
+    ):
+        raise HTTPException(status_code=422, detail="invalid_merchant_size_name")
+
+
 def _partner_option_owner_id(row: Any) -> str:
     payload = dict(row) if isinstance(row, dict) else serialize_record(row)
     extra_data = payload.get("extra_data")
@@ -2535,6 +2550,8 @@ async def create_partner_product_option(
     name = _first_text(body.get("name"), body.get("label"))
     if not name:
         raise HTTPException(status_code=422, detail="option_name_required")
+    if table == "size_options":
+        _validate_merchant_size_name(name)
     logo_url = _first_text(body.get("logo_url"), body.get("logoUrl"))
     is_brand = table == "brands"
     row = await _api_create(
@@ -2577,7 +2594,10 @@ async def update_partner_product_option(
     if row is None or _partner_option_owner_id(row) != str(user.id):
         raise HTTPException(status_code=404, detail="partner_option_not_found")
     body = await request.json()
-    row.name = _first_text(body.get("name"), body.get("label"), row.name)
+    name = _first_text(body.get("name"), body.get("label"), row.name)
+    if table == "size_options" and name != row.name:
+        _validate_merchant_size_name(name)
+    row.name = name
     if table == "brands" and ("logo_url" in body or "logoUrl" in body):
         row.logo_url = _first_text(body.get("logo_url"), body.get("logoUrl")) or None
     if hasattr(row, "code") and body.get("code") is not None:
@@ -5843,6 +5863,7 @@ def _canonical_inventory_stock_counts(payloads: list[dict[str, Any]]) -> dict[st
 
 @router.get("/api/admin/inventory/warehouses")
 async def api_inventory_warehouses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "inventory.view")
     # Keep the dropdown and the warehouses page on the same relationship-aware
     # response so neither view can report a different product count.
     return {"data": await _warehouse_summary_payloads(session)}
@@ -5850,6 +5871,7 @@ async def api_inventory_warehouses(staff: User = Depends(require_staff), session
 
 @router.get("/api/admin/inventory/products")
 async def api_inventory_products(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "inventory.view")
     return {"data": [serialize_record(row) for row in await _rows(session, "products", limit=500)]}
 
 
@@ -5859,6 +5881,7 @@ async def api_inventory_locations(
     staff: User = Depends(require_staff),
     session: AsyncSession = Depends(get_session),
 ):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "inventory.view")
     return {"data": await _canonical_inventory_payloads(session, warehouse_id)}
 
 
@@ -5868,6 +5891,7 @@ async def api_inventory_movements(
     staff: User = Depends(require_staff),
     session: AsyncSession = Depends(get_session),
 ):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "inventory.view")
     movement_payloads = [serialize_record(row) for row in await _rows(session, "inventory_movements", limit=500)]
     if warehouse_id:
         movement_payloads = [
@@ -5887,6 +5911,13 @@ async def api_inventory_movements(
 @router.post("/api/admin/inventory/movements", status_code=201)
 async def api_create_inventory_movement(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     body = await request.json()
+    movement_type = str(body.get("movement_type") or body.get("type") or "in").strip().lower()
+    if movement_type not in {"in", "out", "remove", "decrease", "adjustment", "assignment"}:
+        raise HTTPException(status_code=422, detail="movement_type_invalid")
+    permission = "inventory.adjust" if movement_type in {"adjustment", "assignment"} else "inventory.create"
+    permissions = await effective_permissions(session, staff.id, set(await roles_for(session, staff.id)))
+    if not {permission, "inventory.update"}.intersection(permissions):
+        raise HTTPException(status_code=403, detail={"code": "staff_permission_denied", "permission": permission})
     warehouse_id = str(body.get("warehouse_id") or body.get("warehouseId") or "")
     if not warehouse_id:
         raise HTTPException(status_code=422, detail="warehouse_required")
@@ -5902,15 +5933,15 @@ async def api_create_inventory_movement(request: Request, staff: User = Depends(
         product_id = uuid.UUID(str(body.get("product_id") or body.get("productId")))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="product_required") from exc
+    raw_quantity = body.get("quantity") or 0
     try:
-        quantity = int(body.get("quantity") or 0)
+        quantity = int(raw_quantity)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="quantity_invalid") from exc
+    if isinstance(raw_quantity, bool) or isinstance(raw_quantity, float) and raw_quantity != quantity:
+        raise HTTPException(status_code=422, detail="quantity_invalid")
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="quantity_must_be_positive")
-    movement_type = str(body.get("movement_type") or body.get("type") or "in").strip().lower()
-    if movement_type not in {"in", "out", "remove", "decrease", "adjustment", "assignment"}:
-        raise HTTPException(status_code=422, detail="movement_type_invalid")
     product = await session.get(Product, product_id, with_for_update=True)
     if product is None or product.deleted_at is not None:
         raise HTTPException(status_code=404, detail="product_not_found")
@@ -6167,6 +6198,7 @@ async def api_list_local_merchants(staff: User = Depends(require_staff), session
 
 @router.get("/api/admin/warehouses")
 async def api_list_warehouses(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "warehouses.view")
     return {"data": await _warehouse_summary_payloads(session)}
 
 
@@ -6896,7 +6928,63 @@ async def _resolve_marketer_user_reference(session: AsyncSession, body: Any) -> 
 
 @router.get("/api/marketing/marketers")
 async def api_marketers(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
-    return {"data": [_marketer_payload(row) for row in await _rows(session, "marketers", limit=500)]}
+    marketers = await _rows(session, "marketers", limit=500)
+    totals = await marketer_commission_totals(session, [row.user_id for row in marketers if row.user_id])
+    data = []
+    for row in marketers:
+        profile = _marketer_payload(row)
+        if (balance := totals.get(row.user_id)) is not None:
+            profile.update(
+                total_sales=float(balance.total_sales),
+                total_commission=float(balance.total_commission),
+                pending_commission=float(balance.pending_commission),
+            )
+        data.append(profile)
+    return {"data": data}
+
+
+@router.get("/api/communication/referral/me")
+async def api_my_referral(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    model = MODEL_BY_TABLE["marketers"]
+    row = await session.scalar(
+        select(model)
+        .where(model.user_id == user.id, model.deleted_at.is_(None), model.status == "active")
+        .order_by(model.created_at.desc())
+        .limit(1)
+    )
+    if row is None:
+        return {"data": None}
+    profile = _marketer_payload(row)
+    referral_code = profile["referral_code"]
+    if not referral_code:
+        public_code = MODEL_BY_TABLE["public_marketer_codes"]
+        referral_code = await session.scalar(
+            select(public_code.code)
+            .where(
+                public_code.user_id == user.id,
+                public_code.deleted_at.is_(None),
+                public_code.status == "active",
+                public_code.is_active.is_(True),
+            )
+            .order_by(public_code.created_at.desc())
+            .limit(1)
+        )
+    balance = (await marketer_commission_totals(session, [user.id])).get(user.id)
+    return {
+        "data": {
+            "referral_code": referral_code or "",
+            "total_sales": balance.purchase_count if balance is not None else profile["total_sales"],
+            "total_commission": float(balance.total_commission) if balance is not None else profile["total_commission"],
+        }
+    }
+
+
+@router.get("/api/marketing/marketers/by-code/{code}")
+async def api_marketer_by_referral_code(code: str, session: AsyncSession = Depends(get_session)):
+    marketer = await active_marketer_for_code(session, code)
+    if marketer is None:
+        return {"data": None}
+    return {"data": {"id": str(marketer.id), "name": marketer.name}}
 
 
 @router.get("/api/marketing/users/options")
@@ -9737,7 +9825,13 @@ async def api_delete_marketer(marketer_id: uuid.UUID, request: Request, staff: U
 
 
 @router.post("/api/marketing/commissions/pay")
-async def api_pay_marketer_commission(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+async def api_pay_marketer_commission(
+    request: Request,
+    staff: User = Depends(require_staff),
+    roles: set[str] = Depends(user_roles),
+    session: AsyncSession = Depends(get_session),
+):
+    require_finance_actor(roles)
     body = await request.json()
     raw_ids = body.get("ids") or body.get("commission_ids") or body.get("commissionIds")
     if not raw_ids:
@@ -9752,6 +9846,7 @@ async def api_pay_marketer_commission(request: Request, staff: User = Depends(re
             await session.execute(
                 select(model)
                 .where(model.id.in_(commission_ids), model.deleted_at.is_(None))
+                .order_by(model.id)
                 .with_for_update()
             )
         ).scalars()
@@ -9760,12 +9855,13 @@ async def api_pay_marketer_commission(request: Request, staff: User = Depends(re
         raise HTTPException(status_code=404, detail="commission_not_found")
     if len(commissions) != len(set(commission_ids)):
         raise HTTPException(status_code=404, detail="commission_not_found")
-    payable_statuses = {"pending", "earned", "approved", "unpaid"}
-    if any(str(commission.status or "").lower() not in payable_statuses for commission in commissions):
+    if any(str(commission.status or "").lower() not in PAYABLE_COMMISSION_STATUSES for commission in commissions):
         raise HTTPException(status_code=409, detail="commission_already_paid")
     grouped: dict[uuid.UUID, list[Any]] = {}
+    paid_at = datetime.now(timezone.utc).isoformat()
     for commission in commissions:
         commission.status = "paid"
+        commission.extra_data = {**(commission.extra_data or {}), "paid_at": paid_at}
         grouped.setdefault(commission.user_id, []).append(commission)
     rows = []
     for user_id, user_commissions in grouped.items():
@@ -9777,6 +9873,8 @@ async def api_pay_marketer_commission(request: Request, staff: User = Depends(re
                     "user_id": user_id,
                     "amount": sum((money(item.amount or 0) for item in user_commissions), money(0)),
                     "status": "paid",
+                    "currency_code": "YER",
+                    "payment_date": paid_at,
                     "notes": body.get("notes") or "",
                     "commissions_paid": [str(item.id) for item in user_commissions],
                 },
@@ -9970,7 +10068,7 @@ def _international_purchase_link_id(row: Any) -> str | None:
 
 
 async def _international_order_payloads(session: AsyncSession, rows: list[Any]) -> list[dict[str, Any]]:
-    payloads = [serialize_record(row) for row in rows]
+    payloads = await RevenueRecognitionService.international_order_financial_payloads(session, rows)
     user_ids = {row.user_id for row in rows if getattr(row, "user_id", None) is not None}
     profiles_by_user: dict[str, dict[str, Any]] = {}
     if user_ids:
@@ -10038,7 +10136,7 @@ async def api_international_order_context(order_id: uuid.UUID, staff: User = Dep
         .where(Profile.user_id == row.user_id, Profile.deleted_at.is_(None))
         .limit(1)
     )
-    payload = serialize_record(row)
+    payload = (await RevenueRecognitionService.international_order_financial_payloads(session, [row]))[0]
     linked_purchase_id = _international_purchase_link_id(row)
     if linked_purchase_id:
         payload["purchase_id"] = linked_purchase_id
@@ -10673,8 +10771,11 @@ async def api_create_partner_payment(request: Request, staff: User = Depends(req
         **body, "partner_id": partner_id, "amount": amount, "status": status,
     }, staff)
     if status in {"paid", "confirmed", "approved"}:
+        paid_at = row.get("payment_date") or row.get("created_at")
         for settlement in settlements:
             settlement.status = "paid"
+            if paid_at:
+                settlement.extra_data = {**(settlement.extra_data or {}), "paid_at": paid_at}
     await session.commit()
     return {"data": row}
 
@@ -11758,16 +11859,19 @@ async def api_delete_local_merchant(record_id: uuid.UUID, request: Request, staf
 
 @router.post("/api/admin/warehouses", status_code=201)
 async def api_create_warehouse(request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "warehouses.create")
     return await _create_update_delete_resource("warehouses", request, session, staff)
 
 
 @router.patch("/api/admin/warehouses/{record_id}")
 async def api_update_warehouse(record_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "warehouses.update")
     return await _create_update_delete_resource("warehouses", request, session, staff, record_id, "update")
 
 
 @router.delete("/api/admin/warehouses/{record_id}")
 async def api_delete_warehouse(record_id: uuid.UUID, request: Request, staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
+    await require_staff_permission(session, staff.id, set(await roles_for(session, staff.id)), "warehouses.delete")
     return await _create_update_delete_resource("warehouses", request, session, staff, record_id, "delete")
 
 
@@ -14768,7 +14872,7 @@ _PARTNER_SALES_PERIODS = {
     "all": None,
 }
 _PARTNER_SALES_EXCLUDED_STATUSES = frozenset(
-    {"cancelled", "canceled", "rejected", "failed", "void", "draft"}
+    {"cancelled", "canceled", "rejected", "failed", "void", "draft", "refunded"}
 )
 _PARTNER_SALES_PENDING_STATUSES = frozenset(
     {
@@ -14833,6 +14937,9 @@ async def _partner_sales_analytics(
     for row in result.mappings():
         order_id = row["order_id"]
         status = str(row["status"] or "pending").strip().lower() or "pending"
+        payment_status = str(row["payment_status"] or "unpaid").strip().lower()
+        if payment_status == "refunded":
+            status = "refunded"
         created_at = row["created_at"]
         amount = money(row["total_price"] or 0)
         product_name = str(row["product_name"] or "منتج بدون اسم").strip() or "منتج بدون اسم"
@@ -14842,7 +14949,7 @@ async def _partner_sales_analytics(
             {
                 "status": status,
                 "order_number": str(row["order_number"] or ""),
-                "payment_status": str(row["payment_status"] or "unpaid"),
+                "payment_status": payment_status,
                 "created_at": created_at,
                 "customer_id": row["customer_id"],
                 "subtotal": money(row["order_subtotal"] or 0),
@@ -14976,6 +15083,42 @@ async def _partner_sales_analytics(
             )
         ).scalars()
     )
+    settlement_payloads = [serialize_record(row) for row in settlement_rows]
+    missing_paid_dates = {
+        str(row["id"])
+        for row in settlement_payloads
+        if str(row.get("status", "")).lower() == "paid" and not row.get("paid_at")
+    }
+    if missing_paid_dates:
+        payment_model = MODEL_BY_TABLE["partner_payments"]
+        payments = (
+            await session.execute(
+                select(payment_model)
+                .where(
+                    payment_model.partner_id == partner_id,
+                    payment_model.deleted_at.is_(None),
+                    payment_model.status.in_(("paid", "confirmed", "approved")),
+                    or_(*(
+                        payment_model.extra_data["orders_settled"].contains([settlement_id])
+                        for settlement_id in sorted(missing_paid_dates)
+                    )),
+                )
+                .order_by(payment_model.created_at, payment_model.id)
+            )
+        ).scalars()
+        paid_dates = {}
+        for payment in payments:
+            payout = serialize_record(payment)
+            paid_at = payout.get("payment_date") or payout.get("created_at")
+            payout_settlements = payout.get("orders_settled")
+            if not paid_at or not isinstance(payout_settlements, list):
+                continue
+            for settlement_id in payout_settlements:
+                if isinstance(settlement_id, str) and settlement_id in missing_paid_dates:
+                    paid_dates.setdefault(settlement_id, paid_at)
+        for settlement in settlement_payloads:
+            if str(settlement["id"]) in paid_dates:
+                settlement["paid_at"] = paid_dates[str(settlement["id"])]
     return {
         "period": normalized_period,
         "range": {
@@ -15060,7 +15203,7 @@ async def _partner_sales_analytics(
                 reverse=True,
             )[:10]
         ],
-        "settlements": [serialize_record(row) for row in settlement_rows],
+        "settlements": settlement_payloads,
         "customerSummary": {
             "uniqueCustomers": customers_count,
             "returningCustomers": returning_customers,

@@ -77,6 +77,34 @@ _OPTIONS = [
 
 
 @pytest.mark.asyncio
+async def test_merchant_size_writes_reject_grouped_or_hidden_names(merchant_api):
+    app, ledger, actor = merchant_api
+    model = MODEL_BY_TABLE["size_options"]
+    legacy = model(
+        name="M, L",
+        is_active=True,
+        extra_data={"partner_id": str(actor["id"])},
+    )
+    ledger.add(legacy)
+    path = "/partner/product-options/sizes"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as client:
+        for invalid in ("M, L", "44، 46", "General", str(uuid.uuid4())):
+            created = await client.post(path, json={"name": invalid})
+            assert created.status_code == 422
+            assert created.json()["detail"] == "invalid_merchant_size_name"
+
+        listed = await client.get(path)
+        assert [row["name"] for row in listed.json()["data"]] == ["M, L"]
+        record_path = f"{path}/{legacy.id}"
+        renamed = await client.patch(record_path, json={"name": "44 واسع"})
+        assert renamed.status_code == 200
+        assert renamed.json()["data"]["name"] == "44 واسع"
+        rejected = await client.patch(record_path, json={"name": "44، 46"})
+        assert rejected.status_code == 422
+        assert legacy.name == "44 واسع"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("option,name,updated_name,code", _OPTIONS)
 async def test_merchant_default_permissions_allow_own_option_crud(
     merchant_api, option, name, updated_name, code,

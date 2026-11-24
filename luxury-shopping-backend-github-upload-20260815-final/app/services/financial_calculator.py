@@ -1026,6 +1026,14 @@ async def refunded_total(session: AsyncSession, order_id: uuid.UUID) -> Decimal:
     return money_or_zero(amount)
 
 
+async def sync_order_sales_payables(session: AsyncSession, order: Order, *, reopened: bool = False) -> None:
+    from .marketer_referrals import sync_order_marketer_commission
+    from .merchant_pricing import sync_order_partner_settlements
+
+    await sync_order_partner_settlements(session, order, reopened=reopened)
+    await sync_order_marketer_commission(session, order)
+
+
 async def sync_order_payment_status(session: AsyncSession, order: Order) -> None:
     paid = await approved_payment_total(session, order.id)
     refunded = await refunded_total(session, order.id)
@@ -1046,9 +1054,7 @@ async def sync_order_payment_status(session: AsyncSession, order: Order) -> None
     else:
         order.payment_status = "pending"
 
-    from .merchant_pricing import sync_order_partner_settlements
-
-    await sync_order_partner_settlements(session, order)
+    await sync_order_sales_payables(session, order)
 
 
 def financial_response_row(row: Any) -> dict[str, Any]:

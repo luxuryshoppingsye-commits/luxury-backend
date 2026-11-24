@@ -506,7 +506,13 @@ def public_product_response(
     )
     primary_image = image_url or (images[0] if images else None)
     track_inventory = product.track_inventory is not False
+    public_variants = [
+        variant for variant in variants or []
+        if variant.deleted_at is None and variant.is_active is not False
+    ]
     stock_quantity = int(product.stock_quantity or 0)
+    if track_inventory and public_variants:
+        stock_quantity = sum(max(0, int(variant.stock_quantity or 0)) for variant in public_variants)
     is_publicly_orderable = (
         product.deleted_at is None
         and product.is_active is not False
@@ -553,7 +559,7 @@ def public_product_response(
             else "Main Store"
         ),
         "stock_quantity": stock_quantity,
-        "stock_status": _stock_status(product.stock_quantity),
+        "stock_status": _stock_status(stock_quantity),
         "track_inventory": track_inventory,
         "is_active": product.is_active is not False,
         "approval_status": product.approval_status,
@@ -564,11 +570,7 @@ def public_product_response(
         "published_at": _json_value(product.approved_at or product.created_at),
     }
     if variants is not None:
-        row["variants"] = [
-            public_variant_response(variant)
-            for variant in variants
-            if variant.deleted_at is None and variant.is_active is not False
-        ]
+        row["variants"] = [public_variant_response(variant) for variant in public_variants]
         row["has_variant_options"] = bool(row["variants"])
     return row
 
