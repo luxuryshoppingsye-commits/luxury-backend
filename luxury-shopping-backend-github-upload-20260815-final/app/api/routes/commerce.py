@@ -38,7 +38,7 @@ from ...models.domain import (
     Wishlist,
 )
 from ...repositories.resources import serialize_record
-from ...services.merchant_pricing import contract_share, latest_partner_contract, retail_price
+from ...services.merchant_pricing import contract_share, latest_partner_contract, retail_price, sync_order_partner_settlements
 from ...services.catalog_policy import (
     apply_merchant_product_server_defaults,
     assert_merchant_product_payload_allowed,
@@ -4014,6 +4014,7 @@ async def confirm_customer_order_received(
                 extra_data={"previous_status": previous_status, "new_status": "delivered", "actor": "customer", "actor_id": str(user.id)},
             ))
             await award_loyalty_points_for_fulfilled_order(session, order)
+            await sync_order_partner_settlements(session, order)
         extra.update({
             "customer_received_at": now,
             "customer_received_by": str(user.id),
@@ -4453,6 +4454,7 @@ async def change_order_status(
         await restore_order_inventory(session, order)
     order.status = next_status
     await award_loyalty_points_for_fulfilled_order(session, order)
+    await sync_order_partner_settlements(session, order)
     history_model = MODEL_BY_TABLE["order_status_history"]
     history = history_model(id=uuid.uuid4(), order_id=order.id, status=next_status, notes=body.get("note"), extra_data={"previous_status": previous, "new_status": next_status})
     session.add(history)
@@ -4526,6 +4528,7 @@ async def rollback_order_status(
     if not previous_status or previous_status == current_status:
         raise HTTPException(status_code=409, detail="no_rollback_available")
     order.status = previous_status
+    await sync_order_partner_settlements(session, order, reopened=True)
     session.add(history_model(
         order_id=order.id,
         status=previous_status,

@@ -10649,13 +10649,32 @@ async def api_create_partner_payment(request: Request, staff: User = Depends(req
     require_finance_actor(roles)
     body = await request.json()
     _validate_payment_record_body(body)
-    partner_id = uuid.UUID(str(body.get("partner_id") or body.get("partnerId")))
-    row = await _api_create(session, "partner_payments", {"partner_id": partner_id, "amount": body.get("amount") or 0, "status": body.get("status") or "pending", **body}, staff)
-    settlement_model = MODEL_BY_TABLE["partner_settlements"]
-    for settlement_id in body.get("orders_settled", []) or []:
-        settlement = await session.get(settlement_model, uuid.UUID(str(settlement_id)))
-        if settlement is not None:
-            settlement.status = body.get("status") or "paid"
+    try:
+        partner_id = uuid.UUID(str(body.get("partner_id") or body.get("partnerId")))
+        settlement_ids = {uuid.UUID(str(value)) for value in body.get("orders_settled", []) or []}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "invalid_partner_settlement_reference") from exc
+    amount = money(body.get("amount"))
+    status = body.get("status") or "pending"
+    settlements = []
+    if settlement_ids:
+        model = MODEL_BY_TABLE["partner_settlements"]
+        settlements = (await session.execute(
+            select(model).where(model.id.in_(settlement_ids), model.deleted_at.is_(None))
+            .order_by(model.id).with_for_update()
+        )).scalars().all()
+        if len(settlements) != len(settlement_ids) or any(row.partner_id != partner_id for row in settlements):
+            raise HTTPException(422, "partner_settlement_mismatch")
+        if any(row.status not in {"pending", "unpaid"} for row in settlements):
+            raise HTTPException(409, "partner_settlement_not_pending")
+        if amount != sum((money(row.amount) for row in settlements), Decimal(0)):
+            raise HTTPException(422, "partner_settlement_amount_mismatch")
+    row = await _api_create(session, "partner_payments", {
+        **body, "partner_id": partner_id, "amount": amount, "status": status,
+    }, staff)
+    if status in {"paid", "confirmed", "approved"}:
+        for settlement in settlements:
+            settlement.status = "paid"
     await session.commit()
     return {"data": row}
 

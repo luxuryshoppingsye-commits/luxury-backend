@@ -8,7 +8,7 @@ from sqlalchemy import Numeric, case, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import MODEL_BY_TABLE
-from ..models.domain import Product, ProductVariant
+from ..models.domain import Order, OrderItem, Product, ProductVariant
 from .financial_calculator import money
 
 
@@ -46,6 +46,69 @@ def contract_share(contract) -> Decimal:
     data = getattr(contract, "extra_data", None)
     data = data if isinstance(data, dict) else {}
     return Decimal(str(partner_rate(data.get("commissionRate", data.get("rate")))))
+
+
+async def sync_order_partner_settlements(
+    session: AsyncSession, order: Order, *, reopened: bool = False
+) -> None:
+    """Record one contract-based payable per merchant on a paid, delivered order.
+
+    Serialize on the order row before locking existing settlements. Lock any
+    linked settlements as well so an accounting payout cannot race a reversal.
+    """
+    delivered = order.status in {"delivered", "completed"}
+    if not delivered and not reopened:
+        return
+
+    await session.execute(select(Order.id).where(Order.id == order.id).with_for_update())
+    eligible = delivered and order.deleted_at is None and order.payment_status == "paid"
+    model = MODEL_BY_TABLE["partner_settlements"]
+    existing = (await session.execute(
+        select(model).where(
+            model.deleted_at.is_(None),
+            model.extra_data["order_id"].astext == str(order.id),
+        ).order_by(model.id).with_for_update()
+    )).scalars().all()
+    if not eligible:
+        for row in existing:
+            if row.status in {"pending", "unpaid"}:
+                row.status = "cancelled"
+        return
+
+    by_partner = {row.partner_id: row for row in existing}
+    totals = (await session.execute(
+        select(OrderItem.partner_id, func.sum(OrderItem.total_price))
+        .where(OrderItem.order_id == order.id, OrderItem.partner_id.is_not(None))
+        .group_by(OrderItem.partner_id)
+    )).all()
+    for partner_id, total in totals:
+        previous = by_partner.get(partner_id)
+        if previous is not None:
+            if previous.status == "cancelled":
+                previous.status = "pending"
+            continue
+
+        contract = await latest_partner_contract(session, partner_id)
+        share = contract_share(contract)
+        gross = money(total)
+        payable = money(gross * share / Decimal(100))
+        if payable == 0:
+            continue
+        session.add(model(
+            partner_id=partner_id,
+            status="pending",
+            amount=payable,
+            extra_data={
+                "order_id": str(order.id),
+                "order_number": order.order_number,
+                "currency_code": order.currency_code or "YER",
+                "order_amount": str(gross),
+                "commission_rate": str(Decimal(100) - share),
+                "commission_amount": str(gross - payable),
+                "partner_share_rate": str(share),
+                "partner_amount": str(payable),
+            },
+        ))
 
 
 def retail_price(net, share: Decimal, currency: str) -> Decimal:

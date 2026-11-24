@@ -1046,6 +1046,10 @@ async def sync_order_payment_status(session: AsyncSession, order: Order) -> None
     else:
         order.payment_status = "pending"
 
+    from .merchant_pricing import sync_order_partner_settlements
+
+    await sync_order_partner_settlements(session, order)
+
 
 def financial_response_row(row: Any) -> dict[str, Any]:
     payload = serialize_record(row)
