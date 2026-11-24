@@ -12,7 +12,7 @@ import subprocess
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from io import BytesIO
 from typing import Any
@@ -89,6 +89,7 @@ from ...services.image_pipeline import prepare_image_upload
 from ...services.financial_calculator import (
     advisory_xact_lock,
     approved_payment_total,
+    confirmed_order_payment_totals,
     financial_response_row,
     find_idempotent_refund,
     loyalty_next_tier_min_points,
@@ -7511,12 +7512,20 @@ async def api_dashboard_kpis(staff: User = Depends(require_staff), session: Asyn
         if gross_month_revenue > 0
         else 0.0
     )
+    receipts = MODEL_BY_TABLE["payment_receipts"]
+    pending_receipts = receipts.status.in_(RECEIPT_PENDING_STATUSES)
+    daily_collections = await confirmed_order_payment_totals(session, created_since=today)
     return {"data": {
         "revenue": {"today": float(today_revenue), "yesterday": float(yesterday_revenue), "thisMonth": float(month_revenue), "lastMonth": float(Decimal(last_month_revenue_data["net_revenue"])), "trend": float(today_revenue - yesterday_revenue)},
         "orders": {"today": today_orders, "pending": await _count(session, "orders", order_model.status.in_(("pending", "new"))), "processing": await _count(session, "orders", order_model.status == "processing"), "completed": await _count(session, "orders", order_model.status.in_(("delivered", "completed"))), "trend": 0},
         "customers": {"total": await _customer_count(session), "new_today": await _customer_count(session, user_model.created_at >= today), "new_this_month": await _customer_count(session, user_model.created_at >= month), "trend": 0},
         "products": {"total": await _count(session, "products"), "low_stock": inventory_counts["low_stock"], "out_of_stock": inventory_counts["out_of_stock"], "pending_approval": await _count(session, "products", product_model.approval_status.in_(("pending", "reviewing")))},
-        "payments": {"pending_amount": float(await _sum_amount(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing")))), "pending_count": await _count(session, "payment_receipts", MODEL_BY_TABLE["payment_receipts"].status.in_(("pending", "uploaded", "reviewing"))), "collected_today": float(await _sum_amount(session, "order_payments", MODEL_BY_TABLE["order_payments"].created_at >= today)), "collection_rate": round(collection_rate, 2)},
+        "payments": {
+            "pending_amount": float(await _sum_amount(session, "payment_receipts", pending_receipts)),
+            "pending_count": await _count(session, "payment_receipts", pending_receipts),
+            "collected_today": float(sum(daily_collections.values(), Decimal("0"))),
+            "collection_rate": round(collection_rate, 2),
+        },
         "expenses": {"today": float(await _sum_amount(session, "general_expenses", MODEL_BY_TABLE["general_expenses"].created_at >= today)), "thisMonth": float(monthly_expenses), "general": float(await _sum_amount(session, "general_expenses")), "employees": float(await _sum_amount(session, "employee_payments")), "partners": float(await _sum_amount(session, "partner_payments")), "marketers": float(await _sum_amount(session, "marketer_payments")), "netProfit": float(month_revenue - monthly_expenses)},
         "partners": {"total": await _count(session, "partner_storefronts"), "active": await _count(session, "partner_storefronts", MODEL_BY_TABLE["partner_storefronts"].status.in_(("active", "approved"))), "pending_settlements": await _count(session, "partner_settlements", MODEL_BY_TABLE["partner_settlements"].status.in_(("pending", "unpaid")))},
         "weekly": weekly,
@@ -10752,7 +10761,12 @@ async def api_create_partner_payment(request: Request, staff: User = Depends(req
         settlement_ids = {uuid.UUID(str(value)) for value in body.get("orders_settled", []) or []}
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, "invalid_partner_settlement_reference") from exc
-    amount = money(body.get("amount"))
+    try:
+        amount = money(body.get("amount"))
+    except InvalidOperation as exc:
+        raise HTTPException(400, "invalid_money_amount") from exc
+    if amount <= 0:
+        raise HTTPException(400, "payment_amount_required")
     status = body.get("status") or "pending"
     settlements = []
     if settlement_ids:
@@ -11818,12 +11832,53 @@ async def _api_catalog_banners_uncached(position: str | None, session: AsyncSess
 
 
 @router.post("/api/catalog/banners/{banner_id}/events")
-async def api_catalog_banner_event(banner_id: uuid.UUID, request: Request, session: AsyncSession = Depends(get_session)):
-    body = await request.json()
-    model = MODEL_BY_TABLE.get("analytics_events")
-    if model is not None:
-        session.add(model(type=f"banner_{body.get('type') or 'event'}", entity_id=banner_id, extra_data=body))
-        await session.commit()
+async def api_catalog_banner_event(banner_id: uuid.UUID, body: dict[str, Any], session: AsyncSession = Depends(get_session)):
+    if body.get("type") not in ("view", "click"):
+        raise HTTPException(422, "unsupported_banner_event")
+    event_type = body["type"]
+    event_key = body.get("eventKey", "")
+    if not isinstance(event_key, str) or len(event_key) > 240:
+        raise HTTPException(422, "invalid_banner_event_key")
+
+    banner_model = MODEL_BY_TABLE["banners"]
+    banner = (
+        await session.execute(
+            select(banner_model).where(
+                banner_model.id == banner_id,
+                banner_model.deleted_at.is_(None),
+                banner_model.is_active.is_(True),
+            ).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if banner is None:
+        raise HTTPException(404, "banner_not_found")
+
+    analytics_model = MODEL_BY_TABLE["analytics_events"]
+    event_id = (
+        uuid.uuid5(uuid.NAMESPACE_URL, f"luxury:banner:{banner_id}:{event_type}:{event_key}")
+        if event_key
+        else uuid.uuid4()
+    )
+    event = (
+        pg_insert(analytics_model)
+        .values(
+            id=event_id,
+            type=f"banner_{event_type}",
+            description=str(banner_id),
+            extra_data={"entity_id": str(banner_id), "source": "website"},
+        )
+        .on_conflict_do_nothing(index_elements=[analytics_model.id])
+        .returning(analytics_model.id)
+    )
+    if (await session.execute(event)).scalar_one_or_none() is not None:
+        counter = f"{event_type}_count"
+        extra = dict(banner.extra_data or {})
+        try:
+            count = max(int(extra.get(counter) or 0), 0)
+        except (TypeError, ValueError, OverflowError):
+            count = 0
+        banner.extra_data = {**extra, counter: count + 1}
+    await session.commit()
     return {"tracked": True}
 
 

@@ -1430,12 +1430,6 @@ class ReportGenerationService:
                 except (InvalidOperation, ValueError):
                     return "-"
 
-            def count(value: Any) -> str:
-                try:
-                    return f"{int(Decimal(str(value or 0))):,}"
-                except (InvalidOperation, ValueError):
-                    return "0"
-
             order_status_labels = {
                 "accepted": "مقبول",
                 "cancelled": "ملغى",
@@ -1475,7 +1469,7 @@ class ReportGenerationService:
                 ("إجمالي الإيرادات", amount(metadata.get("gross_revenue"))),
                 ("إجمالي المبالغ المدفوعة", amount(metadata.get("paid_amount"))),
                 ("صافي الإيرادات", amount(metadata.get("net_revenue"))),
-                ("عدد الطلبات", count(metadata.get("order_count"))),
+                ("عدد الطلبات المعروضة", f"{len(rows):,}"),
             )
             card_gap = 12
             card_width = (content_width - (card_gap * 3)) / 4

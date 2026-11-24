@@ -5,7 +5,7 @@ import uuid
 import httpx
 import pytest
 import pytest_asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.database import SessionFactory
@@ -136,6 +136,41 @@ async def test_legacy_receipt_and_manual_payment_are_not_counted_twice(order_rec
                                               extra_data={"payment_receipt_id": str(uuid.uuid4())}))
         await session.flush()
         assert await approved_payment_total(session, order_id) == Decimal("1150")
+
+
+async def test_dashboard_separates_pending_receipts_from_daily_collections(order_record):
+    order_id, client = order_record
+    before = await client.get("/api/dashboard/kpis")
+    assert before.status_code == 200, before.text
+    baseline = before.json()["data"]["payments"]
+
+    manual = MODEL_BY_TABLE["order_payments"]
+    verified = MODEL_BY_TABLE["payments"]
+    receipt = MODEL_BY_TABLE["payment_receipts"]
+    now = datetime.now(timezone.utc)
+    reference = str(uuid.uuid4())
+    async with SessionFactory() as session:
+        order = await session.get(Order, order_id)
+        session.add_all([
+            receipt(order_id=order_id, user_id=order.user_id, amount=300, status="pending_review"),
+            manual(order_id=order_id, amount=300, status="pending", type="bank_transfer"),
+            manual(order_id=order_id, amount=100, status="confirmed", type="bank_transfer",
+                   extra_data={"receipt_url": f"receipt:{reference}"}),
+            verified(order_id=order_id, amount=100, status="approved", type="payment_receipt",
+                     extra_data={"payment_receipt_id": reference}),
+            verified(order_id=order_id, amount=50, status="approved", type="payment_receipt"),
+            manual(order_id=order_id, amount=70, status="paid", type="cash",
+                   created_at=now - timedelta(days=1)),
+            manual(order_id=order_id, amount=80, status="paid", type="cash", deleted_at=now),
+        ])
+        await session.commit()
+
+    after = await client.get("/api/dashboard/kpis")
+    assert after.status_code == 200, after.text
+    payments = after.json()["data"]["payments"]
+    assert payments["collected_today"] == baseline["collected_today"] + 150
+    assert payments["pending_amount"] == baseline["pending_amount"] + 300
+    assert payments["pending_count"] == baseline["pending_count"] + 1
 
 
 async def test_confirmed_creation_cannot_exceed_remaining_balance(order_record):

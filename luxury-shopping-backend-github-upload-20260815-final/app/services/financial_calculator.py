@@ -954,11 +954,14 @@ def payment_receipt_reference(model: Any):
 
 
 async def confirmed_order_payment_totals(
-    session: AsyncSession, order_ids: list[uuid.UUID],
+    session: AsyncSession,
+    order_ids: list[uuid.UUID] | None = None,
+    *,
+    created_since: datetime | None = None,
 ) -> dict[uuid.UUID, Decimal]:
     """Read confirmed ledgers, counting an approved receipt only once."""
     totals: dict[uuid.UUID, Decimal] = {}
-    if not order_ids:
+    if order_ids == [] or (order_ids is None and created_since is None):
         return totals
     manual = MODEL_BY_TABLE["order_payments"]
     legacy = MODEL_BY_TABLE["payments"]
@@ -967,10 +970,14 @@ async def confirmed_order_payment_totals(
         (legacy, (*ORDER_PAYMENT_SUCCESS_STATUSES, "completed")),
     ):
         statement = select(model.order_id, func.coalesce(func.sum(model.amount), 0)).where(
-            model.order_id.in_(order_ids),
+            model.order_id.is_not(None),
             model.deleted_at.is_(None),
             func.lower(model.status).in_(statuses),
         )
+        if order_ids is not None:
+            statement = statement.where(model.order_id.in_(order_ids))
+        if created_since is not None:
+            statement = statement.where(model.created_at >= created_since)
         if model is legacy:
             matching_manual = select(manual.id).where(
                 manual.order_id == legacy.order_id,
