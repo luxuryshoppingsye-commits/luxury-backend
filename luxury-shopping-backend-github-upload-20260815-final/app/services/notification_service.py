@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fastapi import HTTPException
+
 import hashlib
 import json
 import random
@@ -489,6 +491,16 @@ class NotificationService:
         ):
             if key in values:
                 setattr(row, key, bool(values[key]))
+        catalog_keys = ("new_product_notifications", "price_alerts")
+        if any(key in values for key in catalog_keys):
+            await self.session.refresh(row, attribute_names=["extra_data"], with_for_update=True)
+            extra = dict(row.extra_data or {})
+            for key in catalog_keys:
+                if key in values:
+                    if not isinstance(values[key], bool):
+                        raise HTTPException(status_code=422, detail="invalid_notification_preference")
+                    extra[key] = values[key]
+            row.extra_data = extra
         if "security_notifications" in values:
             row.security_notifications = True
         return serialize_record(row)
@@ -989,6 +1001,14 @@ class NotificationService:
             return channels
         pref = await self.preferences_for(user_id)
         category = _category_from_type(notification_type)
+        catalog_preference = {
+            "new_product": "new_product_notifications",
+            "product_published": "new_product_notifications",
+            "price_alert": "price_alerts",
+            "price_drop": "price_alerts",
+        }.get(str(notification_type or "").strip().lower())
+        if catalog_preference and not (pref.extra_data or {}).get(catalog_preference, False):
+            return []
         channels = []
         if pref.in_app_enabled:
             channels.append("in_app")

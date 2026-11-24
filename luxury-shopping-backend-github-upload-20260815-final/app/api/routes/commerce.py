@@ -4183,7 +4183,7 @@ async def create_customer_return_request(
             product_id=item.product_id,
             product_name=item.product_name,
             quantity=quantity,
-            unit_price=money(item.unit_price),
+            unit_price=str(money(item.unit_price)),
             amount=money(item.unit_price) * quantity,
             status="requested",
             reason=reason,
