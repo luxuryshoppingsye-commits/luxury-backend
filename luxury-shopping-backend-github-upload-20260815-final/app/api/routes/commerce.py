@@ -4284,6 +4284,9 @@ async def list_admin_returns(
 ):
     if not roles.intersection({"admin", "manager", "logistics", "finance", "staff"}):
         raise HTTPException(status_code=403, detail="returns_permission_required")
+    permissions = await effective_permissions(session, staff.id, roles)
+    if not permissions.intersection({"orders.view", "finance.view", "accounting.view"}):
+        raise HTTPException(status_code=403, detail="returns_permission_required")
     model = MODEL_BY_TABLE["returns"]
     statement = select(model).where(model.deleted_at.is_(None)).order_by(model.created_at.desc()).limit(500)
     if status_filter:
@@ -4311,6 +4314,8 @@ async def update_return_status(
     if not isinstance(body, dict):
         body = {}
     next_status = str(body.get("status") or "").strip().lower()
+    permission = "finance.update" if next_status in {"refund_pending", "refunded"} else "orders.update"
+    await require_staff_permission(session, staff.id, roles, permission)
     model = MODEL_BY_TABLE["returns"]
     row = (await session.execute(select(model).where(model.id == return_id, model.deleted_at.is_(None)).with_for_update())).scalar_one_or_none()
     if row is None:
