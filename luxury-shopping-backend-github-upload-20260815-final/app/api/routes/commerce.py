@@ -4475,15 +4475,17 @@ async def change_order_status(
     if courier_actor:
         assignment_model = MODEL_BY_TABLE["courier_assignments"]
         courier_assignments = list(
-            await session.execute(
-                select(assignment_model).where(
-                    assignment_model.order_id == order.id,
-                    or_(assignment_model.user_id == user.id, assignment_model.courier_id == user.id),
-                    assignment_model.deleted_at.is_(None),
-                    assignment_model.status.in_(["active", "assigned", "accepted", "picked_up", "out_for_delivery"]),
-                ).with_for_update()
-            )
-        ).scalars()
+            (
+                await session.execute(
+                    select(assignment_model).where(
+                        assignment_model.order_id == order.id,
+                        or_(assignment_model.user_id == user.id, assignment_model.courier_id == user.id),
+                        assignment_model.deleted_at.is_(None),
+                        assignment_model.status.in_(["active", "assigned", "accepted", "picked_up", "out_for_delivery"]),
+                    ).with_for_update()
+                )
+            ).scalars()
+        )
         assignment = next((row for row in courier_assignments if _courier_assignment_is_current(row)), None)
         if assignment is None:
             raise HTTPException(status_code=403, detail="courier_not_assigned")
