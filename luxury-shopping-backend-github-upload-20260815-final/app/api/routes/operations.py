@@ -7120,6 +7120,11 @@ async def api_partner_settlements(
     contract.  Keep the reporting endpoint backward-compatible and make the
     pending endpoint deterministic, filtered, and safe to settle in one action.
     """
+    roles = set(await roles_for(session, staff.id))
+    permissions = await effective_permissions(session, staff.id, roles)
+    if permissions.isdisjoint({"finance.view", "accounting.view"}):
+        raise HTTPException(status_code=403, detail="staff_permission_denied")
+
     is_pending = request.url.path.rstrip("/").endswith("/pending")
     settlement_model = MODEL_BY_TABLE["partner_settlements"]
     clauses = (
