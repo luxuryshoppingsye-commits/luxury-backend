@@ -806,6 +806,14 @@ class RevenueRecognitionService:
                 paid_amount=format(paid, "f"),
                 remaining_balance=format(max(total - paid, Decimal("0.00")), "f"),
                 payment_status=status,
+                can_accept_quote=(
+                    order.status == "reviewing"
+                    and bool(payload.get("pricing_updated_at"))
+                    and payload.get("quote_accepted_version") != payload.get("pricing_updated_at")
+                    and money(order.amount) > 0
+                    and status == "unpaid"
+                    and paid == 0
+                ),
             )
         return payloads
 

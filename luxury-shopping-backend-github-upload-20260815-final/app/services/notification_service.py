@@ -53,6 +53,7 @@ CUSTOMER_NOTIFICATION_TYPES = frozenset([
     'order_canceled',
     'order_completed',
     'order_returned',
+    'order_return_update',
     'shipping_update',
     'shipping_status_changed',
     'delivery_update',

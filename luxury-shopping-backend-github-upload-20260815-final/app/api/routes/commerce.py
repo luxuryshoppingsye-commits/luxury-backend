@@ -3866,6 +3866,59 @@ async def api_user_international_shopping_order_detail(
     return {"data": payload}
 
 
+@router.post("/api/orders/international-shopping/{order_id}/accept-quote")
+async def api_user_accept_international_quote(
+    order_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        body = await request.json()
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="international_quote_version_required") from error
+    quote_version = body.get("pricing_updated_at") if isinstance(body, dict) else None
+    if not isinstance(quote_version, str) or not quote_version:
+        raise HTTPException(status_code=422, detail="international_quote_version_required")
+
+    model = MODEL_BY_TABLE["international_orders"]
+    row = (
+        await session.execute(
+            select(model)
+            .where(model.id == order_id, model.user_id == user.id, model.deleted_at.is_(None))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="international_order_not_found")
+
+    extra = dict(row.extra_data or {})
+    if quote_version != extra.get("pricing_updated_at"):
+        raise HTTPException(status_code=409, detail="international_quote_changed")
+
+    payload = (await RevenueRecognitionService.international_order_financial_payloads(session, [row]))[0]
+    if extra.get("quote_accepted_version") == quote_version:
+        return {"data": payload}
+    if not payload["can_accept_quote"]:
+        raise HTTPException(status_code=409, detail="international_quote_unavailable")
+
+    accepted_at = datetime.now(timezone.utc).isoformat()
+    row.status = "waiting_customer_payment"
+    row.extra_data = {
+        **extra,
+        "quote_accepted_version": quote_version,
+        "quote_accepted_at": accepted_at,
+    }
+    payload.update(
+        status=row.status,
+        can_accept_quote=False,
+        quote_accepted_version=quote_version,
+        quote_accepted_at=accepted_at,
+    )
+    await session.commit()
+    return {"data": payload}
+
+
 @router.get("/orders/{order_id}/courier-assignment")
 @router.get("/api/orders/{order_id}/courier-assignment")
 async def order_courier_assignment(

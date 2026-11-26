@@ -13,8 +13,12 @@ AUTO_PATTERN = "^(LUX-PROD-[A-Z0-9]+-[0-9A-F]{32}|PROD-[A-Z0-9]{1,12}-[A-Z0-9]{1
 
 def upgrade():
     for table, prefix in TABLES:
-        op.add_column(table, sa.Column("previous_auto_sku", sa.String(160)))
-        op.execute(f"CREATE UNIQUE INDEX uq_{table}_previous_auto_sku ON {table} (previous_auto_sku) WHERE previous_auto_sku <> ''")
+        # The initial migration uses current model metadata on an empty database.
+        op.add_column(table, sa.Column("previous_auto_sku", sa.String(160)), if_not_exists=True)
+        op.create_index(
+            f"uq_{table}_previous_auto_sku", table, ["previous_auto_sku"],
+            unique=True, postgresql_where=sa.text("previous_auto_sku <> ''"), if_not_exists=True,
+        )
         op.execute(f"CREATE SEQUENCE {table}_sku_seq START WITH 1001")
         op.execute(f"""
             CREATE FUNCTION next_{table}_sku() RETURNS text LANGUAGE plpgsql AS $$

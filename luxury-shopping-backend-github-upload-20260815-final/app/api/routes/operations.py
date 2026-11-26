@@ -10249,7 +10249,7 @@ async def api_price_international_order(order_id: uuid.UUID, request: Request, s
         raise HTTPException(status_code=422, detail="pricing_payload_required")
 
     model = MODEL_BY_TABLE["international_orders"]
-    row = await session.get(model, order_id)
+    row = await session.get(model, order_id, with_for_update=True)
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="international_order_not_found")
     if row.user_id is None:
