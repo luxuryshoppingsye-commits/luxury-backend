@@ -17,7 +17,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...database import get_session
-from ...dependencies import current_bearer_user, current_user, require_admin, user_roles
+from ...dependencies import current_bearer_user, current_user, require_admin, require_roles, user_roles
 from ...models import MODEL_BY_TABLE
 from ...config import get_settings
 from ...models.domain import AuthSession, LoginAttempt, PasswordResetToken, PasswordResetTokenState, PhoneOtpToken, Profile, RefreshToken, RefreshTokenSecurity, User, UserRole, VerificationToken
@@ -101,6 +101,7 @@ MERCHANT_APPLICATION_REVIEW_STATUSES = (
 MERCHANT_APPLICATION_ACTIVE_STATUSES = ("approved", "active")
 STAFF_ROLE_KEYS = ("admin", "manager", "finance", "logistics", "staff", "employee")
 MANAGED_ACCOUNT_ROLE_KEYS = (*STAFF_ROLE_KEYS, "courier", "delivery")
+require_staff_account_admin = require_roles("admin")
 
 
 async def _welcome_customer(session: AsyncSession, user_id: uuid.UUID) -> None:
@@ -1676,7 +1677,7 @@ async def admin_staff_members(
 
 @router.get("/api/admin/staff/roles")
 async def admin_staff_roles(
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     rows = (await session.execute(
@@ -1723,7 +1724,7 @@ async def admin_user_options(
 @router.post("/api/admin/staff/members", status_code=201)
 async def admin_create_staff_member(
     request: Request,
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a dedicated staff login without reusing a customer account."""
@@ -1792,7 +1793,7 @@ async def admin_create_staff_member(
 @router.post("/api/admin/staff/roles", status_code=201)
 async def admin_add_staff_role(
     request: Request,
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     body = await request.json()
@@ -1843,7 +1844,7 @@ async def admin_add_staff_role(
 async def admin_update_staff_role(
     role_id: str,
     request: Request,
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     old_user_id, old_role = _parse_role_id(role_id)
@@ -1865,7 +1866,7 @@ async def admin_update_staff_role(
 @router.delete("/api/admin/staff/roles/{role_id}")
 async def admin_delete_staff_role(
     role_id: str,
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     user_id, role = _parse_role_id(role_id)
@@ -1878,14 +1879,14 @@ async def admin_delete_staff_role(
 
 
 @router.get("/api/admin/staff/permissions/catalog")
-async def admin_staff_permissions_catalog(_: User = Depends(require_admin)):
+async def admin_staff_permissions_catalog(_: User = Depends(require_staff_account_admin)):
     return {"data": PERMISSION_GROUPS}
 
 
 @router.get("/api/admin/staff/permissions/{user_id}")
 async def admin_staff_permissions(
     user_id: uuid.UUID,
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     target = await session.get(User, user_id)
@@ -1910,7 +1911,7 @@ async def admin_staff_permissions(
 async def admin_save_staff_permissions(
     user_id: uuid.UUID,
     request: Request,
-    _: User = Depends(require_admin),
+    _: User = Depends(require_staff_account_admin),
     session: AsyncSession = Depends(get_session),
 ):
     target = await session.get(User, user_id)
