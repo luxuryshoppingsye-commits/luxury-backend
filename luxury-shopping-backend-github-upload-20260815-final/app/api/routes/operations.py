@@ -5593,6 +5593,7 @@ async def api_loyalty_tiers(session: AsyncSession = Depends(get_session)):
 
 
 @router.get("/api/loyalty/settings")
+@router.get("/loyalty/settings", include_in_schema=False)
 async def api_loyalty_settings(staff: User = Depends(require_staff), session: AsyncSession = Depends(get_session)):
     return {"data": [_loyalty_settings_payload(row) for row in await _rows(session, "loyalty_settings", limit=50)]}
 
