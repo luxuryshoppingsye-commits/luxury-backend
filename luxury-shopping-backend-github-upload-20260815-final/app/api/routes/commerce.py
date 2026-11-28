@@ -2016,6 +2016,13 @@ def _catalog_image_variant_key(relative: str, width: int | None, quality: int) -
     return f"{relative}|w={width or 0}|q={quality if width is not None else 0}"
 
 
+def _catalog_image_relative_path(image_path: str) -> str:
+    relative = str(image_path or "").replace("\\", "/").lstrip("/").removeprefix("v2/")
+    if not relative or ".." in Path(relative).parts:
+        raise HTTPException(status_code=404, detail="image_not_found")
+    return relative
+
+
 def _catalog_image_cache_get(key: str) -> tuple[bytes, str, str] | None:
     entry = _catalog_image_cache.get(key)
     if entry is not None:
@@ -2162,52 +2169,38 @@ def _canonicalize_catalog_image(
     if media_type == "image/jpeg" and not data.endswith(b"\xff\xd9"):
         data = data + b"\xff\xd9"
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps, ImageSequence
 
         with Image.open(BytesIO(data)) as image:
             image.load()
-            if max_width is not None:
-                if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
-                    rgba = image.convert("RGBA")
-                    background = Image.new("RGB", rgba.size, (255, 255, 255))
-                    background.paste(rgba, mask=rgba.getchannel("A"))
-                    converted = background
-                else:
-                    converted = image.convert("RGB")
-                if converted.width > max_width:
+            if media_type == "image/webp" and max_width is None:
+                return data, media_type
+
+            def prepare(frame):
+                oriented = ImageOps.exif_transpose(frame)
+                has_alpha = oriented.mode in {"RGBA", "LA"} or "transparency" in oriented.info
+                converted = oriented.convert("RGBA" if has_alpha else "RGB")
+                if max_width is not None and converted.width > max_width:
                     target_height = max(1, round(converted.height * max_width / converted.width))
                     converted = converted.resize((max_width, target_height), Image.Resampling.LANCZOS)
-                output = BytesIO()
-                try:
-                    converted.save(
-                        output,
-                        format="WEBP",
-                        quality=quality,
-                        method=4,
-                    )
-                    return output.getvalue(), "image/webp"
-                except OSError:
-                    output = BytesIO()
-                    converted.save(
-                        output,
-                        format="JPEG",
-                        quality=quality,
-                        optimize=True,
-                        progressive=True,
-                    )
-                    return output.getvalue(), "image/jpeg"
-            # Android devices are not consistent when an object is named
-            # .webp but the edge/CDN metadata is incomplete. Return one
-            # decoder-safe representation from the proxy so the URL suffix,
-            # Content-Type, and bytes always agree.
-            if media_type == "image/webp":
-                converted = image.convert("RGB")
-                output = BytesIO()
-                converted.save(output, format="JPEG", quality=92, optimize=True)
-                return output.getvalue(), "image/jpeg"
+                return converted
+
+            output = BytesIO()
+            options = {"quality": 92 if max_width is None else quality, "method": 4}
+            if max_width is None and getattr(image, "is_animated", False):
+                loop = image.info.get("loop", 1)
+                durations = []
+                frames = []
+                for frame in ImageSequence.Iterator(image):
+                    frames.append(prepare(frame))
+                    durations.append(frame.info.get("duration", 100))
+                frames[0].save(output, format="WEBP", save_all=True, append_images=frames[1:],
+                               duration=durations, loop=loop, **options)
+            else:
+                prepare(image).save(output, format="WEBP", **options)
+            return output.getvalue(), "image/webp"
     except Exception:
         return None
-    return data, media_type
 
 
 @router.get("/catalog/brand-logo/{file_id}")
@@ -2257,10 +2250,8 @@ async def catalog_brand_logo(file_id: uuid.UUID, session: AsyncSession = Depends
 @router.head("/catalog/image-proxy/{image_path:path}")
 async def catalog_image_proxy_head(image_path: str):
     """Expose the immutable object fingerprint for gallery de-duplication."""
-    relative = str(image_path or "").replace("\\", "/").lstrip("/")
-    if not relative or ".." in Path(relative).parts:
-        raise HTTPException(status_code=404, detail="image_not_found")
-    media_type, etag = await _load_catalog_image_fingerprint(relative)
+    relative = _catalog_image_relative_path(image_path)
+    _, etag = await _load_catalog_image_fingerprint(relative)
     headers = {
         "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
         "X-Content-Type-Options": "nosniff",
@@ -2268,7 +2259,7 @@ async def catalog_image_proxy_head(image_path: str):
     }
     if etag:
         headers["ETag"] = etag
-    return Response(status_code=200, media_type=media_type, headers=headers)
+    return Response(status_code=200, media_type="image/webp", headers=headers)
 
 
 @router.get("/catalog/image-proxy/{image_path:path}")
@@ -2283,9 +2274,7 @@ async def catalog_image_proxy(
     This route is deliberately allow-listed to one historical image hostname;
     it is not a general URL fetcher and therefore cannot become an SSRF proxy.
     """
-    relative = str(image_path or "").replace("\\", "/").lstrip("/")
-    if not relative or ".." in Path(relative).parts:
-        raise HTTPException(status_code=404, detail="image_not_found")
+    relative = _catalog_image_relative_path(image_path)
     variant_key = _catalog_image_variant_key(relative, width, quality)
     cached = _catalog_image_cache_get(variant_key)
     if cached is not None:

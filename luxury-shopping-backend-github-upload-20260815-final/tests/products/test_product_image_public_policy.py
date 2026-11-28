@@ -139,11 +139,11 @@ def test_canonical_proxy_repairs_jpeg_eoi_and_reports_actual_mime() -> None:
 
     assert canonical is not None
     data, media_type = canonical
-    assert media_type == "image/jpeg"
-    assert data.endswith(b"\xff\xd9")
+    assert media_type == "image/webp"
+    assert data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
-def test_canonical_proxy_transcodes_webp_to_android_safe_jpeg() -> None:
+def test_canonical_proxy_preserves_original_webp() -> None:
     output = BytesIO()
     Image.new("RGB", (2, 2), (220, 170, 20)).save(output, format="WEBP")
 
@@ -151,8 +151,8 @@ def test_canonical_proxy_transcodes_webp_to_android_safe_jpeg() -> None:
 
     assert canonical is not None
     data, media_type = canonical
-    assert media_type == "image/jpeg"
-    assert data.startswith(b"\xff\xd8\xff")
+    assert media_type == "image/webp"
+    assert data == output.getvalue()
 
 
 def test_catalog_proxy_builds_small_card_variant() -> None:
@@ -163,7 +163,7 @@ def test_catalog_proxy_builds_small_card_variant() -> None:
 
     assert canonical is not None
     data, media_type = canonical
-    assert media_type == "image/jpeg"
+    assert media_type == "image/webp"
     with Image.open(BytesIO(data)) as image:
         assert image.size == (640, 480)
 
@@ -214,7 +214,7 @@ def test_share_image_builds_small_card_variant() -> None:
 
     assert variant is not None
     data, media_type = variant
-    assert media_type == "image/jpeg"
+    assert media_type == "image/webp"
     with Image.open(BytesIO(data)) as image:
         assert image.size == (640, 853)
 

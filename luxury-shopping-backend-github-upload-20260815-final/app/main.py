@@ -800,7 +800,8 @@ app.include_router(resources.router, prefix="/api", include_in_schema=False)
 
 
 def _upload_media_type(path) -> str:
-    data = path.read_bytes()[:16]
+    with path.open("rb") as stream:
+        data = stream.read(16)
     if data.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -843,19 +844,26 @@ async def _serve_upload(file_path: str, *, request: Request, requested_format: s
         raise HTTPException(status_code=404, detail="file_not_found")
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file_not_found")
+    media_type = _upload_media_type(target)
+    if media_type == "image/jpeg":
+        variant = await asyncio.to_thread(commerce._canonicalize_catalog_image, target.read_bytes())
+        if variant is None:
+            raise HTTPException(status_code=422, detail="image_invalid")
+        data, media_type = variant
+        return Response(data, media_type=media_type, headers={"Cache-Control": "public, max-age=86400, immutable"})
     transcoded = _transcoded_public_upload_response(target, requested_format)
     if transcoded is not None:
         return transcoded
     return FileResponse(
         target,
-        media_type=_upload_media_type(target),
+        media_type=media_type,
         headers={"Cache-Control": "public, max-age=86400, immutable"},
     )
 
 
 def _transcoded_public_upload_response(target: Path, requested_format: str | None) -> Response | None:
     output_format = (requested_format or "").strip().lower()
-    if output_format not in {"png", "jpeg", "jpg"}:
+    if output_format != "png":
         return None
     if target.suffix.lower() != ".webp":
         return None
@@ -864,22 +872,13 @@ def _transcoded_public_upload_response(target: Path, requested_format: str | Non
     except Exception:
         logger.warning("Pillow is unavailable for public upload transcoding")
         return None
-    pil_format = "JPEG" if output_format in {"jpeg", "jpg"} else "PNG"
-    media_type = "image/jpeg" if pil_format == "JPEG" else "image/png"
     with Image.open(target) as image:
-        if pil_format == "JPEG":
-            if image.mode in {"RGBA", "LA", "P"}:
-                background = Image.new("RGB", image.size, (255, 255, 255))
-                background.paste(image.convert("RGBA"), mask=image.convert("RGBA").getchannel("A"))
-                image = background
-            else:
-                image = image.convert("RGB")
-        elif image.mode not in {"RGB", "RGBA"}:
+        if image.mode not in {"RGB", "RGBA"}:
             image = image.convert("RGBA")
         output = BytesIO()
-        image.save(output, format=pil_format, optimize=True)
+        image.save(output, format="PNG", optimize=True)
     return Response(
         output.getvalue(),
-        media_type=media_type,
+        media_type="image/png",
         headers={"Cache-Control": "public, max-age=86400, immutable"},
     )

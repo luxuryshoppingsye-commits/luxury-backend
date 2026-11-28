@@ -132,7 +132,7 @@ def _detect_image_type(data: bytes) -> str | None:
     return None
 
 
-def _share_image_variant(data: bytes, *, max_width: int, quality: int) -> tuple[bytes, str] | None:
+def _share_image_variant(data: bytes, *, max_width: int | None, quality: int) -> tuple[bytes, str] | None:
     try:
         from PIL import Image
 
@@ -145,18 +145,17 @@ def _share_image_variant(data: bytes, *, max_width: int, quality: int) -> tuple[
                 converted = background
             else:
                 converted = image.convert("RGB")
-            if converted.width > max_width:
+            if max_width is not None and converted.width > max_width:
                 target_height = max(1, round(converted.height * max_width / converted.width))
                 converted = converted.resize((max_width, target_height), Image.Resampling.LANCZOS)
             output = BytesIO()
             converted.save(
                 output,
-                format="JPEG",
+                format="WEBP",
                 quality=quality,
-                optimize=True,
-                progressive=True,
+                method=4,
             )
-            return output.getvalue(), "image/jpeg"
+            return output.getvalue(), "image/webp"
     except Exception:
         return None
 
@@ -306,10 +305,11 @@ async def share_product_image(
         image = await _read_image(source)
         if image is not None:
             data, media_type = image
-            if width is not None:
+            if width is not None or media_type != "image/webp":
                 variant = _share_image_variant(data, max_width=width, quality=quality)
-                if variant is not None:
-                    data, media_type = variant
+                if variant is None:
+                    continue
+                data, media_type = variant
             return Response(content=data, media_type=media_type, headers={"Cache-Control": SHARE_IMAGE_CACHE_CONTROL})
     raise HTTPException(status_code=404, detail="product_image_not_found")
 
